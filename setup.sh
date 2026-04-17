@@ -107,8 +107,14 @@ if [[ -n "$TS_AUTHKEY" ]]; then
   TS_IP=$(tailscale ip -4 2>/dev/null || echo "pendiente")
   log "IP Tailscale: ${BOLD}${TS_IP}${NC}"
 else
-  warn "--authkey no proporcionado."
-  warn "Corre manualmente después: sudo tailscale up"
+  log "Iniciando Tailscale login — abre el link en tu browser y luego regresa aquí..."
+  tailscale up --hostname="$TS_HOSTNAME" --accept-routes --ssh || true
+  TS_IP=$(tailscale ip -4 2>/dev/null || echo "no conectado")
+  if [[ "$TS_IP" != "no conectado" ]]; then
+    ok "Tailscale conectado — IP: ${BOLD}${TS_IP}${NC}"
+  else
+    warn "Tailscale no autenticado todavía. Corre: sudo tailscale up"
+  fi
 fi
 
 # ════════════════════════════════════════════════════════════
