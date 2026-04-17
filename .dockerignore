@@ -1,0 +1,6 @@
+cat <<EOF > .dockerignore
+venv/
+__pycache__/
+videos/
+resources/
+EOF

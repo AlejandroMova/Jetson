@@ -1,0 +1,8 @@
+female_adult
+female_child
+female_senior
+female_young
+male_adult
+male_child
+male_senior
+male_young

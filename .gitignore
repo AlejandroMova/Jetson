@@ -1,0 +1,39 @@
+# TensorRT engines — architecture-specific, regenerated automatically on each device
+*.engine
+
+# Large model binaries — download separately via NGC or share manually
+*.onnx
+*.etlt
+*.tlt
+*.pth
+*.pt
+
+# Compiled shared libraries — must be recompiled per architecture (x86 vs ARM64)
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Outputs / temp
+crops/
+results/
+results_model_fb/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+
+# IDE
+.vscode/
+.claude/
+
+# Misc
+*.zip
+ngc-cli/
+deepstream_examples/
+PLATFORM/
+TEST/

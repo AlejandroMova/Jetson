@@ -1,0 +1,38 @@
+[property]
+gpu-id=0
+
+# Rutas de los modelos (Asegúrate de que el nombre coincida al exportar)
+onnx-file=resnet18_finetuned_int8_fixed.onnx
+model-engine-file=resnet18_finetuned_int8_fixed.engine
+labelfile-path=labels.txt
+
+# Matemáticas de Normalización (ImageNet PyTorch)
+net-scale-factor=0.01735207
+offsets=123.675;116.280;103.53
+model-color-format=0
+
+# Dimensiones y Tipo de Red
+infer-dims=3;224;224
+batch-size=16
+network-mode=2
+network-type=1
+
+# Configuración del motor secundario (Clasificador)
+process-mode=2
+gie-unique-id=2
+num-detected-classes=6
+operate-on-gie-id=1
+operate-on-class-ids=0
+
+# Custom parser: aplica Softmax a los logits crudos de TAO
+custom-lib-path=libcustom_softmax_parser.so
+parse-classifier-func-name=CustomClassifierParseFunction
+
+# Umbrales y rendimiento
+interval=1
+classifier-async-mode=0
+classifier-threshold=0.1
+input-object-min-width=32
+input-object-min-height=32
+maintain-aspect-ratio=0
+scaling-filter=1
