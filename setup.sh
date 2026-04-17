@@ -122,8 +122,10 @@ if [[ "$SKIP_VNC" == false ]]; then
   VNC_PASS_FILE="/etc/x11vnc.pass"
   if [[ ! -f "$VNC_PASS_FILE" ]]; then
     # Genera contraseña aleatoria sin caracteres especiales problemáticos
-    VNC_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
-    x11vnc -storepasswd "$VNC_PASS" "$VNC_PASS_FILE"
+    VNC_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || true)
+    # Guarda la contraseña de forma no interactiva
+    echo "$VNC_PASS" | x11vnc -storepasswd /dev/stdin "$VNC_PASS_FILE" 2>/dev/null || \
+      x11vnc -storepasswd "$VNC_PASS" "$VNC_PASS_FILE" < /dev/null || true
     chmod 600 "$VNC_PASS_FILE"
     warn "Contraseña VNC: ${BOLD}${VNC_PASS}${NC} — guárdala ahora"
   else
