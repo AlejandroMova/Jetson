@@ -4,22 +4,22 @@
 #  Configura: SSH · Tailscale · VNC · Docker
 #
 #  Uso:
-#    sudo bash setup.sh --authkey <tailscale-auth-key>
+#    sudo bash setup.sh
 #
 #  Flags opcionales:
 #    --authkey    Auth key de Tailscale
-#    --compose    Nombre del docker-compose.yml (default: docker-compose.yml)
+#    --compose    Nombre del archivo compose (default: docker-compose.yml)
 #    --hostname   Nombre visible en Tailscale (default: hostname actual)
 #    --no-vnc     Omite la instalación de VNC
 #    --no-docker  Omite docker compose
 #
 #  Prerequisito:
 #    Clonar el repo manualmente antes de correr este script:
-#    git clone https://<token>@github.com/AlejandroMova/NX-SETUP.git
-#    cd NX-SETUP && sudo bash setup.sh --authkey <key>
+#    git clone https://<token>@github.com/AlejandroMova/NX-JETSON.git
+#    cd NX-JETSON && sudo bash setup.sh --authkey <key>
 # ============================================================
 
-set -euo pipefail
+set -eo pipefail
 
 # ── Colores ─────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -37,7 +37,7 @@ TS_HOSTNAME="$(hostname)"
 SKIP_VNC=false
 SKIP_DOCKER=false
 
-# El script asume que está corriendo desde la carpeta del repo
+# El script corre desde la carpeta del repo
 WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Parse args ──────────────────────────────────────────────
@@ -55,7 +55,7 @@ done
 [[ $EUID -ne 0 ]] && die "Corre con sudo"
 
 echo -e "\n${BOLD}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}   NX Computing — Jetson Setup v2.0       ${NC}"
+echo -e "${BOLD}   NX Computing — Jetson Setup v2.1       ${NC}"
 echo -e "${BOLD}   Host: $(hostname) | $(date '+%Y-%m-%d %H:%M')${NC}"
 echo -e "${BOLD}══════════════════════════════════════════${NC}\n"
 
@@ -78,11 +78,6 @@ grep -q "^PermitRootLogin" "$SSHD_CONF" \
 grep -q "^X11Forwarding" "$SSHD_CONF" \
   && sed -i 's/^X11Forwarding.*/X11Forwarding yes/' "$SSHD_CONF" \
   || echo "X11Forwarding yes" >> "$SSHD_CONF"
-
-# Habilitar AcceptEnv para pasar GH_TOKEN desde tu laptop via SSH
-grep -q "^AcceptEnv" "$SSHD_CONF" \
-  && sed -i 's/^AcceptEnv.*/AcceptEnv LANG LC_* GH_TOKEN/' "$SSHD_CONF" \
-  || echo "AcceptEnv LANG LC_* GH_TOKEN" >> "$SSHD_CONF"
 
 systemctl restart ssh
 ok "SSH activo en puerto 22"
@@ -126,12 +121,13 @@ if [[ "$SKIP_VNC" == false ]]; then
 
   VNC_PASS_FILE="/etc/x11vnc.pass"
   if [[ ! -f "$VNC_PASS_FILE" ]]; then
-    VNC_PASS=$(tr -dc 'A-Za-z0-9!@#$' </dev/urandom | head -c 12)
+    # Genera contraseña aleatoria sin caracteres especiales problemáticos
+    VNC_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
     x11vnc -storepasswd "$VNC_PASS" "$VNC_PASS_FILE"
     chmod 600 "$VNC_PASS_FILE"
-    warn "Contraseña VNC generada: ${BOLD}${VNC_PASS}${NC} (guárdala)"
+    warn "Contraseña VNC: ${BOLD}${VNC_PASS}${NC} — guárdala ahora"
   else
-    ok "Archivo de contraseña VNC ya existe"
+    ok "Contraseña VNC ya existe"
   fi
 
   cat > /etc/systemd/system/x11vnc.service << 'EOF'
@@ -183,8 +179,8 @@ if [[ "$SKIP_DOCKER" == false ]]; then
   COMPOSE_PATH="${WORK_DIR}/${COMPOSE_FILE}"
 
   if [[ ! -f "$COMPOSE_PATH" ]]; then
-    warn "No se encontró ${COMPOSE_PATH}. Saltando Docker."
-    warn "Asegúrate de tener docker-compose.yml en el repo."
+    warn "No se encontró ${COMPOSE_PATH} — saltando Docker."
+    warn "Agrega docker-compose.yml al repo para que arranque automático."
   else
     cd "$WORK_DIR"
 
