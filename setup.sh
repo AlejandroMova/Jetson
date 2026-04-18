@@ -149,8 +149,9 @@ if [[ "$SKIP_VNC" == false ]]; then
   log "Detectando display activo..."
 
   # Busca el número de display desde el proceso de Xorg
-  # En JetPack con GDM el display siempre es :1
-  XORG_DISPLAY=":1"
+  # Detecta display desde /tmp/.X11-unix (más confiable que ps)
+  XORG_DISPLAY=$(ls /tmp/.X11-unix/ 2>/dev/null | head -1 | sed 's/X/:/')
+  XORG_DISPLAY="${XORG_DISPLAY:-:0}"
 
   # Busca el Xauthority desde el proceso de Xorg
   XAUTH_FILE=$(ps aux | grep -oP '(?<=-auth )/run/user/\d+/gdm/Xauthority' | head -1 || true)
@@ -182,48 +183,46 @@ if [[ "$SKIP_VNC" == false ]]; then
     ok "Contraseña VNC ya existe"
   fi
 
-  # ── Servicio systemd corriendo como el usuario, no como root ─
-  cat > /etc/systemd/system/x11vnc.service << EOF
+  # ── Servicio de usuario (no root) — accede al display correctamente ─
+  chmod 644 /etc/x11vnc.pass
+
+  # Habilita lingering para que el servicio de usuario arranque sin login
+  loginctl enable-linger "${REAL_USER}"
+
+  # Crea el directorio del servicio de usuario
+  USER_SYSTEMD_DIR="/home/${REAL_USER}/.config/systemd/user"
+  mkdir -p "$USER_SYSTEMD_DIR"
+
+  cat > "${USER_SYSTEMD_DIR}/x11vnc.service" << EOF
 [Unit]
-Description=NX VNC Server (x11vnc)
+Description=x11vnc VNC Server
 After=graphical-session.target
-Wants=graphical-session.target
 
 [Service]
-User=${REAL_USER}
-Type=simple
-Environment=DISPLAY=:1
-Environment=XAUTHORITY=/run/user/1000/gdm/Xauthority
-ExecStartPre=/bin/sleep 15
-ExecStart=/usr/bin/x11vnc \\
-  -display :1 \\
-  -auth /run/user/1000/gdm/Xauthority \\
-  -rfbauth /etc/x11vnc.pass \\
-  -rfbport 5900 \\
-  -forever \\
-  -loop \\
-  -noxdamage \\
-  -repeat \\
-  -shared
+Environment=DISPLAY=${XORG_DISPLAY}
+Environment=XAUTHORITY=${XAUTH_FILE}
+ExecStart=/usr/bin/x11vnc -display ${XORG_DISPLAY} -auth ${XAUTH_FILE} -rfbauth /etc/x11vnc.pass -rfbport 5900 -forever -shared -noxdamage
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=graphical.target
+WantedBy=default.target
 EOF
 
-  # El usuario necesita poder leer el archivo de contraseña
-  chmod 644 /etc/x11vnc.pass
+  # Desactiva el servicio de sistema si existe
+  systemctl stop x11vnc 2>/dev/null || true
+  systemctl disable x11vnc 2>/dev/null || true
 
-  systemctl daemon-reload
-  systemctl enable x11vnc
-  systemctl restart x11vnc
-  sleep 2
+  # Activa el servicio de usuario
+  sudo -u "${REAL_USER}" systemctl --user daemon-reload
+  sudo -u "${REAL_USER}" systemctl --user enable x11vnc
+  sudo -u "${REAL_USER}" systemctl --user restart x11vnc
+  sleep 3
 
-  if systemctl is-active x11vnc -q; then
+  if sudo -u "${REAL_USER}" systemctl --user is-active x11vnc -q 2>/dev/null; then
     ok "VNC corriendo en background en puerto 5900"
   else
-    warn "VNC no pudo arrancar — revisa: sudo systemctl status x11vnc"
+    warn "VNC no pudo arrancar aun — arrancara al iniciar sesion grafica"
   fi
 
   log "Conectar desde VNC Viewer: ${BOLD}<tailscale-ip>:5900${NC}"
