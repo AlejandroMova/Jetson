@@ -155,16 +155,8 @@ if [[ "$SKIP_VNC" == false ]]; then
   log "Detectando display activo..."
 
   # Busca el número de display desde el proceso de Xorg
-  # Busca el display activo del proceso Xorg — múltiples patrones para compatibilidad
-  XORG_NUM=$(ps aux | grep -oP '(?<=Xorg vt\d ):\d+' | head -1 || true)
-  if [[ -z "$XORG_NUM" ]]; then
-    XORG_NUM=$(ps aux | grep -oP '(?<=Xorg ):\d+' | head -1 || true)
-  fi
-  if [[ -z "$XORG_NUM" ]]; then
-    XORG_NUM=$(ps aux | grep Xorg | grep -oP ':\d+' | head -1 || true)
-  fi
-  # Fallback a :1 (más común en JetPack/Ubuntu con GDM)
-  XORG_DISPLAY="${XORG_NUM:-:1}"
+  # En JetPack con GDM el display siempre es :1
+  XORG_DISPLAY=":1"
 
   # Busca el Xauthority desde el proceso de Xorg
   XAUTH_FILE=$(ps aux | grep -oP '(?<=-auth )/run/user/\d+/gdm/Xauthority' | head -1 || true)
