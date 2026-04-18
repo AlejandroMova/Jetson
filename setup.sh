@@ -101,14 +101,13 @@ if [[ -n "$TS_AUTHKEY" ]]; then
   tailscale up \
     --authkey="$TS_AUTHKEY" \
     --hostname="$TS_HOSTNAME" \
-    --accept-routes \
-    --ssh
+    --accept-routes
   ok "Tailscale conectado"
   TS_IP=$(tailscale ip -4 2>/dev/null || echo "pendiente")
   log "IP Tailscale: ${BOLD}${TS_IP}${NC}"
 else
   log "Iniciando Tailscale login — abre el link en tu browser y luego regresa aquí..."
-  tailscale up --hostname="$TS_HOSTNAME" --accept-routes --ssh || true
+  tailscale up --hostname="$TS_HOSTNAME" --accept-routes || true
   TS_IP=$(tailscale ip -4 2>/dev/null || echo "no conectado")
   if [[ "$TS_IP" != "no conectado" ]]; then
     ok "Tailscale conectado — IP: ${BOLD}${TS_IP}${NC}"
@@ -201,12 +200,12 @@ if [[ "$SKIP_VNC" == false ]]; then
   cat > /etc/systemd/system/x11vnc.service << EOF
 [Unit]
 Description=NX VNC Server (x11vnc)
-After=network.target display-manager.service
-Wants=display-manager.service
+After=graphical-session.target display-manager.service
+Wants=graphical-session.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 5
+ExecStartPre=/bin/sleep 15
 ExecStart=/usr/bin/x11vnc \\
   -display ${XORG_DISPLAY} \\
   -auth ${XAUTH_FILE} \\
