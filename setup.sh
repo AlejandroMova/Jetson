@@ -183,46 +183,38 @@ if [[ "$SKIP_VNC" == false ]]; then
     ok "Contraseña VNC ya existe"
   fi
 
-  # ── Servicio de usuario (no root) — accede al display correctamente ─
+  # ── Servicio de sistema que corre como el usuario ────────────
   chmod 644 /etc/x11vnc.pass
 
-  # Habilita lingering para que el servicio de usuario arranque sin login
-  loginctl enable-linger "${REAL_USER}"
-
-  # Crea el directorio del servicio de usuario
-  USER_SYSTEMD_DIR="/home/${REAL_USER}/.config/systemd/user"
-  mkdir -p "$USER_SYSTEMD_DIR"
-
-  cat > "${USER_SYSTEMD_DIR}/x11vnc.service" << EOF
+  cat > /etc/systemd/system/x11vnc.service << EOF
 [Unit]
 Description=x11vnc VNC Server
-After=graphical-session.target
+After=graphical.target
+Wants=graphical.target
 
 [Service]
+Type=simple
+User=${REAL_USER}
 Environment=DISPLAY=${XORG_DISPLAY}
 Environment=XAUTHORITY=${XAUTH_FILE}
+ExecStartPre=/bin/sleep 10
 ExecStart=/usr/bin/x11vnc -display ${XORG_DISPLAY} -auth ${XAUTH_FILE} -rfbauth /etc/x11vnc.pass -rfbport 5900 -forever -shared -noxdamage
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical.target
 EOF
 
-  # Desactiva el servicio de sistema si existe
-  systemctl stop x11vnc 2>/dev/null || true
-  systemctl disable x11vnc 2>/dev/null || true
-
-  # Activa el servicio de usuario
-  sudo -u "${REAL_USER}" systemctl --user daemon-reload
-  sudo -u "${REAL_USER}" systemctl --user enable x11vnc
-  sudo -u "${REAL_USER}" systemctl --user restart x11vnc
+  systemctl daemon-reload
+  systemctl enable x11vnc
+  systemctl restart x11vnc
   sleep 3
 
-  if sudo -u "${REAL_USER}" systemctl --user is-active x11vnc -q 2>/dev/null; then
+  if systemctl is-active x11vnc -q; then
     ok "VNC corriendo en background en puerto 5900"
   else
-    warn "VNC no pudo arrancar aun — arrancara al iniciar sesion grafica"
+    warn "VNC arrancara despues del proximo reboot con sesion grafica activa"
   fi
 
   log "Conectar desde VNC Viewer: ${BOLD}<tailscale-ip>:5900${NC}"
