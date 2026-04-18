@@ -118,7 +118,29 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
-# 3. VNC (x11vnc)
+# 3. Login automático (necesario para VNC sin acceso físico)
+# ════════════════════════════════════════════════════════════
+log "Configurando login automático..."
+
+REAL_USER=$(logname 2>/dev/null || who | awk '{print $1}' | head -1 || echo "nxcomputingdemo")
+GDM_CONF="/etc/gdm3/custom.conf"
+mkdir -p /etc/gdm3
+
+if grep -q "AutomaticLoginEnable" "$GDM_CONF" 2>/dev/null; then
+  sed -i "s/.*AutomaticLoginEnable.*/AutomaticLoginEnable=true/" "$GDM_CONF"
+  sed -i "s/.*AutomaticLogin=.*/AutomaticLogin=${REAL_USER}/" "$GDM_CONF"
+else
+  if grep -q "^\[daemon\]" "$GDM_CONF" 2>/dev/null; then
+    sed -i "/^\[daemon\]/a AutomaticLoginEnable=true\nAutomaticLogin=${REAL_USER}" "$GDM_CONF"
+  else
+    printf '[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=%s\n' "$REAL_USER" >> "$GDM_CONF"
+  fi
+fi
+
+ok "Login automático configurado para: ${BOLD}${REAL_USER}${NC}"
+
+# ════════════════════════════════════════════════════════════
+# 4. VNC (x11vnc)
 # ════════════════════════════════════════════════════════════
 if [[ "$SKIP_VNC" == false ]]; then
   log "Instalando VNC (x11vnc)..."
@@ -129,13 +151,16 @@ if [[ "$SKIP_VNC" == false ]]; then
   log "Detectando display activo..."
 
   # Busca el número de display desde el proceso de Xorg
-  XORG_DISPLAY=$(ps aux | grep -oP '/usr/lib/xorg/Xorg.*\K:\d+' | head -1 || true)
-  if [[ -z "$XORG_DISPLAY" ]]; then
-    XORG_DISPLAY=$(ps aux | grep -oP 'Xorg.*\s:\K\d+' | head -1 || true)
-    XORG_DISPLAY=":${XORG_DISPLAY}"
+  # Busca el display activo del proceso Xorg — múltiples patrones para compatibilidad
+  XORG_NUM=$(ps aux | grep -oP '(?<=Xorg vt\d ):\d+' | head -1 || true)
+  if [[ -z "$XORG_NUM" ]]; then
+    XORG_NUM=$(ps aux | grep -oP '(?<=Xorg ):\d+' | head -1 || true)
   fi
-  # Fallback a :0 si no encuentra nada
-  XORG_DISPLAY="${XORG_DISPLAY:-:0}"
+  if [[ -z "$XORG_NUM" ]]; then
+    XORG_NUM=$(ps aux | grep Xorg | grep -oP ':\d+' | head -1 || true)
+  fi
+  # Fallback a :1 (más común en JetPack/Ubuntu con GDM)
+  XORG_DISPLAY="${XORG_NUM:-:1}"
 
   # Busca el Xauthority desde el proceso de Xorg
   XAUTH_FILE=$(ps aux | grep -oP '(?<=-auth )/run/user/\d+/gdm/Xauthority' | head -1 || true)
