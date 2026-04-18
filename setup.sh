@@ -55,7 +55,7 @@ done
 [[ $EUID -ne 0 ]] && die "Corre con sudo"
 
 echo -e "\n${BOLD}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}   NX Computing — Jetson Setup v2.1       ${NC}"
+echo -e "${BOLD}   NX Computing — Jetson Setup v2.2       ${NC}"
 echo -e "${BOLD}   Host: $(hostname) | $(date '+%Y-%m-%d %H:%M')${NC}"
 echo -e "${BOLD}══════════════════════════════════════════${NC}\n"
 
@@ -125,20 +125,50 @@ if [[ "$SKIP_VNC" == false ]]; then
 
   apt-get install -y x11vnc -qq
 
+  # ── Detecta display y Xauthority automáticamente ─────────
+  log "Detectando display activo..."
+
+  # Busca el número de display desde el proceso de Xorg
+  XORG_DISPLAY=$(ps aux | grep -oP '/usr/lib/xorg/Xorg.*\K:\d+' | head -1 || true)
+  if [[ -z "$XORG_DISPLAY" ]]; then
+    XORG_DISPLAY=$(ps aux | grep -oP 'Xorg.*\s:\K\d+' | head -1 || true)
+    XORG_DISPLAY=":${XORG_DISPLAY}"
+  fi
+  # Fallback a :0 si no encuentra nada
+  XORG_DISPLAY="${XORG_DISPLAY:-:0}"
+
+  # Busca el Xauthority desde el proceso de Xorg
+  XAUTH_FILE=$(ps aux | grep -oP '(?<=-auth )/run/user/\d+/gdm/Xauthority' | head -1 || true)
+  if [[ -z "$XAUTH_FILE" ]]; then
+    # Busca en ubicaciones comunes
+    for f in /run/user/*/gdm/Xauthority /var/lib/gdm3/:0.Xauth /var/gdm/:0.Xauth; do
+      if [[ -f "$f" ]]; then
+        XAUTH_FILE="$f"
+        break
+      fi
+    done
+  fi
+  XAUTH_FILE="${XAUTH_FILE:-/run/user/1000/gdm/Xauthority}"
+
+  ok "Display: ${BOLD}${XORG_DISPLAY}${NC} | Xauthority: ${BOLD}${XAUTH_FILE}${NC}"
+
+  # ── Contraseña VNC ────────────────────────────────────────
   VNC_PASS_FILE="/etc/x11vnc.pass"
   if [[ ! -f "$VNC_PASS_FILE" ]]; then
-    # Genera contraseña aleatoria sin caracteres especiales problemáticos
     VNC_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || true)
-    # Guarda la contraseña de forma no interactiva
-    echo "$VNC_PASS" | x11vnc -storepasswd /dev/stdin "$VNC_PASS_FILE" 2>/dev/null || \
-      x11vnc -storepasswd "$VNC_PASS" "$VNC_PASS_FILE" < /dev/null || true
+    printf '%s\n%s\n' "$VNC_PASS" "$VNC_PASS" | x11vnc -storepasswd /dev/stdin "$VNC_PASS_FILE" 2>/dev/null || \
+      x11vnc -storepasswd "$VNC_PASS" "$VNC_PASS_FILE" 2>/dev/null || true
     chmod 600 "$VNC_PASS_FILE"
-    warn "Contraseña VNC: ${BOLD}${VNC_PASS}${NC} — guárdala ahora"
+    warn "╔══════════════════════════════════════╗"
+    warn "  Contraseña VNC: ${BOLD}${VNC_PASS}${NC}"
+    warn "  Guárdala en 1Password ahora."
+    warn "╚══════════════════════════════════════╝"
   else
     ok "Contraseña VNC ya existe"
   fi
 
-  cat > /etc/systemd/system/x11vnc.service << 'EOF'
+  # ── Servicio systemd con display detectado ────────────────
+  cat > /etc/systemd/system/x11vnc.service << EOF
 [Unit]
 Description=NX VNC Server (x11vnc)
 After=network.target display-manager.service
@@ -147,17 +177,17 @@ Wants=display-manager.service
 [Service]
 Type=simple
 ExecStartPre=/bin/sleep 5
-ExecStart=/usr/bin/x11vnc \
-  -display :0 \
-  -auth guess \
-  -rfbauth /etc/x11vnc.pass \
-  -rfbport 5900 \
-  -forever \
-  -loop \
-  -noxdamage \
-  -repeat \
+ExecStart=/usr/bin/x11vnc \\
+  -display ${XORG_DISPLAY} \\
+  -auth ${XAUTH_FILE} \\
+  -rfbauth /etc/x11vnc.pass \\
+  -rfbport 5900 \\
+  -forever \\
+  -loop \\
+  -noxdamage \\
+  -repeat \\
   -shared
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
@@ -166,9 +196,15 @@ EOF
 
   systemctl daemon-reload
   systemctl enable x11vnc
-  systemctl restart x11vnc || warn "VNC arrancará cuando haya sesión gráfica activa."
+  systemctl restart x11vnc
+  sleep 2
 
-  ok "VNC configurado en puerto 5900"
+  if systemctl is-active x11vnc -q; then
+    ok "VNC corriendo en background en puerto 5900"
+  else
+    warn "VNC no pudo arrancar — revisa: sudo systemctl status x11vnc"
+  fi
+
   log "Conectar desde VNC Viewer: ${BOLD}<tailscale-ip>:5900${NC}"
 else
   warn "VNC omitido (--no-vnc)"
