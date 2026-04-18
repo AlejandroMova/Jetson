@@ -125,20 +125,14 @@ REAL_USER=$(logname 2>/dev/null || who | awk '{print $1}' | head -1 || echo "nxc
 GDM_CONF="/etc/gdm3/custom.conf"
 mkdir -p /etc/gdm3
 
-# Habilita AutomaticLoginEnable (maneja lineas comentadas)
-if grep -q "AutomaticLoginEnable" "$GDM_CONF" 2>/dev/null; then
-  sed -i "s/.*AutomaticLoginEnable.*/AutomaticLoginEnable=true/" "$GDM_CONF"
+# Escribe el bloque [daemon] completo con autologin — evita problemas con líneas comentadas
+if grep -q "^\[daemon\]" "$GDM_CONF" 2>/dev/null; then
+  # Elimina líneas previas de AutomaticLogin para evitar duplicados
+  sed -i '/.*AutomaticLogin.*/d' "$GDM_CONF"
+  # Inserta las dos líneas limpias después de [daemon]
+  sed -i "/^\[daemon\]/a AutomaticLogin=${REAL_USER}\nAutomaticLoginEnable=true" "$GDM_CONF"
 else
-  sed -i "/^\[daemon\]/a AutomaticLoginEnable=true" "$GDM_CONF"
-fi
-
-# Habilita AutomaticLogin (maneja lineas comentadas con formato "= user1")
-if grep -q "AutomaticLogin" "$GDM_CONF" 2>/dev/null; then
-  sed -i "s/.*AutomaticLogin.*/AutomaticLogin=${REAL_USER}/" "$GDM_CONF"
-  # Elimina duplicados si quedaron dos lineas
-  awk '!seen[$0]++' "$GDM_CONF" > /tmp/gdm_tmp && mv /tmp/gdm_tmp "$GDM_CONF"
-else
-  sed -i "/^\[daemon\]/a AutomaticLogin=${REAL_USER}" "$GDM_CONF"
+  printf '[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin=%s\n' "$REAL_USER" >> "$GDM_CONF"
 fi
 
 ok "Login automático configurado para: ${BOLD}${REAL_USER}${NC}"
