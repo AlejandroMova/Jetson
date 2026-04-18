@@ -182,19 +182,22 @@ if [[ "$SKIP_VNC" == false ]]; then
     ok "Contraseña VNC ya existe"
   fi
 
-  # ── Servicio systemd con display detectado ────────────────
+  # ── Servicio systemd corriendo como el usuario, no como root ─
   cat > /etc/systemd/system/x11vnc.service << EOF
 [Unit]
 Description=NX VNC Server (x11vnc)
-After=graphical-session.target display-manager.service
+After=graphical-session.target
 Wants=graphical-session.target
 
 [Service]
+User=${REAL_USER}
 Type=simple
+Environment=DISPLAY=:1
+Environment=XAUTHORITY=/run/user/1000/gdm/Xauthority
 ExecStartPre=/bin/sleep 15
 ExecStart=/usr/bin/x11vnc \\
-  -display ${XORG_DISPLAY} \\
-  -auth ${XAUTH_FILE} \\
+  -display :1 \\
+  -auth /run/user/1000/gdm/Xauthority \\
   -rfbauth /etc/x11vnc.pass \\
   -rfbport 5900 \\
   -forever \\
@@ -206,8 +209,11 @@ Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
 EOF
+
+  # El usuario necesita poder leer el archivo de contraseña
+  chmod 644 /etc/x11vnc.pass
 
   systemctl daemon-reload
   systemctl enable x11vnc
