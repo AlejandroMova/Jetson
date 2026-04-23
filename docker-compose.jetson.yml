@@ -1,0 +1,47 @@
+services:
+
+  # ── DeepStream inference pipeline ───────────────────────────────────────────
+  deepstream:
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
+    runtime: nvidia                  # NVIDIA container runtime (already on Jetson)
+    restart: unless-stopped
+    ports:
+      - "8554:8554"                  # RTSP — view with VLC: rtsp://<tailscale-ip>:8554/ds-test
+    volumes:
+      - ./app:/nx_tech/app           # Python pipeline code (hot-reloadable)
+      - ./models:/nx_tech/models     # Models + configs (engine files rebuilt here on first run)
+      - ./test_videos:/nx_tech/test_videos
+    working_dir: /nx_tech
+    environment:
+      PYTHONPATH: /nx_tech/app
+      CAMERA_ID: cam-001
+      JETSON_ID: jetson-nx-001
+      API_BASE_URL: http://backend:8000   # change to real backend URL when deployed
+      API_KEY: your-api-key
+    # To run the production app instead: change to "python3 app/app.py"
+    command: python3 app/app_video_testing.py
+
+  # ── Database ─────────────────────────────────────────────────────────────────
+  db:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: nxcomputing
+      POSTGRES_PASSWORD: nxcomputing_dev
+      POSTGRES_DB: nxcomputing
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # ── Cache ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:

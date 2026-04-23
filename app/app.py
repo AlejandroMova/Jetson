@@ -70,14 +70,13 @@ def main():
     # nvvidconv2 reconvierte la salida del OSD al formato preferido por el sink
     nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
 
-    # 7. Sumidero: Pantalla en vivo (Live Window)
-    sink = Gst.ElementFactory.make("nveglglessink", "nvvideo-renderer")
-
-    # sync=0: pipeline no se throttlea al reloj del video.
-    # Para file-source, webcam y RTSP siempre debe ser 0; de lo contrario
-    # el sink impone un techo de FPS igual a la velocidad de la fuente.
-    sink.set_property("sync", 0)
-    sink.set_property("qos", 0)
+    # 7. Sumidero: RTSP headless (ver con VLC → rtsp://<jetson-ip>:8554/ds-test)
+    sink = Gst.ElementFactory.make("nvrtspoutsinkbin", "rtsp-renderer")
+    sink.set_property("rtsp-port", 8554)
+    sink.set_property("enc-type", 0)    # 0 = hardware encoder (nvv4l2h264enc en Jetson)
+    sink.set_property("codec", 0)       # 0 = H264
+    sink.set_property("bitrate", 4000000)
+    sink.set_property("sync", False)
 
     elements = [source, h264parser, decoder, streammux, pgie, tracker,
                 secondary_inference, nvvidconv1, caps_rgba, nvosd, nvvidconv2, sink]

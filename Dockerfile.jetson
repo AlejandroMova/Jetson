@@ -1,0 +1,28 @@
+FROM nvcr.io/nvidia/deepstream-l4t:6.3-samples
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Python GStreamer bindings + compiler for custom parser
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-gi python3-dev python3-gst-1.0 \
+    python3-pip \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-built pyds wheel for arm64 — no 20-minute from-source build needed.
+# Version must match the DeepStream release: DS 6.3 → pyds 1.1.8
+RUN pip3 install \
+    https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.1.8/pyds-1.1.8-py3-none-linux_aarch64.whl
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+
+# Entrypoint compiles the custom softmax parser for the current arch (arm64)
+# and then execs the CMD passed by docker-compose.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+WORKDIR /nx_tech
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/bin/bash"]
