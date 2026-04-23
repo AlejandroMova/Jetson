@@ -55,7 +55,7 @@ done
 [[ $EUID -ne 0 ]] && die "Corre con sudo"
 
 echo -e "\n${BOLD}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}   NX Computing — Jetson Setup v2.2       ${NC}"
+echo -e "${BOLD}   NX Computing — Jetson Setup v2.4       ${NC}"
 echo -e "${BOLD}   Host: $(hostname) | $(date '+%Y-%m-%d %H:%M')${NC}"
 echo -e "${BOLD}══════════════════════════════════════════${NC}\n"
 
@@ -183,6 +183,48 @@ if [[ "$SKIP_VNC" == false ]]; then
     ok "Contraseña VNC ya existe"
   fi
 
+  # ── xorg.conf headless (fuerza resolución sin monitor físico) ─
+  log "Configurando xorg.conf para operación headless..."
+  XORG_CONF="/etc/X11/xorg.conf"
+
+  if ! grep -q "DummyMonitor" "$XORG_CONF" 2>/dev/null; then
+    cat > "$XORG_CONF" << 'XORGEOF'
+Section "Module"
+    Disable     "dri"
+    SubSection  "extmod"
+        Option  "omit xfree86-dga"
+    EndSubSection
+EndSection
+
+Section "Device"
+    Identifier  "Tegra0"
+    Driver      "nvidia"
+    Option      "AllowEmptyInitialConfiguration" "true"
+EndSection
+
+Section "Monitor"
+    Identifier "DummyMonitor"
+    HorizSync 28.0-80.0
+    VertRefresh 48.0-75.0
+    Modeline "1920x1080" 172.80 1920 2040 2248 2576 1080 1081 1084 1118
+EndSection
+
+Section "Screen"
+    Identifier "Default Screen"
+    Device "Tegra0"
+    Monitor "DummyMonitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "1920x1080"
+    EndSubSection
+EndSection
+XORGEOF
+    ok "xorg.conf configurado para headless 1920x1080"
+  else
+    ok "xorg.conf headless ya estaba configurado"
+  fi
+
   # ── Servicio de sistema que corre como el usuario ────────────
   chmod 644 /etc/x11vnc.pass
 
@@ -198,7 +240,9 @@ User=${REAL_USER}
 Environment=DISPLAY=${XORG_DISPLAY}
 Environment=XAUTHORITY=${XAUTH_FILE}
 ExecStartPre=/bin/sleep 10
-ExecStart=/usr/bin/x11vnc -display ${XORG_DISPLAY} -auth ${XAUTH_FILE} -rfbauth /etc/x11vnc.pass -rfbport 5900 -forever -shared -noxdamage
+ExecStartPre=/bin/sh -c 'fuser -k 5900/tcp 2>/dev/null || true'
+ExecStartPre=/bin/sh -c 'DISPLAY=${XORG_DISPLAY} XAUTHORITY=${XAUTH_FILE} xrandr --fb 1920x1080 2>/dev/null || true'
+ExecStart=/usr/bin/x11vnc -display ${XORG_DISPLAY} -auth ${XAUTH_FILE} -rfbauth /etc/x11vnc.pass -rfbport 5900 -forever -shared -noxdamage -noshm
 Restart=always
 RestartSec=5
 
@@ -260,7 +304,36 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
-# 5. Resumen final
+# 5. Descubrimiento de DVR
+# ════════════════════════════════════════════════════════════
+log "Buscando DVR en la red local..."
+
+if ! command -v nmap &>/dev/null; then
+  apt-get install -y nmap -qq
+fi
+
+LOCAL_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+LOCAL_SUBNET=$(ip -o -f inet addr show "$LOCAL_IFACE" 2>/dev/null | awk '{print $4}' | head -1)
+
+DVR_IP=""
+if [[ -n "$LOCAL_SUBNET" ]]; then
+  log "Escaneando ${LOCAL_SUBNET} en busca de puerto 554..."
+  DVR_IP=$(nmap -p 554 --open -oG - "$LOCAL_SUBNET" 2>/dev/null \
+    | awk '/554\/open/{print $2}' | head -1)
+fi
+
+if [[ -n "$DVR_IP" ]]; then
+  ok "DVR encontrado: ${BOLD}${DVR_IP}${NC}"
+  echo "$DVR_IP" > /etc/nx_dvr_ip
+  ok "IP guardada en /etc/nx_dvr_ip"
+else
+  warn "No se encontró DVR con puerto 554 en ${LOCAL_SUBNET:-red local}"
+  warn "Verifica conexión del DVR o corre: nmap -p 554 --open <subnet>"
+  DVR_IP="no encontrado"
+fi
+
+# ════════════════════════════════════════════════════════════
+# 6. Resumen final
 # ════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}══════════════════════════════════════════${NC}"
@@ -272,6 +345,7 @@ TS_IP=$(tailscale ip -4 2>/dev/null || echo "no conectado")
 
 echo -e "  IP local:     ${BOLD}${LOCAL_IP}${NC}"
 echo -e "  IP Tailscale: ${BOLD}${TS_IP}${NC}"
+echo -e "  IP DVR:       ${BOLD}${DVR_IP}${NC}"
 echo ""
 echo -e "  ${GREEN}SSH:${NC}  ssh NxComputingDemo@${TS_IP}"
 echo -e "  ${GREEN}VNC:${NC}  ${TS_IP}:5900  (VNC Viewer)"
