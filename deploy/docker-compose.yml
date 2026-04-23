@@ -5,23 +5,33 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.jetson
-    runtime: nvidia                  # NVIDIA container runtime (already on Jetson)
+    runtime: nvidia
     restart: unless-stopped
     ports:
-      - "8554:8554"                  # RTSP — view with VLC: rtsp://<tailscale-ip>:8554/ds-test
+      - "8554:8554"          # RTSP output — view with: vlc rtsp://<jetson-ip>:8554/ds-test
     volumes:
-      - ./app:/nx_tech/app           # Python pipeline code (hot-reloadable)
-      - ./models:/nx_tech/models     # Models + configs (engine files rebuilt here on first run)
+      - ./pipelines:/nx_tech/pipelines   # shared pipeline code
+      - ./clients:/nx_tech/clients       # per-client configs (.env gitignored)
+      - ./models:/nx_tech/models         # model files + TensorRT engines (rebuilt on first run)
+      - ./tools:/nx_tech/tools             # DVR discovery + probe scripts
       - ./test_videos:/nx_tech/test_videos
+      - /etc/nx_client:/etc/nx_client:ro   # written by setup.sh
+      - /etc/nx_dvr_ip:/etc/nx_dvr_ip:ro  # written by setup.sh
     working_dir: /nx_tech
     environment:
-      PYTHONPATH: /nx_tech/app
+      PYTHONPATH: /nx_tech/pipelines
+      # NX_CLIENT overrides /etc/nx_client — useful for testing a specific client
+      # without re-running setup.sh. Comment out to use the value from /etc/nx_client.
+      NX_CLIENT: demo
+      # Device identity — sent with every event to the API
       CAMERA_ID: cam-001
       JETSON_ID: jetson-nx-001
-      API_BASE_URL: http://backend:8000   # change to real backend URL when deployed
+      API_BASE_URL: http://localhost:8000   # update to your backend URL
       API_KEY: your-api-key
-    # To run the production app instead: change to "python3 app/app.py"
-    command: python3 app/app_video_testing.py
+    # Production: reads DVR credentials from clients/<NX_CLIENT>/.env
+    command: python3 pipelines/app.py
+    # Testing with a local video file (no DVR required):
+    # command: python3 pipelines/app_video_testing.py test_videos/sample.mp4
 
   # ── Database ─────────────────────────────────────────────────────────────────
   db:

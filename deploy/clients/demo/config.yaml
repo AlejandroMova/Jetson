@@ -1,0 +1,28 @@
+client_name: demo
+
+# DVR connection
+dvr_port: 554
+
+# RTSP URL template — placeholders replaced at runtime by config_loader:
+#   {user}      → DVR_USER from .env
+#   {password}  → DVR_PASS from .env
+#   {dvr_ip}    → DVR IP discovered by setup.sh (written to /etc/nx_dvr_ip)
+#   {port}      → dvr_port above
+#   {ch:02d}    → zero-padded channel number (01, 03, 05, ...)
+#
+# Confirm the exact path format with your DVR model before deploying.
+# Common variants:
+#   Hikvision : rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}01
+#   Dahua     : rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch:02d}&subtype=0
+#   Generic   : rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream
+rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream"
+
+# Active camera channels (DVR channel numbers, 1-indexed)
+channels: [1]
+
+# Stream resolution — must match DVR main stream output
+stream_width: 1920
+stream_height: 1080
+
+# Pipeline(s) to run: people_counting | hotspot | reid
+pipeline: people_counting

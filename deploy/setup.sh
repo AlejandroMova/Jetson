@@ -8,6 +8,7 @@
 #
 #  Flags opcionales:
 #    --authkey    Auth key de Tailscale
+#    --client     Nombre del cliente (escribe /etc/nx_client, e.g. demo)
 #    --compose    Nombre del archivo compose (default: docker-compose.yml)
 #    --hostname   Nombre visible en Tailscale (default: hostname actual)
 #    --no-vnc     Omite la instalación de VNC
@@ -36,6 +37,7 @@ COMPOSE_FILE="docker-compose.yml"
 TS_HOSTNAME="$(hostname)"
 SKIP_VNC=false
 SKIP_DOCKER=false
+NX_CLIENT=""
 
 # El script corre desde la carpeta del repo
 WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --authkey)   TS_AUTHKEY="$2";   shift 2 ;;
     --compose)   COMPOSE_FILE="$2"; shift 2 ;;
     --hostname)  TS_HOSTNAME="$2";  shift 2 ;;
+    --client)    NX_CLIENT="$2";    shift 2 ;;
     --no-vnc)    SKIP_VNC=true;     shift ;;
     --no-docker) SKIP_DOCKER=true;  shift ;;
     *) die "Flag desconocido: $1" ;;
@@ -55,7 +58,7 @@ done
 [[ $EUID -ne 0 ]] && die "Corre con sudo"
 
 echo -e "\n${BOLD}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}   NX Computing — Jetson Setup v2.4       ${NC}"
+echo -e "${BOLD}   NX Computing — Jetson Setup v2.5       ${NC}"
 echo -e "${BOLD}   Host: $(hostname) | $(date '+%Y-%m-%d %H:%M')${NC}"
 echo -e "${BOLD}══════════════════════════════════════════${NC}\n"
 
@@ -333,7 +336,22 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
-# 6. Resumen final
+# 6. Cliente NX
+# ════════════════════════════════════════════════════════════
+log "Registrando nombre de cliente..."
+
+if [[ -n "$NX_CLIENT" ]]; then
+  echo "$NX_CLIENT" > /etc/nx_client
+  ok "Cliente guardado en /etc/nx_client: ${BOLD}${NX_CLIENT}${NC}"
+elif [[ -f /etc/nx_client ]]; then
+  ok "Cliente ya registrado: ${BOLD}$(cat /etc/nx_client)${NC}"
+else
+  warn "/etc/nx_client no existe. Usa: sudo bash setup.sh --client <nombre>"
+  warn "O escríbelo manualmente: echo 'demo' | sudo tee /etc/nx_client"
+fi
+
+# ════════════════════════════════════════════════════════════
+# 7. Resumen final
 # ════════════════════════════════════════════════════════════
 echo ""
 echo -e "${BOLD}══════════════════════════════════════════${NC}"
@@ -346,6 +364,7 @@ TS_IP=$(tailscale ip -4 2>/dev/null || echo "no conectado")
 echo -e "  IP local:     ${BOLD}${LOCAL_IP}${NC}"
 echo -e "  IP Tailscale: ${BOLD}${TS_IP}${NC}"
 echo -e "  IP DVR:       ${BOLD}${DVR_IP}${NC}"
+echo -e "  Cliente NX:   ${BOLD}$(cat /etc/nx_client 2>/dev/null || echo 'no configurado')${NC}"
 echo ""
 echo -e "  ${GREEN}SSH:${NC}  ssh NxComputingDemo@${TS_IP}"
 echo -e "  ${GREEN}VNC:${NC}  ${TS_IP}:5900  (VNC Viewer)"

@@ -1,6 +1,11 @@
-cat <<EOF > .dockerignore
 venv/
 __pycache__/
+*.pyc
 videos/
 resources/
-EOF
+test_videos/
+results/
+results_model_fb/
+dev/
+*.egg-info/
+.git/

@@ -27,6 +27,9 @@ results_model_fb/
 *.png
 *.mp4
 
+# Client credentials — copy .env.example → .env and fill in per deployment
+clients/**/.env
+
 # IDE
 .vscode/
 .claude/
