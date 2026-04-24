@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional, Tuple
 
 import yaml
 from dotenv import dotenv_values
@@ -81,7 +82,7 @@ def _build_url(pattern: str, dvr_ip: str, port: int,
     )
 
 
-def _rtsp_describe(host: str, port: int, url_path: str) -> tuple[int, str]:
+def _rtsp_describe(host: str, port: int, url_path: str) -> Tuple[int, str]:
     """
     Send RTSP DESCRIBE. Returns (status_code, body).
     body contains the SDP on 200 OK — useful for future parsing.
@@ -114,7 +115,7 @@ def _rtsp_describe(host: str, port: int, url_path: str) -> tuple[int, str]:
 
 
 def _probe_pattern(pattern: str, dvr_ip: str, port: int,
-                   user: str, password: str) -> tuple[bool, str]:
+                   user: str, password: str) -> Tuple[bool, str]:
     """Try one pattern on channel 1. Returns (success, full_url)."""
     url = _build_url(pattern, dvr_ip, port, user, password, ch=1)
     url_path = re.sub(r"^rtsp://[^/]+", "", url)
@@ -127,7 +128,7 @@ def _probe_pattern(pattern: str, dvr_ip: str, port: int,
     return False, url
 
 
-def _get_resolution(rtsp_url: str) -> tuple[int, int] | None:
+def _get_resolution(rtsp_url: str) -> Optional[Tuple[int, int]]:
     """
     Use gst-discoverer-1.0 to get stream resolution.
     Returns (width, height) or None if it fails.
@@ -148,7 +149,7 @@ def _get_resolution(rtsp_url: str) -> tuple[int, int] | None:
     return None
 
 
-def _load_credentials(client_name: str) -> tuple[str, str, int, str]:
+def _load_credentials(client_name: str) -> Tuple[str, str, int, str]:
     """Returns (dvr_ip, user, password, dvr_port)."""
     dvr_ip = (
         os.environ.get("NX_DVR_IP", "").strip()
