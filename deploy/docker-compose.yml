@@ -17,6 +17,8 @@ services:
       - ./test_videos:/nx_tech/test_videos
       - /etc/nx_client:/etc/nx_client:ro   # written by setup.sh
       - /etc/nx_dvr_ip:/etc/nx_dvr_ip:ro  # written by setup.sh
+    devices:
+      - /dev/v4l2-nvenc:/dev/v4l2-nvenc   # Jetson hardware H264 encoder
     working_dir: /nx_tech
     environment:
       PYTHONPATH: /nx_tech/pipelines

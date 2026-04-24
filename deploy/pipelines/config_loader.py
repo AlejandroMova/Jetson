@@ -53,6 +53,7 @@ class ClientConfig:
                 .replace("{dvr_ip}",   self.dvr_ip)
                 .replace("{port}",     str(self.dvr_port))
                 .replace("{ch:02d}",   f"{ch:02d}")
+                .replace("{ch}",       str(ch))
             )
             urls.append(url)
         return urls
