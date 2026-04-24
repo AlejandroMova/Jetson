@@ -84,29 +84,50 @@ def _build_url(pattern: str, dvr_ip: str, port: int,
 
 
 def _recv_response(s: socket.socket) -> str:
+    """Read until we see the end of headers (\\r\\n\\r\\n) or the socket closes/times out."""
     data = b""
-    while True:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-        if b"\r\n\r\n" in data:
-            break
+    try:
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"\r\n\r\n" in data:
+                break
+    except (socket.timeout, OSError):
+        pass
     return data.decode(errors="ignore")
 
 
 def _digest_auth_header(user: str, password: str, method: str,
                         uri: str, www_auth: str) -> str:
+    """
+    Build an RFC 2617 Digest Authorization header (no-qop / RFC 2069 variant).
+
+    Dahua DVRs issue WWW-Authenticate with no qop field, so the response
+    formula is simply: MD5(HA1 : nonce : HA2).
+
+    The uri MUST be the full absolute RTSP URL (e.g. rtsp://host:554/path)
+    because RFC 2326 §10.4 mandates absolute URLs in the RTSP Request-Line,
+    and RFC 2617 §3.2.2 requires digest-uri to match the Request-URI exactly.
+
+    The www_auth string may contain a trailing \\r — strip it to avoid
+    corrupting the extracted nonce value.
+    """
+    www_auth = www_auth.strip()
     realm = re.search(r'realm="([^"]+)"', www_auth)
     nonce = re.search(r'nonce="([^"]+)"', www_auth)
     if not realm or not nonce:
         return ""
-    realm, nonce = realm.group(1), nonce.group(1)
+    realm = realm.group(1).strip()
+    nonce = nonce.group(1).strip()
     ha1 = hashlib.md5(f"{user}:{realm}:{password}".encode()).hexdigest()
     ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
     response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+    # Include algorithm="MD5" — required by some Dahua firmware revisions.
     return (f'Digest username="{user}", realm="{realm}", '
-            f'nonce="{nonce}", uri="{uri}", response="{response}"')
+            f'nonce="{nonce}", uri="{uri}", '
+            f'algorithm="MD5", response="{response}"')
 
 
 def _rtsp_describe(host: str, port: int, url_path: str,
@@ -114,6 +135,21 @@ def _rtsp_describe(host: str, port: int, url_path: str,
     """
     Send RTSP DESCRIBE with Digest auth support.
     Returns (status_code, body).
+
+    Protocol flow for Dahua (and most DVRs):
+      1. Open TCP connection → send unauthenticated DESCRIBE.
+      2. DVR replies 401 + WWW-Authenticate: Digest realm=..., nonce=...
+         Dahua closes (or may keep) the connection here.
+      3. Open a NEW TCP connection → send authenticated DESCRIBE.
+         The nonce from step 2 is valid for this new connection.
+
+    Using a fresh socket for the authenticated request is the safest
+    approach; some Dahua firmware mark a nonce as used after the first
+    401 response and will reject a retry on the same TCP session.
+
+    The uri in the Authorization header and in HA2 MUST be the full
+    absolute rtsp:// URL — RFC 2326 uses absolute URLs in the Request-Line,
+    and RFC 2617 requires digest-uri to match the Request-URI.
     """
     url = f"rtsp://{host}:{port}{url_path}"
 
@@ -128,28 +164,34 @@ def _rtsp_describe(host: str, port: int, url_path: str,
         return req
 
     try:
+        # ── Step 1: unauthenticated probe ─────────────────────────────────────
         with socket.create_connection((host, port), timeout=TIMEOUT) as s:
             s.settimeout(TIMEOUT)
-            s.sendall(_make_request().encode())
+            s.sendall(_make_request(cseq=1).encode())
             text = _recv_response(s)
-            m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
-            code = int(m.group(1)) if m else 0
 
-            if code == 401 and user and password:
-                www_auth = re.search(r"WWW-Authenticate: (.+)", text)
-                if www_auth:
-                    auth = _digest_auth_header(
-                        user, password, "DESCRIBE", url, www_auth.group(1))
-                    if auth:
-                        with socket.create_connection((host, port), timeout=TIMEOUT) as s2:
-                            s2.settimeout(TIMEOUT)
-                            s2.sendall(_make_request(auth, cseq=2).encode())
-                            text = _recv_response(s2)
-                            m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
-                            code = int(m.group(1)) if m else 0
+        m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
+        code = int(m.group(1)) if m else 0
+
+        if code == 200:
+            return code, text
+
+        # ── Step 2: digest challenge → authenticated retry (new connection) ───
+        if code == 401 and user and password:
+            www_auth_m = re.search(r"WWW-Authenticate:\s*(.+)", text)
+            if www_auth_m:
+                auth = _digest_auth_header(
+                    user, password, "DESCRIBE", url, www_auth_m.group(1))
+                if auth:
+                    with socket.create_connection((host, port), timeout=TIMEOUT) as s2:
+                        s2.settimeout(TIMEOUT)
+                        s2.sendall(_make_request(auth, cseq=2).encode())
+                        text = _recv_response(s2)
+                        m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
+                        code = int(m.group(1)) if m else 0
 
         return code, text
-    except (OSError, ConnectionRefusedError, TimeoutError):
+    except (OSError, ConnectionRefusedError, TimeoutError, socket.timeout):
         return 0, ""
 
 

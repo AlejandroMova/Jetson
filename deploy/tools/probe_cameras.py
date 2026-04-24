@@ -16,6 +16,7 @@ clients/<name>/config.yaml so you don't have to edit it manually.
 """
 
 import argparse
+import hashlib
 import os
 import re
 import socket
@@ -30,32 +31,107 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT   = 4   # seconds per channel probe
 
 
+# ── RTSP Digest auth helper ───────────────────────────────────────────────────
+
+def _digest_auth_header(user: str, password: str, method: str,
+                        uri: str, www_auth: str) -> str:
+    """
+    Build RFC 2617 no-qop Digest Authorization header.
+    uri MUST be the full absolute rtsp:// URL (RFC 2326 + RFC 2617 §3.2.2).
+    """
+    www_auth = www_auth.strip()
+    realm_m = re.search(r'realm="([^"]+)"', www_auth)
+    nonce_m = re.search(r'nonce="([^"]+)"', www_auth)
+    if not realm_m or not nonce_m:
+        return ""
+    realm = realm_m.group(1).strip()
+    nonce = nonce_m.group(1).strip()
+    ha1 = hashlib.md5(f"{user}:{realm}:{password}".encode()).hexdigest()
+    ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+    response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+    return (f'Digest username="{user}", realm="{realm}", '
+            f'nonce="{nonce}", uri="{uri}", '
+            f'algorithm="MD5", response="{response}"')
+
+
+def _recv_response(s: socket.socket) -> str:
+    data = b""
+    try:
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"\r\n\r\n" in data:
+                break
+    except (socket.timeout, OSError):
+        pass
+    return data.decode(errors="ignore")
+
+
 # ── RTSP DESCRIBE probe ───────────────────────────────────────────────────────
 
 def _rtsp_describe(host: str, port: int, path: str,
                    user: str, password: str) -> int:
     """
-    Send RTSP DESCRIBE to one URL. Returns the HTTP-style status code:
-      200 → camera present and accessible
-      401 → auth required (camera likely exists, wrong credentials)
+    Send RTSP DESCRIBE with full Digest auth support.
+    Returns the RTSP status code:
+      200 → camera present and authenticated
+      401 → persistent 401 after digest auth attempt → bad credentials
+      403 → forbidden
       404 → no stream at this path (channel empty / not configured)
       0   → connection refused / timeout (DVR unreachable)
+
+    Dahua DVRs always respond with 401+challenge on the first unauthenticated
+    request, even for channels that exist. This is NOT an auth error — it is
+    the normal challenge/response flow. We therefore always attempt digest
+    auth when we receive a 401, and only report auth_error if the second
+    authenticated request also returns 401.
     """
     url = f"rtsp://{host}:{port}{path}"
-    request = (
-        f"DESCRIBE {url} RTSP/1.0\r\n"
-        f"CSeq: 1\r\n"
-        f"User-Agent: NX-probe/1.0\r\n"
-        f"Accept: application/sdp\r\n"
-        f"\r\n"
-    )
+
+    def _make_req(auth_header: str = "", cseq: int = 1) -> bytes:
+        req = (f"DESCRIBE {url} RTSP/1.0\r\n"
+               f"CSeq: {cseq}\r\n"
+               f"User-Agent: NX-probe/1.0\r\n"
+               f"Accept: application/sdp\r\n")
+        if auth_header:
+            req += f"Authorization: {auth_header}\r\n"
+        req += "\r\n"
+        return req.encode()
+
     try:
+        # Step 1 — unauthenticated probe
         with socket.create_connection((host, port), timeout=TIMEOUT) as s:
-            s.sendall(request.encode())
-            response = s.recv(256).decode(errors="ignore")
-        m = re.search(r"RTSP/1\.\d\s+(\d{3})", response)
-        return int(m.group(1)) if m else 0
-    except (OSError, ConnectionRefusedError):
+            s.settimeout(TIMEOUT)
+            s.sendall(_make_req(cseq=1))
+            text = _recv_response(s)
+
+        m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
+        code = int(m.group(1)) if m else 0
+
+        if code != 401 or not user or not password:
+            return code
+
+        # Step 2 — digest challenge → fresh connection with credentials
+        www_auth_m = re.search(r"WWW-Authenticate:\s*(.+)", text)
+        if not www_auth_m:
+            return code
+
+        auth = _digest_auth_header(user, password, "DESCRIBE", url,
+                                   www_auth_m.group(1))
+        if not auth:
+            return code
+
+        with socket.create_connection((host, port), timeout=TIMEOUT) as s2:
+            s2.settimeout(TIMEOUT)
+            s2.sendall(_make_req(auth, cseq=2))
+            text2 = _recv_response(s2)
+
+        m2 = re.search(r"RTSP/1\.\d\s+(\d{3})", text2)
+        return int(m2.group(1)) if m2 else 0
+
+    except (OSError, ConnectionRefusedError, socket.timeout):
         return 0
 
 
@@ -70,8 +146,9 @@ def probe_channel(dvr_ip: str, dvr_port: int, pattern: str,
                   .replace("{password}", password) \
                   .replace("{ch:02d}", f"{ch:02d}")
 
-    # Extract just the path component for the DESCRIBE request
-    # (strip rtsp://host:port prefix)
+    # Extract just the path component for the socket connection
+    # (strip rtsp://host:port prefix); the full URL is reconstructed inside
+    # _rtsp_describe for use in the DESCRIBE request line and digest URI.
     url_path = re.sub(r"^rtsp://[^/]+", "", path)
 
     code = _rtsp_describe(dvr_ip, dvr_port, url_path, user, password)
@@ -79,6 +156,7 @@ def probe_channel(dvr_ip: str, dvr_port: int, pattern: str,
     if code == 200:
         return "ok"
     elif code in (401, 403):
+        # 401 here means digest auth was attempted and still rejected → bad creds
         return "auth_error"
     elif code == 404:
         return "empty"
