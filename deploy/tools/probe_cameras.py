@@ -21,6 +21,7 @@ import re
 import socket
 import sys
 from pathlib import Path
+from typing import List
 
 import yaml
 from dotenv import dotenv_values
@@ -117,7 +118,7 @@ def _load_runtime(client_name: str):
     return dvr_ip, cfg, user, password, config_path
 
 
-def _update_config(config_path: Path, channels: list[int]):
+def _update_config(config_path: Path, channels: List[int]):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     cfg["channels"] = channels
