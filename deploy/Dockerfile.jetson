@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/deepstream-l4t:6.3-samples
+FROM nvcr.io/nvidia/deepstream:7.1-samples-multiarch
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pre-built pyds wheel for arm64 — no 20-minute from-source build needed.
 # Version must match the DeepStream release: DS 6.3 → pyds 1.1.8
 RUN pip3 install \
-    https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.1.8/pyds-1.1.8-py3-none-linux_aarch64.whl
+    https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.1.11/pyds-1.1.11-py3-none-linux_aarch64.whl
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
