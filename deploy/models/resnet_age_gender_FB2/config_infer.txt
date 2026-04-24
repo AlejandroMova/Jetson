@@ -13,7 +13,7 @@ model-color-format=0
 
 # Dimensiones y Tipo de Red
 infer-dims=3;224;224
-batch-size=16
+batch-size=8
 network-mode=2
 network-type=1
 
@@ -29,6 +29,7 @@ custom-lib-path=libcustom_softmax_parser.so
 parse-classifier-func-name=CustomClassifierParseFunction
 
 # Umbrales y rendimiento
+workspace-size=1024
 interval=1
 classifier-async-mode=0
 classifier-threshold=0.1
