@@ -8,13 +8,17 @@ PARSER_SRC="$PARSER_DIR/custom_softmax_parser.cpp"
 PARSER_OUT="$PARSER_DIR/libcustom_softmax_parser.so"
 DS_INCLUDES="/opt/nvidia/deepstream/deepstream/sources/includes"
 
-echo "[entrypoint] Compiling custom softmax parser for $(uname -m)..."
-g++ -shared -fPIC \
-    -o "$PARSER_OUT" \
-    "$PARSER_SRC" \
-    -I"$DS_INCLUDES" \
-    -I"$PARSER_DIR" \
-    -std=c++14 -O2
-echo "[entrypoint] Parser compiled: $PARSER_OUT"
+if [[ -f "$PARSER_SRC" ]]; then
+    echo "[entrypoint] Compiling custom softmax parser for $(uname -m)..."
+    g++ -shared -fPIC \
+        -o "$PARSER_OUT" \
+        "$PARSER_SRC" \
+        -I"$DS_INCLUDES" \
+        -I"$PARSER_DIR" \
+        -std=c++14 -O2
+    echo "[entrypoint] Parser compiled: $PARSER_OUT"
+else
+    echo "[entrypoint] Parser source not found — skipping compilation (no models volume mounted)"
+fi
 
 exec "$@"
