@@ -348,6 +348,20 @@ if [[ "$SKIP_DOCKER" == false ]]; then
     ENV_FILE="${WORK_DIR}/clients/${CLIENT_NAME}/.env"
 
     if [[ -n "$CLIENT_NAME" && -f "$ENV_FILE" && "$DVR_IP" != "no encontrado" ]]; then
+      # Crear directorio y config.yaml mínimo si no existen
+      CLIENT_DIR="${WORK_DIR}/clients/${CLIENT_NAME}"
+      mkdir -p "$CLIENT_DIR"
+      if [[ ! -f "${CLIENT_DIR}/config.yaml" ]]; then
+        cat > "${CLIENT_DIR}/config.yaml" << CFGEOF
+dvr_port: 554
+rtsp_url_pattern: ""
+stream_width: 1920
+stream_height: 1080
+channels: []
+CFGEOF
+        ok "config.yaml inicial creado en ${CLIENT_DIR}/"
+      fi
+
       log "Identificando marca/patrón del DVR..."
       if $COMPOSE_CMD -f "$COMPOSE_FILE" run --rm deepstream \
           python3 tools/identify_dvr.py --update-config; then

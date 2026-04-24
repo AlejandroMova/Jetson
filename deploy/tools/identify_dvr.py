@@ -331,8 +331,11 @@ def main():
     # ── Write or print result ─────────────────────────────────────────────────
     if args.update_config:
         cfg_path = REPO_ROOT / "clients" / client_name / "config.yaml"
-        with open(cfg_path) as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg = {}
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f) or {}
         cfg["dvr_port"]         = dvr_port
         cfg["rtsp_url_pattern"] = working_pattern
         cfg["stream_width"]     = width
