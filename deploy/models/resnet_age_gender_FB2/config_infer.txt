@@ -13,7 +13,7 @@ model-color-format=0
 
 # Dimensiones y Tipo de Red
 infer-dims=3;224;224
-batch-size=8
+batch-size=16
 network-mode=2
 network-type=1
 
