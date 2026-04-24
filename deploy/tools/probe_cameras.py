@@ -144,7 +144,8 @@ def probe_channel(dvr_ip: str, dvr_port: int, pattern: str,
                   .replace("{port}", str(dvr_port)) \
                   .replace("{user}", user) \
                   .replace("{password}", password) \
-                  .replace("{ch:02d}", f"{ch:02d}")
+                  .replace("{ch:02d}", f"{ch:02d}") \
+                  .replace("{ch}", str(ch))
 
     # Extract just the path component for the socket connection
     # (strip rtsp://host:port prefix); the full URL is reconstructed inside
