@@ -101,32 +101,32 @@ def _rtsp_describe(host: str, port: int, path: str,
         return req.encode()
 
     try:
-        # Step 1 — unauthenticated probe
         with socket.create_connection((host, port), timeout=TIMEOUT) as s:
             s.settimeout(TIMEOUT)
+
+            # Step 1 — unauthenticated probe
             s.sendall(_make_req(cseq=1))
             text = _recv_response(s)
 
-        m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
-        code = int(m.group(1)) if m else 0
+            m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
+            code = int(m.group(1)) if m else 0
 
-        if code != 401 or not user or not password:
-            return code
+            if code != 401 or not user or not password:
+                return code
 
-        # Step 2 — digest challenge → fresh connection with credentials
-        www_auth_m = re.search(r"WWW-Authenticate:\s*(.+)", text)
-        if not www_auth_m:
-            return code
+            # Step 2 — digest auth on the SAME connection
+            # Dahua binds the nonce to the TCP session.
+            www_auth_m = re.search(r"WWW-Authenticate:\s*(.+)", text)
+            if not www_auth_m:
+                return code
 
-        auth = _digest_auth_header(user, password, "DESCRIBE", url,
-                                   www_auth_m.group(1))
-        if not auth:
-            return code
+            auth = _digest_auth_header(user, password, "DESCRIBE", url,
+                                       www_auth_m.group(1))
+            if not auth:
+                return code
 
-        with socket.create_connection((host, port), timeout=TIMEOUT) as s2:
-            s2.settimeout(TIMEOUT)
-            s2.sendall(_make_req(auth, cseq=2))
-            text2 = _recv_response(s2)
+            s.sendall(_make_req(auth, cseq=2))
+            text2 = _recv_response(s)
 
         m2 = re.search(r"RTSP/1\.\d\s+(\d{3})", text2)
         return int(m2.group(1)) if m2 else 0
