@@ -351,10 +351,10 @@ if [[ "$SKIP_DOCKER" == false ]]; then
       log "Identificando marca/patrón del DVR..."
       if $COMPOSE_CMD -f "$COMPOSE_FILE" run --rm deepstream \
           python3 tools/identify_dvr.py --update-config; then
-        ok "DVR identificado y config.yaml actualizado"
+        ok "Patrón de URL del DVR identificado y config.yaml actualizado"
       else
-        warn "No se pudo identificar el DVR automáticamente."
-        warn "Corre manualmente: docker compose run --rm deepstream python3 tools/identify_dvr.py"
+        warn "No se pudo identificar el patrón de URL del DVR (IP sí encontrada: ${DVR_IP})."
+        warn "Corre manualmente: docker compose run --rm deepstream python3 tools/identify_dvr.py --update-config"
       fi
 
       log "Detectando canales activos..."
@@ -362,7 +362,7 @@ if [[ "$SKIP_DOCKER" == false ]]; then
           python3 tools/probe_cameras.py --update-config; then
         ok "Canales activos detectados y config.yaml actualizado"
       else
-        warn "No se pudieron detectar los canales automáticamente."
+        warn "No se pudieron detectar los canales activos."
         warn "Corre manualmente: docker compose run --rm deepstream python3 tools/probe_cameras.py --update-config"
       fi
     else
