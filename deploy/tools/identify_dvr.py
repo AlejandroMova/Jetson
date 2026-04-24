@@ -15,6 +15,7 @@ Usage (run inside the Docker container on the Jetson):
 """
 
 import argparse
+import hashlib
 import os
 import re
 import socket
@@ -82,34 +83,71 @@ def _build_url(pattern: str, dvr_ip: str, port: int,
     )
 
 
-def _rtsp_describe(host: str, port: int, url_path: str) -> Tuple[int, str]:
+def _recv_response(s: socket.socket) -> str:
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+        if b"\r\n\r\n" in data:
+            break
+    return data.decode(errors="ignore")
+
+
+def _digest_auth_header(user: str, password: str, method: str,
+                        uri: str, www_auth: str) -> str:
+    realm = re.search(r'realm="([^"]+)"', www_auth)
+    nonce = re.search(r'nonce="([^"]+)"', www_auth)
+    if not realm or not nonce:
+        return ""
+    realm, nonce = realm.group(1), nonce.group(1)
+    ha1 = hashlib.md5(f"{user}:{realm}:{password}".encode()).hexdigest()
+    ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+    response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+    return (f'Digest username="{user}", realm="{realm}", '
+            f'nonce="{nonce}", uri="{uri}", response="{response}"')
+
+
+def _rtsp_describe(host: str, port: int, url_path: str,
+                   user: str = "", password: str = "") -> Tuple[int, str]:
     """
-    Send RTSP DESCRIBE. Returns (status_code, body).
-    body contains the SDP on 200 OK — useful for future parsing.
+    Send RTSP DESCRIBE with Digest auth support.
+    Returns (status_code, body).
     """
     url = f"rtsp://{host}:{port}{url_path}"
-    request = (
-        f"DESCRIBE {url} RTSP/1.0\r\n"
-        f"CSeq: 1\r\n"
-        f"User-Agent: NX-identify/1.0\r\n"
-        f"Accept: application/sdp\r\n"
-        f"\r\n"
-    )
+
+    def _make_request(auth_header: str = "", cseq: int = 1) -> str:
+        req = (f"DESCRIBE {url} RTSP/1.0\r\n"
+               f"CSeq: {cseq}\r\n"
+               f"User-Agent: NX-identify/1.0\r\n"
+               f"Accept: application/sdp\r\n")
+        if auth_header:
+            req += f"Authorization: {auth_header}\r\n"
+        req += "\r\n"
+        return req
+
     try:
         with socket.create_connection((host, port), timeout=TIMEOUT) as s:
             s.settimeout(TIMEOUT)
-            s.sendall(request.encode())
-            data = b""
-            while True:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\r\n\r\n" in data:
-                    break
-        text = data.decode(errors="ignore")
-        m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
-        code = int(m.group(1)) if m else 0
+            s.sendall(_make_request().encode())
+            text = _recv_response(s)
+            m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
+            code = int(m.group(1)) if m else 0
+
+            if code == 401 and user and password:
+                www_auth = re.search(r"WWW-Authenticate: (.+)", text)
+                if www_auth:
+                    auth = _digest_auth_header(
+                        user, password, "DESCRIBE", url, www_auth.group(1))
+                    if auth:
+                        with socket.create_connection((host, port), timeout=TIMEOUT) as s2:
+                            s2.settimeout(TIMEOUT)
+                            s2.sendall(_make_request(auth, cseq=2).encode())
+                            text = _recv_response(s2)
+                            m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
+                            code = int(m.group(1)) if m else 0
+
         return code, text
     except (OSError, ConnectionRefusedError, TimeoutError):
         return 0, ""
@@ -120,12 +158,12 @@ def _probe_pattern(pattern: str, dvr_ip: str, port: int,
     """Try one pattern on channel 1. Returns (success, full_url)."""
     url = _build_url(pattern, dvr_ip, port, user, password, ch=1)
     url_path = re.sub(r"^rtsp://[^/]+", "", url)
-    code, _ = _rtsp_describe(dvr_ip, port, url_path)
+    code, _ = _rtsp_describe(dvr_ip, port, url_path, user, password)
 
     if code == 200:
         return True, url
-    if code in (401, 403):
-        return None, url   # None = auth error
+    if code == 403:
+        return None, url   # Forbidden — wrong credentials
     return False, url
 
 
