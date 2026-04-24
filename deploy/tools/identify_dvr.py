@@ -97,6 +97,7 @@ def _rtsp_describe(host: str, port: int, url_path: str) -> Tuple[int, str]:
     )
     try:
         with socket.create_connection((host, port), timeout=TIMEOUT) as s:
+            s.settimeout(TIMEOUT)
             s.sendall(request.encode())
             data = b""
             while True:
@@ -104,7 +105,7 @@ def _rtsp_describe(host: str, port: int, url_path: str) -> Tuple[int, str]:
                 if not chunk:
                     break
                 data += chunk
-                if b"\r\n\r\n" in data and len(data) > 512:
+                if b"\r\n\r\n" in data:
                     break
         text = data.decode(errors="ignore")
         m = re.search(r"RTSP/1\.\d\s+(\d{3})", text)
