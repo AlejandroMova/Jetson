@@ -270,44 +270,7 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
-# 4. Docker Compose
-# ════════════════════════════════════════════════════════════
-if [[ "$SKIP_DOCKER" == false ]]; then
-  log "Arrancando contenedores Docker desde: ${WORK_DIR}"
-
-  if ! command -v docker &>/dev/null; then
-    die "Docker no está instalado. Instala con: curl -fsSL https://get.docker.com | sh"
-  fi
-
-  COMPOSE_PATH="${WORK_DIR}/${COMPOSE_FILE}"
-
-  if [[ ! -f "$COMPOSE_PATH" ]]; then
-    warn "No se encontró ${COMPOSE_PATH} — saltando Docker."
-    warn "Agrega docker-compose.yml al repo para que arranque automático."
-  else
-    cd "$WORK_DIR"
-
-    if docker compose version &>/dev/null 2>&1; then
-      COMPOSE_CMD="docker compose"
-    elif command -v docker-compose &>/dev/null; then
-      COMPOSE_CMD="docker-compose"
-    else
-      die "docker compose no encontrado."
-    fi
-
-    log "Usando: ${COMPOSE_CMD}"
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --build --remove-orphans
-
-    ok "Contenedores arriba"
-    echo ""
-    $COMPOSE_CMD -f "$COMPOSE_FILE" ps
-  fi
-else
-  warn "Docker omitido (--no-docker)"
-fi
-
-# ════════════════════════════════════════════════════════════
-# 5. Descubrimiento de DVR
+# 4. Descubrimiento de DVR
 # ════════════════════════════════════════════════════════════
 log "Buscando DVR en la red local..."
 
@@ -336,7 +299,7 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
-# 6. Cliente NX
+# 5. Cliente NX
 # ════════════════════════════════════════════════════════════
 log "Registrando nombre de cliente..."
 
@@ -348,6 +311,78 @@ elif [[ -f /etc/nx_client ]]; then
 else
   warn "/etc/nx_client no existe. Usa: sudo bash setup.sh --client <nombre>"
   warn "O escríbelo manualmente: echo 'demo' | sudo tee /etc/nx_client"
+fi
+
+# ════════════════════════════════════════════════════════════
+# 6. Docker Compose
+# ════════════════════════════════════════════════════════════
+if [[ "$SKIP_DOCKER" == false ]]; then
+  log "Configurando pipeline Docker desde: ${WORK_DIR}"
+
+  if ! command -v docker &>/dev/null; then
+    die "Docker no está instalado. Instala con: curl -fsSL https://get.docker.com | sh"
+  fi
+
+  COMPOSE_PATH="${WORK_DIR}/${COMPOSE_FILE}"
+
+  if [[ ! -f "$COMPOSE_PATH" ]]; then
+    warn "No se encontró ${COMPOSE_PATH} — saltando Docker."
+  else
+    cd "$WORK_DIR"
+
+    if docker compose version &>/dev/null 2>&1; then
+      COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &>/dev/null; then
+      COMPOSE_CMD="docker-compose"
+    else
+      die "docker compose no encontrado."
+    fi
+
+    # ── 6a. Build ────────────────────────────────────────────
+    log "Construyendo imagen Docker (~10 min la primera vez)..."
+    $COMPOSE_CMD -f "$COMPOSE_FILE" build deepstream
+    ok "Imagen construida"
+
+    # ── 6b. Auto-identificar DVR (patrón URL + resolución) ───
+    CLIENT_NAME=$(cat /etc/nx_client 2>/dev/null || echo "")
+    ENV_FILE="${WORK_DIR}/clients/${CLIENT_NAME}/.env"
+
+    if [[ -n "$CLIENT_NAME" && -f "$ENV_FILE" && "$DVR_IP" != "no encontrado" ]]; then
+      log "Identificando marca/patrón del DVR..."
+      if $COMPOSE_CMD -f "$COMPOSE_FILE" run --rm deepstream \
+          python3 tools/identify_dvr.py --update-config; then
+        ok "DVR identificado y config.yaml actualizado"
+      else
+        warn "No se pudo identificar el DVR automáticamente."
+        warn "Corre manualmente: docker compose run --rm deepstream python3 tools/identify_dvr.py"
+      fi
+
+      log "Detectando canales activos..."
+      if $COMPOSE_CMD -f "$COMPOSE_FILE" run --rm deepstream \
+          python3 tools/probe_cameras.py --update-config; then
+        ok "Canales activos detectados y config.yaml actualizado"
+      else
+        warn "No se pudieron detectar los canales automáticamente."
+        warn "Corre manualmente: docker compose run --rm deepstream python3 tools/probe_cameras.py --update-config"
+      fi
+    else
+      if [[ -z "$CLIENT_NAME" ]]; then
+        warn "Sin /etc/nx_client — saltando identificación de DVR. Usa --client <nombre>"
+      elif [[ ! -f "$ENV_FILE" ]]; then
+        warn "Sin credenciales DVR en ${ENV_FILE} — saltando identificación de DVR."
+        warn "Crea el archivo y corre: docker compose run --rm deepstream python3 tools/identify_dvr.py --update-config"
+      fi
+    fi
+
+    # ── 6c. Arrancar pipeline ────────────────────────────────
+    log "Arrancando pipeline..."
+    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --remove-orphans
+    ok "Pipeline arriba"
+    echo ""
+    $COMPOSE_CMD -f "$COMPOSE_FILE" ps
+  fi
+else
+  warn "Docker omitido (--no-docker)"
 fi
 
 # ════════════════════════════════════════════════════════════

@@ -40,34 +40,33 @@ NX-JETSON/
 git clone https://github.com/AlejandroMova/NX-JETSON.git
 cd NX-JETSON/deploy
 
-# 2. Run setup script (SSH, Tailscale, Docker, DVR auto-discovery)
-sudo bash setup.sh --client <client_name> --authkey <tailscale-key>
-# This writes /etc/nx_client and /etc/nx_dvr_ip
-
-# 3. Create client credentials (on the Jetson — never on laptop)
+# 2. Create client credentials (on the Jetson — never on laptop)
 cp clients/demo/.env.example clients/<client_name>/.env
 nano clients/<client_name>/.env     # fill DVR_USER and DVR_PASS
 
-# 4. Build the Docker image (first time ~10 min)
-docker compose build
+# 3. Run setup — does everything automatically:
+#    installs Docker + Tailscale, detects DVR IP, builds image,
+#    identifies DVR URL pattern, detects active channels, starts pipeline
+sudo bash setup.sh --client <client_name> --authkey <tailscale-key>
 
-# 5. Auto-identify DVR: URL pattern + stream resolution
-docker compose run --rm deepstream python3 tools/identify_dvr.py
-# → copy the printed values into clients/<client_name>/config.yaml
-
-# 6. Find which channels have cameras connected
-docker compose run --rm deepstream python3 tools/probe_cameras.py --update-config
-# → writes the active channel list into clients/<client_name>/config.yaml automatically
-
-# 7. Start everything
-docker compose up -d
-
-# 8. Watch inference from your laptop
+# 4. Watch inference from your laptop
 vlc rtsp://<jetson-tailscale-ip>:8554/ds-test
 ```
 
 > **First run**: TensorRT will build engines for both models (~5 min each).  
 > Subsequent starts take ~30 seconds.
+
+### Manual mode (if you need to run steps individually)
+
+```bash
+# Skip docker in setup, then run each step manually:
+sudo bash setup.sh --client <client_name> --authkey <tailscale-key> --no-docker
+
+docker compose build
+docker compose run --rm deepstream python3 tools/identify_dvr.py --update-config
+docker compose run --rm deepstream python3 tools/probe_cameras.py --update-config
+docker compose up -d
+```
 
 ---
 

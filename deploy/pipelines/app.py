@@ -21,7 +21,7 @@ from gi.repository import GLib, Gst
 
 import pyds
 from config_loader import load_config
-from probes import osd_sink_pad_buffer_probe, api_client
+from probes import osd_sink_pad_buffer_probe, api_client, init_channel_map
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +73,7 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
 def main():
     cfg = load_config()
     cfg.log_summary()
+    init_channel_map(cfg.channels)
 
     urls = cfg.rtsp_urls()
     n_streams = len(urls)

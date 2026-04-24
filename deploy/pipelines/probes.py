@@ -35,10 +35,25 @@ logger = logging.getLogger(__name__)
 # CONFIGURACIÓN
 # Ajusta estos valores según tu entorno. Idealmente muévalos a un .env o config.
 # ==============================================================================
-CAMERA_ID: str  = os.environ.get("CAMERA_ID",  "cam-001")
-JETSON_ID: str  = os.environ.get("JETSON_ID",  os.uname().nodename)
+JETSON_ID: str    = os.environ.get("JETSON_ID",  os.uname().nodename)
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "http://localhost:8000")
-API_KEY: str    = os.environ.get("API_KEY",    "your-api-key")
+API_KEY: str      = os.environ.get("API_KEY",    "your-api-key")
+
+# Mapa pad_index → número de canal real del DVR.
+# Se inicializa desde app.py llamando a init_channel_map(cfg.channels).
+# Ejemplo: channels=[1,3,5] → {0: 1, 1: 3, 2: 5}
+_channel_map: Dict[int, int] = {}
+
+def init_channel_map(channels: list):
+    """Llamar desde app.py después de load_config(), antes de arrancar el pipeline."""
+    global _channel_map
+    _channel_map = {idx: ch for idx, ch in enumerate(channels)}
+    logger.info("Channel map: %s", _channel_map)
+
+def _camera_id_for(pad_index: int) -> str:
+    """Devuelve un camera_id con el canal real, ej. 'jetson-nx-001-ch03'."""
+    ch = _channel_map.get(pad_index, pad_index)
+    return f"{JETSON_ID}-ch{ch:02d}"
 
 # gie-unique-id de cada modelo (deben coincidir con los configs de nvinfer)
 PGIE_UNIQUE_ID: int = 1       # PeopleNet
@@ -187,17 +202,16 @@ class NxApiClient:
     # ------------------------------------------------------------------
     # Métodos de negocio (wrappers de alto nivel)
     # ------------------------------------------------------------------
-    def post_detection_event(self, frame_num: int, detections: List[dict],
+    def post_detection_event(self, camera_id: str, frame_num: int, detections: List[dict],
                              event_type: str = "person_detection"):
         """
         Envía un evento de detección al backend.
-        Construye el payload con la estructura esperada por el dashboard.
         event_type: "person_detection" (primera aparición) o
                     "person_classified" (clasificación demográfica confirmada).
         """
         payload = {
             "event_id": str(uuid.uuid4()),
-            "camera_id": CAMERA_ID,
+            "camera_id": camera_id,
             "jetson_id": JETSON_ID,
             "frame_num": frame_num,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -208,13 +222,10 @@ class NxApiClient:
         }
         self.enqueue("POST", "/api/events", payload)
 
-    def post_analytics_snapshot(self, stats: dict):
-        """
-        Envía un snapshot de analytics agregadas (edad/género, conteo).
-        Alimenta el endpoint GET /api/analytics/age-gender del dashboard.
-        """
+    def post_analytics_snapshot(self, camera_id: str, stats: dict):
+        """Envía un snapshot de analytics agregadas (edad/género, conteo) por cámara."""
         payload = {
-            "camera_id": CAMERA_ID,
+            "camera_id": camera_id,
             "jetson_id": JETSON_ID,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             **stats,
@@ -230,10 +241,10 @@ class NxApiClient:
     def add_event_note(self, event_id: str, text: str):
         self.enqueue("POST", f"/api/events/{event_id}/notes", {"text": text})
 
-    def post_crop(self, track_id: int, frame_num: int, crop_b64: str, bbox: dict):
+    def post_crop(self, camera_id: str, track_id: int, frame_num: int, crop_b64: str, bbox: dict):
         """Envía un recorte de persona a la API para construcción de dataset."""
         payload = {
-            "camera_id": CAMERA_ID,
+            "camera_id": camera_id,
             "jetson_id": JETSON_ID,
             "track_id": track_id,
             "frame_num": frame_num,
@@ -243,14 +254,14 @@ class NxApiClient:
         }
         self.enqueue("POST", "/api/crops", payload)
 
-    def post_reference_frame(self, frame_num: int, frame_b64: str, width: int, height: int):
+    def post_reference_frame(self, camera_id: str, frame_num: int, frame_b64: str, width: int, height: int):
         """
         Envía un frame de referencia sin personas al backend.
         El dashboard lo usa como fondo para superponer el heatmap de posiciones.
-        Se envía una sola vez por sesión (primer frame limpio disponible).
+        Se envía una sola vez por sesión por cámara (primer frame limpio disponible).
         """
         payload = {
-            "camera_id": CAMERA_ID,
+            "camera_id": camera_id,
             "jetson_id": JETSON_ID,
             "frame_num": frame_num,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -392,35 +403,43 @@ _person_notified: set = set()
 _crop_counts: Dict[int, int] = {}
 _crop_last_frame: Dict[int, int] = {}
 
-# Frame de referencia (sin personas) para el heatmap del dashboard.
-# Se envía una sola vez por sesión — el primer frame donde no hay detecciones.
-_reference_frame_sent: bool = False
+# Frame de referencia enviado por pad_index — uno por cámara, una sola vez por sesión
+_reference_frame_sent: Dict[int, bool] = {}
 
-# Acumulador para analytics agregadas (se envía cada ANALYTICS_SEND_INTERVAL_SECS)
-_analytics: Dict = {
-    "person_count": 0,
-    "gender_male": 0,
-    "gender_female": 0,
-    "age_gender_classes": {},   # e.g. {"male_adult": 12, "female_young": 3, ...}
-}
-_analytics_last_sent: float = time.monotonic()
+# Analytics y timestamp por pad_index — conteos independientes por cámara
+_analytics: Dict[int, Dict] = {}
+_analytics_last_sent: Dict[int, float] = {}
+
+def _get_analytics(pad_index: int) -> Dict:
+    if pad_index not in _analytics:
+        _analytics[pad_index] = {
+            "person_count": 0, "gender_male": 0,
+            "gender_female": 0, "age_gender_classes": {},
+        }
+    return _analytics[pad_index]
+
+def _get_analytics_last_sent(pad_index: int) -> float:
+    if pad_index not in _analytics_last_sent:
+        _analytics_last_sent[pad_index] = time.monotonic()
+    return _analytics_last_sent[pad_index]
 
 
 def _save_and_send_crop(
     crop_bgr: np.ndarray,
+    camera_id: str,
     track_id: int,
     frame_num: int,
     bbox: dict,
 ) -> None:
     """Guarda el recorte localmente y lo envía a la API de forma no bloqueante."""
-    person_dir = Path(CROPS_DIR) / str(track_id)
+    person_dir = Path(CROPS_DIR) / camera_id / str(track_id)
     person_dir.mkdir(parents=True, exist_ok=True)
     filepath = person_dir / f"frame_{frame_num:06d}.jpg"
     cv2.imwrite(str(filepath), crop_bgr)
 
     _, buf = cv2.imencode(".jpg", crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     crop_b64 = base64.b64encode(buf).decode("utf-8")
-    api_client.post_crop(track_id, frame_num, crop_b64, bbox)
+    api_client.post_crop(camera_id, track_id, frame_num, crop_b64, bbox)
 
 
 def osd_sink_pad_buffer_probe(_pad, info):
@@ -437,7 +456,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
       - Si aún no hay resultado          → muestra "P#N | Analizando..." en cyan.
       - Si ya fue clasificada antes      → recupera de caché (no re-analiza).
     """
-    global _analytics, _analytics_last_sent, _person_notified, _person_cache, _person_votes, _person_vote_last_frame, _crop_counts, _crop_last_frame, _reference_frame_sent
+    global _person_notified, _person_cache, _person_votes, _person_vote_last_frame, _crop_counts, _crop_last_frame
 
     gst_buffer = info.get_buffer()
     if not gst_buffer:
@@ -451,6 +470,8 @@ def osd_sink_pad_buffer_probe(_pad, info):
         batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
     ):
         frame_num = frame_meta.frame_num
+        pad_index = frame_meta.pad_index
+        camera_id = _camera_id_for(pad_index)
         frame_detections: List[dict] = []
 
         # Extraer frame como numpy (una sola vez por frame para todos los objetos)
@@ -556,7 +577,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     crop = frame_np[t:t + h, l:l + w]
                     if crop.shape[0] >= CROP_MIN_HEIGHT and crop.shape[1] >= CROP_MIN_WIDTH:
                         _save_and_send_crop(
-                            crop, p_track_id, frame_num,
+                            crop, camera_id, p_track_id, frame_num,
                             {"left": l, "top": t, "width": w, "height": h},
                         )
                         _crop_counts[p_track_id] = count + 1
@@ -568,7 +589,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 det = _build_detection_dict(obj_meta)
                 det["type"] = "person"
                 frame_detections.append(det)
-                _analytics["person_count"] += 1
+                _get_analytics(pad_index)["person_count"] += 1
 
             # Notificar primera clasificación confirmada
             if is_new_classification:
@@ -582,27 +603,26 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     "confidence": round(prob, 3),
                 }
                 frame_detections.append(det)
-                _analytics["age_gender_classes"][raw_label] = (
-                    _analytics["age_gender_classes"].get(raw_label, 0) + 1
-                )
+                an = _get_analytics(pad_index)
+                an["age_gender_classes"][raw_label] = an["age_gender_classes"].get(raw_label, 0) + 1
                 if raw_label.startswith("male"):
-                    _analytics["gender_male"] += 1
+                    an["gender_male"] += 1
                 else:
-                    _analytics["gender_female"] += 1
+                    an["gender_female"] += 1
 
         # ----------------------------------------------------------------
-        # Frame de referencia para heatmap — primer frame sin personas
+        # Frame de referencia para heatmap — primer frame sin personas, por cámara
         # ----------------------------------------------------------------
-        if (not _reference_frame_sent
+        if (not _reference_frame_sent.get(pad_index, False)
                 and frame_np is not None
                 and not frame_detections
                 and frame_meta.num_obj_meta == 0):
             h, w = frame_np.shape[:2]
             _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
             frame_b64 = base64.b64encode(buf).decode("utf-8")
-            api_client.post_reference_frame(frame_num, frame_b64, w, h)
-            _reference_frame_sent = True
-            logger.info("Frame de referencia enviado (frame=%d, %dx%d)", frame_num, w, h)
+            api_client.post_reference_frame(camera_id, frame_num, frame_b64, w, h)
+            _reference_frame_sent[pad_index] = True
+            logger.info("Frame de referencia enviado camera=%s (frame=%d, %dx%d)", camera_id, frame_num, w, h)
 
         # ----------------------------------------------------------------
         # Enviar evento solo cuando hay detección nueva o clasificación nueva
@@ -610,23 +630,24 @@ def osd_sink_pad_buffer_probe(_pad, info):
         if frame_detections:
             has_classified = any(d.get("type") == "person_classified" for d in frame_detections)
             evt_type = "person_classified" if has_classified else "person_detection"
-            api_client.post_detection_event(frame_num, frame_detections, evt_type)
+            api_client.post_detection_event(camera_id, frame_num, frame_detections, evt_type)
 
         # ----------------------------------------------------------------
-        # Enviar analytics agregadas cada ANALYTICS_SEND_INTERVAL_SECS
+        # Enviar analytics agregadas cada ANALYTICS_SEND_INTERVAL_SECS, por cámara
         # ----------------------------------------------------------------
         now = time.monotonic()
-        if now - _analytics_last_sent >= ANALYTICS_SEND_INTERVAL_SECS:
-            api_client.post_analytics_snapshot({
-                "people_count":       _analytics["person_count"],
-                "gender_male":        _analytics["gender_male"],
-                "gender_female":      _analytics["gender_female"],
-                "age_gender_classes": _analytics["age_gender_classes"],
+        if now - _get_analytics_last_sent(pad_index) >= ANALYTICS_SEND_INTERVAL_SECS:
+            an = _get_analytics(pad_index)
+            api_client.post_analytics_snapshot(camera_id, {
+                "people_count":       an["person_count"],
+                "gender_male":        an["gender_male"],
+                "gender_female":      an["gender_female"],
+                "age_gender_classes": an["age_gender_classes"],
             })
-            _analytics = {
+            _analytics[pad_index] = {
                 "person_count": 0, "gender_male": 0,
                 "gender_female": 0, "age_gender_classes": {},
             }
-            _analytics_last_sent = now
+            _analytics_last_sent[pad_index] = now
 
     return Gst.PadProbeReturn.OK

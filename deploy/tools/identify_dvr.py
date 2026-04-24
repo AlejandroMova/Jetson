@@ -182,9 +182,10 @@ def _load_credentials(client_name: str) -> tuple[str, str, int, str]:
 
 def main():
     ap = argparse.ArgumentParser(description="Auto-identify DVR RTSP URL pattern and stream resolution")
-    ap.add_argument("--client",  default=None, help="Client name (default: /etc/nx_client)")
-    ap.add_argument("--dvr-ip",  default=None, help="Override DVR IP")
-    ap.add_argument("--port",    type=int, default=None, help="Override DVR port (default: 554)")
+    ap.add_argument("--client",        default=None, help="Client name (default: /etc/nx_client)")
+    ap.add_argument("--dvr-ip",        default=None, help="Override DVR IP")
+    ap.add_argument("--port",          type=int, default=None, help="Override DVR port (default: 554)")
+    ap.add_argument("--update-config", action="store_true", help="Write detected values directly into config.yaml")
     args = ap.parse_args()
 
     # Resolve client
@@ -245,15 +246,30 @@ def main():
     width, height = resolution if resolution else (1920, 1080)
     res_note = "" if resolution else "  (gst-discoverer not available — defaulting to 1920x1080, verify manually)"
 
-    # ── Print result ──────────────────────────────────────────────────────────
-    print(f"\n{'─'*55}")
-    print(f"  DVR identified. Paste this into clients/{client_name}/config.yaml:")
-    print(f"{'─'*55}\n")
-    print(f"  dvr_port: {dvr_port}")
-    print(f"  rtsp_url_pattern: \"{working_pattern}\"")
-    print(f"  stream_width: {width}")
-    print(f"  stream_height: {height}{res_note}")
-    print(f"\n{'─'*55}")
+    # ── Write or print result ─────────────────────────────────────────────────
+    if args.update_config:
+        cfg_path = REPO_ROOT / "clients" / client_name / "config.yaml"
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        cfg["dvr_port"]         = dvr_port
+        cfg["rtsp_url_pattern"] = working_pattern
+        cfg["stream_width"]     = width
+        cfg["stream_height"]    = height
+        with open(cfg_path, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+        print(f"\n  ✓  config.yaml updated: {cfg_path}")
+        if res_note:
+            print(f"  {res_note.strip()}")
+    else:
+        print(f"\n{'─'*55}")
+        print(f"  DVR identified. Paste this into clients/{client_name}/config.yaml:")
+        print(f"{'─'*55}\n")
+        print(f"  dvr_port: {dvr_port}")
+        print(f"  rtsp_url_pattern: \"{working_pattern}\"")
+        print(f"  stream_width: {width}")
+        print(f"  stream_height: {height}{res_note}")
+        print(f"\n{'─'*55}")
+
     print("\n  Next: run probe_cameras.py --update-config to discover active channels.")
 
 
