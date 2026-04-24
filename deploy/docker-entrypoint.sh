@@ -14,7 +14,6 @@ if [[ -f "$PARSER_SRC" ]]; then
         -o "$PARSER_OUT" \
         "$PARSER_SRC" \
         -I"$DS_INCLUDES" \
-        -I"$PARSER_DIR" \
         -std=c++14 -O2
     echo "[entrypoint] Parser compiled: $PARSER_OUT"
 else

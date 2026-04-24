@@ -10,7 +10,7 @@
  *       -std=c++14 -O2
  */
 
-#include "nvdsinfer_custom_impl.h"
+#include "nvdsinfer.h"
 #include <cmath>
 #include <algorithm>
 #include <vector>
