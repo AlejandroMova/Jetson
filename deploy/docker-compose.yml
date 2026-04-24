@@ -20,9 +20,9 @@ services:
     working_dir: /nx_tech
     environment:
       PYTHONPATH: /nx_tech/pipelines
-      # NX_CLIENT overrides /etc/nx_client — useful for testing a specific client
-      # without re-running setup.sh. Comment out to use the value from /etc/nx_client.
-      NX_CLIENT: demo
+      # NX_CLIENT overrides /etc/nx_client — set this per deployment or leave commented
+      # to read from /etc/nx_client (written by setup.sh --client <name>).
+      # NX_CLIENT: demo
       # Device identity — sent with every event to the API
       CAMERA_ID: cam-001
       JETSON_ID: jetson-nx-001
