@@ -1,8 +1,7 @@
 # TensorRT engines — architecture-specific, regenerated automatically on each device
 *.engine
 
-# Large model binaries — download separately via NGC or share manually
-*.onnx
+# Large model weights — too big or not needed in repo
 *.etlt
 *.tlt
 *.pth
