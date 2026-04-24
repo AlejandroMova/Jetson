@@ -1,6 +1,6 @@
 # NX Computing AI — Jetson Edge Pipeline
 
-Real-time CCTV analytics on NVIDIA Jetson NX using DeepStream 6.3.  
+Real-time CCTV analytics on NVIDIA Jetson NX using DeepStream 7.1.  
 Detects people, classifies age/gender, and streams inference output via RTSP.
 
 ---
@@ -40,16 +40,20 @@ NX-JETSON/
 git clone https://github.com/AlejandroMova/NX-JETSON.git
 cd NX-JETSON/deploy
 
-# 2. Create client credentials (on the Jetson — never on laptop)
+# 2. Create client credentials (DVR login)
 cp clients/demo/.env.example clients/<client_name>/.env
 nano clients/<client_name>/.env     # fill DVR_USER and DVR_PASS
 
-# 3. Run setup — does everything automatically:
+# 3. Create API credentials (NX backend token)
+cp .env.example .env
+nano .env                           # fill API_KEY and API_BASE_URL
+
+# 4. Run setup — does everything automatically:
 #    installs Docker + Tailscale, detects DVR IP, builds image,
 #    identifies DVR URL pattern, detects active channels, starts pipeline
 sudo bash setup.sh --client <client_name> --authkey <tailscale-key>
 
-# 4. Watch inference from your laptop
+# 5. Watch inference from your laptop
 vlc rtsp://<jetson-tailscale-ip>:8554/ds-test
 ```
 
@@ -171,6 +175,16 @@ docker compose run --rm deepstream \
 |-----|-------------|
 | `DVR_USER` | DVR login username |
 | `DVR_PASS` | DVR login password |
+
+### `deploy/.env` (gitignored) — Docker Compose level
+
+| Key | Description |
+|-----|-------------|
+| `API_BASE_URL` | NX backend URL (e.g. `https://api.nxcomputing.ai`) |
+| `API_KEY` | API token assigned to this Jetson |
+| `JETSON_ID` | Device identifier sent with every event (e.g. `jetson-mova-001`) |
+
+Copy from `deploy/.env.example` and fill in before first deploy.
 
 ### Runtime resolution order
 
