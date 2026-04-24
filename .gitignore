@@ -30,6 +30,9 @@ results_model_fb/
 # Client credentials — copy .env.example → .env and fill in per deployment
 clients/**/.env
 
+# Deploy-level secrets (API_KEY, API_BASE_URL)
+deploy/.env
+
 # IDE
 .vscode/
 .claude/

@@ -26,8 +26,8 @@ services:
       # Device identity — sent with every event to the API
       CAMERA_ID: cam-001
       JETSON_ID: jetson-nx-001
-      API_BASE_URL: http://localhost:8000   # update to your backend URL
-      API_KEY: your-api-key
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8000}
+      API_KEY: ${API_KEY:-}
     # Production: reads DVR credentials from clients/<NX_CLIENT>/.env
     command: python3 pipelines/app.py
     # Testing with a local video file (no DVR required):
