@@ -198,10 +198,6 @@ def main():
         "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml")
     tracker.set_property("display-tracking-id", 1)
 
-    # ── SGIE — Age/Gender ─────────────────────────────────────────────────────
-    sgie = Gst.ElementFactory.make("nvinfer", "secondary-inference")
-    sgie.set_property("config-file-path", "models/resnet_age_gender_FB2/config_infer.txt")
-
     # ── OSD ───────────────────────────────────────────────────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
     caps_rgba  = Gst.ElementFactory.make("capsfilter",     "capsfilter-rgba")
@@ -222,7 +218,7 @@ def main():
     appsink.set_property("max-buffers",  2)
     appsink.set_property("drop",         True)
 
-    elements = [pgie, tracker, sgie, nvvidconv1, caps_rgba, nvosd,
+    elements = [pgie, tracker, nvvidconv1, caps_rgba, nvosd,
                 nvvidconv2, caps_nv12, appsink]
     if not all(elements):
         logger.error("Failed to create one or more pipeline elements.")
@@ -234,8 +230,7 @@ def main():
     # ── Linking ───────────────────────────────────────────────────────────────
     streammux.link(pgie)
     pgie.link(tracker)
-    tracker.link(sgie)
-    sgie.link(nvvidconv1)
+    tracker.link(nvvidconv1)
     nvvidconv1.link(caps_rgba)
     caps_rgba.link(nvosd)
     nvosd.link(nvvidconv2)
