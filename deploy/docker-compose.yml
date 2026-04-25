@@ -6,6 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile.jetson
     runtime: nvidia
+    privileged: true          # needed for Jetson hardware video encoder (nvv4l2h264enc)
     restart: unless-stopped
     ports:
       - "8554:8554"          # RTSP output — view with: vlc rtsp://<jetson-ip>:8554/ds-test

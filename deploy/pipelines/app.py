@@ -124,12 +124,11 @@ def main():
     nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
 
     # ── RTSP output sink ──────────────────────────────────────────────────────
-    # enc-type=1 → software x264enc (avoids /dev/v4l2-nvenc device dependency).
-    # To use Jetson HW encoder: enc-type=0, add /dev/video* devices in docker-compose.
+    # enc-type=0 → Jetson hardware encoder (nvv4l2h264enc), requires privileged: true
     # codec=1 → H264 (DS 7.x enum: H264=1, H265=2)
     sink = Gst.ElementFactory.make("nvrtspoutsinkbin", "rtsp-renderer")
     sink.set_property("rtsp-port", 8554)
-    sink.set_property("enc-type",  1)       # software x264enc
+    sink.set_property("enc-type",  0)       # Jetson HW encoder
     sink.set_property("codec",     1)       # H264 (DS 7.x)
     sink.set_property("bitrate",   4000000)
     sink.set_property("sync",      False)
