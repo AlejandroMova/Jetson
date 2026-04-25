@@ -47,8 +47,8 @@ class _RtspSink:
         factory.set_launch(
             f"( appsrc name=vsrc is-live=true block=true format=time "
             f"caps=video/x-raw,format=NV12,width={width},height={height},framerate=30/1 "
-            f"! videoconvert "
-            f"! avenc_h264 bitrate={bitrate} threads=2 "
+            f"! nvvideoconvert "
+            f"! nvv4l2h264enc bitrate={bitrate} "
             f"! h264parse "
             f"! rtph264pay name=pay0 pt=96 config-interval=1 )"
         )
