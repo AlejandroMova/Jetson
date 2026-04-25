@@ -9,7 +9,7 @@ services:
     privileged: true          # needed for Jetson hardware video encoder (nvv4l2h264enc)
     restart: unless-stopped
     ports:
-      - "8554:8554"          # RTSP output — view with: vlc rtsp://<jetson-ip>:8554/ds-test
+      - "8080:8080"          # MJPEG output — view with: vlc http://<jetson-ip>:8080/stream
     volumes:
       - ./pipelines:/nx_tech/pipelines   # shared pipeline code
       - ./clients:/nx_tech/clients       # per-client configs (.env gitignored)

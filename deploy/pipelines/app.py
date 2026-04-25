@@ -2,18 +2,25 @@
 app.py — NX Computing AI | Production Pipeline (Live DVR / RTSP)
 
 Source: RTSP stream(s) from DVR, configured per-client via config_loader.
-Sink  : RTSP output on port 8554 — view with VLC:
-          vlc rtsp://<jetson-ip>:8554/ds-test
+Sink  : MJPEG stream on port 8080 — view with VLC:
+          vlc http://<jetson-ip>:8080/stream
 
 Pipeline:
   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
     → nvstreammux → nvinfer (PeopleNet) → nvtracker
     → nvinfer (Age/Gender) → nvvideoconvert → capsfilter(RGBA)
-    → nvdsosd → nvvideoconvert → nvrtspoutsinkbin
+    → nvdsosd → nvvideoconvert → capsfilter(NV12/CPU)
+    → appsink → [HTTP MJPEG server]
 """
 
+import http.server
 import logging
 import sys
+import threading
+import time
+
+import cv2
+import numpy as np
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -30,11 +37,81 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class _MjpegServer:
+    """HTTP MJPEG server — no encoder dependency, works on any Jetson."""
+
+    def __init__(self, port: int, width: int, height: int):
+        self._width   = width
+        self._height  = height
+        self._lock    = threading.Lock()
+        self._jpeg    = b""
+        self._running = True
+
+        handler = self._make_handler()
+        self._http = http.server.HTTPServer(("", port), handler)
+        threading.Thread(target=self._http.serve_forever, daemon=True).start()
+        logger.info("MJPEG server → http://<jetson-ip>:%d/stream", port)
+
+    def _make_handler(self):
+        srv = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/stream":
+                    self.send_response(200)
+                    self.send_header(
+                        "Content-Type",
+                        "multipart/x-mixed-replace; boundary=frame",
+                    )
+                    self.end_headers()
+                    try:
+                        while srv._running:
+                            with srv._lock:
+                                frame = srv._jpeg
+                            if frame:
+                                self.wfile.write(
+                                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                                )
+                                self.wfile.write(frame)
+                                self.wfile.write(b"\r\n")
+                            time.sleep(1 / 30)
+                    except Exception:
+                        pass
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *_):  # silence HTTP logs
+                pass
+
+        return _Handler
+
+    def push_sample(self, sample: Gst.Sample):
+        buf = sample.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return
+        try:
+            data = np.frombuffer(info.data, dtype=np.uint8)
+            # NV12: Y plane (H*W bytes) + interleaved UV plane (H/2*W bytes)
+            yuv = data.reshape(self._height * 3 // 2, self._width)
+            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+            _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            with self._lock:
+                self._jpeg = enc.tobytes()
+        finally:
+            buf.unmap(info)
+
+    def stop(self):
+        self._running = False
+        self._http.shutdown()
+
+
 def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
     """Add one RTSP source branch and link it to streammux sink_{stream_idx}."""
-    source  = Gst.ElementFactory.make("rtspsrc",      f"source-{stream_idx}")
-    depay   = Gst.ElementFactory.make("rtph264depay", f"depay-{stream_idx}")
-    parser  = Gst.ElementFactory.make("h264parse",    f"parser-{stream_idx}")
+    source  = Gst.ElementFactory.make("rtspsrc",       f"source-{stream_idx}")
+    depay   = Gst.ElementFactory.make("rtph264depay",  f"depay-{stream_idx}")
+    parser  = Gst.ElementFactory.make("h264parse",     f"parser-{stream_idx}")
     decoder = Gst.ElementFactory.make("nvv4l2decoder", f"decoder-{stream_idx}")
 
     if not all([source, depay, parser, decoder]):
@@ -44,7 +121,7 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
     source.set_property("location",        rtsp_url)
     source.set_property("latency",         200)
     source.set_property("drop-on-latency", True)
-    source.set_property("protocols",       4)   # TCP only — more reliable through NAT
+    source.set_property("protocols",       4)   # TCP only
 
     decoder.set_property("drop-frame-interval", 0)
 
@@ -58,7 +135,6 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
     streammux_sinkpad = streammux.get_request_pad(f"sink_{stream_idx}")
     decoder_srcpad.link(streammux_sinkpad)
 
-    # rtspsrc pads are dynamic — connect when the RTSP server sends the SDP
     def _on_pad_added(_src, pad, _depay=depay):
         caps = pad.get_current_caps() or pad.query_caps(None)
         if caps and "video" in caps.to_string():
@@ -67,7 +143,12 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
                 pad.link(sink)
 
     source.connect("pad-added", _on_pad_added)
-    logger.info("Stream %d → %s", stream_idx, rtsp_url.replace(rtsp_url.split("@")[0].split("//")[1] if "@" in rtsp_url else "", "***:***"))
+    logger.info(
+        "Stream %d → %s", stream_idx,
+        rtsp_url.replace(
+            rtsp_url.split("@")[0].split("//")[1] if "@" in rtsp_url else "", "***:***"
+        ),
+    )
 
 
 def main():
@@ -83,14 +164,13 @@ def main():
 
     # ── Streammux ──────────────────────────────────────────────────────────────
     streammux = Gst.ElementFactory.make("nvstreammux", "Stream-muxer")
-    streammux.set_property("width",               cfg.stream_width)
-    streammux.set_property("height",              cfg.stream_height)
-    streammux.set_property("batch-size",          n_streams)
-    streammux.set_property("batched-push-timeout", 33333)   # ~1 frame @ 30 fps (µs)
-    streammux.set_property("live-source",         1)        # RTSP is a live source
+    streammux.set_property("width",                cfg.stream_width)
+    streammux.set_property("height",               cfg.stream_height)
+    streammux.set_property("batch-size",           n_streams)
+    streammux.set_property("batched-push-timeout", 33333)
+    streammux.set_property("live-source",          1)
     pipeline.add(streammux)
 
-    # ── RTSP sources (one per channel) ────────────────────────────────────────
     for i, url in enumerate(urls):
         _add_rtsp_source(pipeline, streammux, url, i)
 
@@ -112,29 +192,30 @@ def main():
 
     # ── SGIE — Age/Gender ─────────────────────────────────────────────────────
     sgie = Gst.ElementFactory.make("nvinfer", "secondary-inference")
-    sgie.set_property("config-file-path",
-                      "models/resnet_age_gender_FB2/config_infer.txt")
+    sgie.set_property("config-file-path", "models/resnet_age_gender_FB2/config_infer.txt")
 
     # ── OSD ───────────────────────────────────────────────────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
-    caps_rgba  = Gst.ElementFactory.make("capsfilter",    "capsfilter-rgba")
+    caps_rgba  = Gst.ElementFactory.make("capsfilter",     "capsfilter-rgba")
     caps_rgba.set_property("caps",
         Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
     nvosd      = Gst.ElementFactory.make("nvdsosd",        "onscreendisplay")
+
+    # ── GPU→CPU download then appsink ─────────────────────────────────────────
+    # nvvideoconvert copies NVMM→system memory when downstream caps lack NVMM.
     nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
+    caps_nv12  = Gst.ElementFactory.make("capsfilter",     "capsfilter-nv12")
+    caps_nv12.set_property("caps", Gst.Caps.from_string(
+        f"video/x-raw,format=NV12,width={cfg.stream_width},height={cfg.stream_height}"
+    ))
+    appsink = Gst.ElementFactory.make("appsink", "mjpeg-sink")
+    appsink.set_property("emit-signals", True)
+    appsink.set_property("sync",         False)
+    appsink.set_property("max-buffers",  2)
+    appsink.set_property("drop",         True)
 
-    # ── RTSP output sink ──────────────────────────────────────────────────────
-    # enc-type=0 → Jetson HW encoder (nvv4l2h264enc via libnvtvmr.so)
-    # Requires kmod in the container so that libnvtvmr.so can call lsmod.
-    # codec=1 → H264 (DS 7.x enum: H264=1, H265=2)
-    sink = Gst.ElementFactory.make("nvrtspoutsinkbin", "rtsp-renderer")
-    sink.set_property("rtsp-port", 8554)
-    sink.set_property("enc-type",  0)
-    sink.set_property("codec",     1)
-    sink.set_property("bitrate",   4000000)
-    sink.set_property("sync",      False)
-
-    elements = [pgie, tracker, sgie, nvvidconv1, caps_rgba, nvosd, nvvidconv2, sink]
+    elements = [pgie, tracker, sgie, nvvidconv1, caps_rgba, nvosd,
+                nvvidconv2, caps_nv12, appsink]
     if not all(elements):
         logger.error("Failed to create one or more pipeline elements.")
         sys.exit(1)
@@ -150,11 +231,23 @@ def main():
     nvvidconv1.link(caps_rgba)
     caps_rgba.link(nvosd)
     nvosd.link(nvvidconv2)
-    nvvidconv2.link(sink)
+    nvvidconv2.link(caps_nv12)
+    caps_nv12.link(appsink)
 
     # ── Probe ─────────────────────────────────────────────────────────────────
     osd_sink_pad = nvosd.get_static_pad("sink")
     osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
+
+    # ── MJPEG server ──────────────────────────────────────────────────────────
+    mjpeg = _MjpegServer(port=8080, width=cfg.stream_width, height=cfg.stream_height)
+
+    def _on_new_sample(sink):
+        sample = sink.emit("pull-sample")
+        if sample:
+            mjpeg.push_sample(sample)
+        return Gst.FlowReturn.OK
+
+    appsink.connect("new-sample", _on_new_sample)
 
     # ── Run ───────────────────────────────────────────────────────────────────
     api_client.start()
@@ -178,8 +271,7 @@ def main():
 
     bus.connect("message", _on_bus_message)
 
-    logger.info("Starting pipeline (first run builds TensorRT engines — may take several minutes)…")
-    logger.info("RTSP output → rtsp://<jetson-ip>:8554/ds-test")
+    logger.info("Starting pipeline…")
     pipeline.set_state(Gst.State.PLAYING)
 
     try:
@@ -188,6 +280,7 @@ def main():
         logger.info("Stopped by user.")
     finally:
         pipeline.set_state(Gst.State.NULL)
+        mjpeg.stop()
         api_client.stop()
 
 
