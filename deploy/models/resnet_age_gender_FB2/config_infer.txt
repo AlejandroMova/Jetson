@@ -3,7 +3,7 @@ gpu-id=0
 
 # Rutas de los modelos (Asegúrate de que el nombre coincida al exportar)
 onnx-file=resnet18_finetuned_int8_fixed.onnx
-model-engine-file=resnet18_finetuned_int8_fixed.onnx_b16_gpu0_fp16.engine
+model-engine-file=resnet18_finetuned_int8_fixed.onnx_b1_gpu0_fp16.engine
 labelfile-path=labels.txt
 
 # Matemáticas de Normalización (ImageNet PyTorch)
@@ -13,7 +13,7 @@ model-color-format=0
 
 # Dimensiones y Tipo de Red
 infer-dims=3;224;224
-batch-size=16
+batch-size=1
 network-mode=2
 network-type=1
 

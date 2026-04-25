@@ -90,15 +90,23 @@ class _MjpegServer:
         buf = sample.get_buffer()
         ok, info = buf.map(Gst.MapFlags.READ)
         if not ok:
+            logger.error("appsink buf.map() failed — buffer may still be in NVMM")
             return
         try:
             data = np.frombuffer(info.data, dtype=np.uint8)
+            expected = self._width * self._height * 3 // 2
+            if data.size != expected:
+                logger.error("Buffer size mismatch: got %d bytes, expected %d", data.size, expected)
+                return
             # NV12: Y plane (H*W bytes) + interleaved UV plane (H/2*W bytes)
             yuv = data.reshape(self._height * 3 // 2, self._width)
             bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
             _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
             with self._lock:
+                first = len(self._jpeg) == 0
                 self._jpeg = enc.tobytes()
+            if first:
+                logger.info("First MJPEG frame encoded (%d bytes) — stream ready", len(self._jpeg))
         finally:
             buf.unmap(info)
 
