@@ -9,15 +9,18 @@ Pipeline:
   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
     → nvstreammux → nvinfer (PeopleNet) → nvtracker
     → nvinfer (Age/Gender) → nvvideoconvert → capsfilter(RGBA)
-    → nvdsosd → nvvideoconvert → nvrtspoutsinkbin
+    → nvdsosd → nvvideoconvert → capsfilter(NV12/system)
+    → appsink → [GstRtspServer] → avenc_h264 → rtph264pay → RTSP:8554
 """
 
 import logging
 import sys
+import threading
 
 import gi
 gi.require_version("Gst", "1.0")
-from gi.repository import GLib, Gst
+gi.require_version("GstRtspServer", "1.0")
+from gi.repository import GLib, Gst, GstRtspServer
 
 import pyds
 from config_loader import load_config
@@ -28,6 +31,60 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+class _RtspSink:
+    """GstRtspServer that accepts raw NV12 frames from DeepStream via appsink."""
+
+    def __init__(self, port: int, width: int, height: int, bitrate: int = 4_000_000):
+        self._lock   = threading.Lock()
+        self._appsrc = None
+
+        self._server  = GstRtspServer.RTSPServer()
+        self._server.props.service = str(port)
+
+        factory = GstRtspServer.RTSPMediaFactory()
+        factory.set_launch(
+            f"( appsrc name=vsrc is-live=true block=true format=time "
+            f"caps=video/x-raw,format=NV12,width={width},height={height},framerate=30/1 "
+            f"! videoconvert "
+            f"! avenc_h264 bitrate={bitrate} threads=2 "
+            f"! h264parse "
+            f"! rtph264pay name=pay0 pt=96 config-interval=1 )"
+        )
+        factory.set_shared(True)
+        factory.connect("media-configure", self._on_media_configure)
+
+        mounts = self._server.get_mount_points()
+        mounts.add_factory("/ds-test", factory)
+        self._server.attach(None)
+        logger.info("RTSP server listening on :%d/ds-test", port)
+
+    def _on_media_configure(self, _factory, media):
+        pipeline = media.get_element()
+        with self._lock:
+            self._appsrc = pipeline.get_by_name("vsrc")
+        logger.info("RTSP client connected — encoder pipeline ready")
+
+        def _on_eos(_bus, _msg):
+            with self._lock:
+                self._appsrc = None
+
+        bus = media.get_element().get_bus()
+        if bus:
+            bus.add_signal_watch()
+            bus.connect("message::eos", _on_eos)
+
+    def push_sample(self, sample: Gst.Sample) -> Gst.FlowReturn:
+        with self._lock:
+            src = self._appsrc
+        if src is None:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        ret = src.emit("push-buffer", buf)
+        if ret not in (Gst.FlowReturn.OK, Gst.FlowReturn.FLUSHING):
+            logger.warning("appsrc push-buffer returned %s", ret)
+        return Gst.FlowReturn.OK
 
 
 def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
@@ -121,19 +178,21 @@ def main():
     caps_rgba.set_property("caps",
         Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
     nvosd      = Gst.ElementFactory.make("nvdsosd",        "onscreendisplay")
-    nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
 
-    # ── RTSP output sink ──────────────────────────────────────────────────────
-    # enc-type=0 → Jetson hardware encoder (nvv4l2h264enc), requires privileged: true
-    # codec=1 → H264 (DS 7.x enum: H264=1, H265=2)
-    sink = Gst.ElementFactory.make("nvrtspoutsinkbin", "rtsp-renderer")
-    sink.set_property("rtsp-port", 8554)
-    sink.set_property("enc-type",  0)       # Jetson HW encoder
-    sink.set_property("codec",     1)       # H264 (DS 7.x)
-    sink.set_property("bitrate",   4000000)
-    sink.set_property("sync",      False)
+    # ── Output — NVMM→system memory then appsink ──────────────────────────────
+    # nvvideoconvert without NVMM downstream caps copies GPU→CPU automatically.
+    nvvidconv2  = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
+    caps_nv12   = Gst.ElementFactory.make("capsfilter",     "capsfilter-nv12")
+    caps_nv12.set_property("caps",
+        Gst.Caps.from_string(f"video/x-raw,format=NV12,width={cfg.stream_width},height={cfg.stream_height}"))
+    appsink = Gst.ElementFactory.make("appsink", "rtsp-appsink")
+    appsink.set_property("emit-signals", True)
+    appsink.set_property("sync",         False)
+    appsink.set_property("max-buffers",  2)
+    appsink.set_property("drop",         True)
 
-    elements = [pgie, tracker, sgie, nvvidconv1, caps_rgba, nvosd, nvvidconv2, sink]
+    elements = [pgie, tracker, sgie, nvvidconv1, caps_rgba, nvosd,
+                nvvidconv2, caps_nv12, appsink]
     if not all(elements):
         logger.error("Failed to create one or more pipeline elements.")
         sys.exit(1)
@@ -149,11 +208,28 @@ def main():
     nvvidconv1.link(caps_rgba)
     caps_rgba.link(nvosd)
     nvosd.link(nvvidconv2)
-    nvvidconv2.link(sink)
+    nvvidconv2.link(caps_nv12)
+    caps_nv12.link(appsink)
 
     # ── Probe ─────────────────────────────────────────────────────────────────
     osd_sink_pad = nvosd.get_static_pad("sink")
     osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
+
+    # ── RTSP server (GstRtspServer + avenc_h264 — no V4L2 or libx264 needed) ─
+    rtsp_sink = _RtspSink(
+        port=8554,
+        width=cfg.stream_width,
+        height=cfg.stream_height,
+        bitrate=4_000_000,
+    )
+
+    def _on_new_sample(sink):
+        sample = sink.emit("pull-sample")
+        if sample:
+            rtsp_sink.push_sample(sample)
+        return Gst.FlowReturn.OK
+
+    appsink.connect("new-sample", _on_new_sample)
 
     # ── Run ───────────────────────────────────────────────────────────────────
     api_client.start()
