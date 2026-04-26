@@ -131,7 +131,8 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
     source.set_property("location",        rtsp_url)
     source.set_property("latency",         200)
     source.set_property("drop-on-latency", True)
-    source.set_property("protocols",       4)   # TCP only
+    source.set_property("protocols",       4)      # TCP only
+    source.set_property("tcp-timeout",     5000000) # 5 s TCP keepalive — prevents Dahua 180 s session cut
 
     decoder.set_property("drop-frame-interval", 0)
 
@@ -191,13 +192,13 @@ def main():
 
     # ── Tracker ───────────────────────────────────────────────────────────────
     tracker = Gst.ElementFactory.make("nvtracker", "tracker")
-    tracker.set_property("tracker-width",  640)
-    tracker.set_property("tracker-height", 384)
+    tracker.set_property("tracker-width",  320)
+    tracker.set_property("tracker-height", 192)
     tracker.set_property("gpu-id",         0)
     tracker.set_property("ll-lib-file",
         "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
     tracker.set_property("ll-config-file",
-        "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml")
+        "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml")
     tracker.set_property("display-tracking-id", 1)
 
     # ── SGIE — Age/Gender ─────────────────────────────────────────────────────
