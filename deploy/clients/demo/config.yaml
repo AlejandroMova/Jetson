@@ -31,3 +31,10 @@ stream_height: 1080
 
 # Pipeline(s) to run: people_counting | hotspot | reid
 pipeline: people_counting
+
+# Tracker algorithm:
+#   nvdcf — NvDCF correlation filter. More precise tracking through occlusions.
+#            Stable up to ~6 streams on Jetson Orin Nano. Use for clients with few cameras.
+#   iou   — IoU matching. Simpler, no CUDA kernels. Stable with 16 streams.
+#            Loses track ID on crossing/occlusion but sufficient for people counting.
+tracker: nvdcf

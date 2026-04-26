@@ -198,8 +198,7 @@ def main():
     tracker.set_property("gpu-id",         0)
     tracker.set_property("ll-lib-file",
         "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-    tracker.set_property("ll-config-file",
-        "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml")
+    tracker.set_property("ll-config-file", cfg.tracker_config_path())
     tracker.set_property("display-tracking-id", 1)
 
     # ── SGIE — Age/Gender ─────────────────────────────────────────────────────

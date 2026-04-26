@@ -29,6 +29,12 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+TRACKER_CONFIGS = {
+    "nvdcf": "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml",
+    "iou":   "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml",
+}
+
+
 @dataclass
 class ClientConfig:
     client_name: str
@@ -41,6 +47,14 @@ class ClientConfig:
     pipeline: List[str]
     stream_width: int = 1920
     stream_height: int = 1080
+    tracker: str = "nvdcf"  # "nvdcf" (precise, ≤6 streams) | "iou" (stable, 16 streams)
+
+    def tracker_config_path(self) -> str:
+        if self.tracker not in TRACKER_CONFIGS:
+            raise RuntimeError(
+                f"Unknown tracker '{self.tracker}'. Valid options: {list(TRACKER_CONFIGS)}"
+            )
+        return TRACKER_CONFIGS[self.tracker]
 
     def rtsp_urls(self) -> List[str]:
         """Build one RTSP URL per active channel."""
@@ -64,6 +78,7 @@ class ClientConfig:
         logger.info("Channels   : %s", self.channels)
         logger.info("Pipeline(s): %s", self.pipeline)
         logger.info("Resolution : %dx%d", self.stream_width, self.stream_height)
+        logger.info("Tracker    : %s", self.tracker)
         # Log URLs but mask the password
         for url in self.rtsp_urls():
             masked = url.replace(self.dvr_pass, "***") if self.dvr_pass else url
@@ -137,4 +152,5 @@ def load_config() -> ClientConfig:
         pipeline=pipeline,
         stream_width=int(cfg.get("stream_width", 1920)),
         stream_height=int(cfg.get("stream_height", 1080)),
+        tracker=cfg.get("tracker", "nvdcf"),
     )
