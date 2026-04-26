@@ -15,6 +15,7 @@ Pipeline:
 
 import http.server
 import logging
+import math
 import sys
 import threading
 import time
@@ -205,6 +206,15 @@ def main():
     sgie = Gst.ElementFactory.make("nvinfer", "secondary-inference")
     sgie.set_property("config-file-path", "models/resnet_age_gender_FB2/config_infer.txt")
 
+    # ── Tiler — combines N streams into one tiled frame ───────────────────────
+    tiler_cols = math.ceil(math.sqrt(n_streams))
+    tiler_rows = math.ceil(n_streams / tiler_cols)
+    tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
+    tiler.set_property("rows",    tiler_rows)
+    tiler.set_property("columns", tiler_cols)
+    tiler.set_property("width",   cfg.stream_width  * tiler_cols)
+    tiler.set_property("height",  cfg.stream_height * tiler_rows)
+
     # ── OSD ───────────────────────────────────────────────────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
     caps_rgba  = Gst.ElementFactory.make("capsfilter",     "capsfilter-rgba")
@@ -223,7 +233,7 @@ def main():
     appsink.set_property("max-buffers",  2)
     appsink.set_property("drop",         True)
 
-    elements = [pgie, tracker, sgie, nvvidconv1, caps_rgba, nvosd,
+    elements = [pgie, tracker, sgie, tiler, nvvidconv1, caps_rgba, nvosd,
                 nvvidconv2, caps_nv12, appsink]
     if not all(elements):
         logger.error("Failed to create one or more pipeline elements.")
@@ -236,7 +246,8 @@ def main():
     streammux.link(pgie)
     pgie.link(tracker)
     tracker.link(sgie)
-    sgie.link(nvvidconv1)
+    sgie.link(tiler)
+    tiler.link(nvvidconv1)
     nvvidconv1.link(caps_rgba)
     caps_rgba.link(nvosd)
     nvosd.link(nvvidconv2)
