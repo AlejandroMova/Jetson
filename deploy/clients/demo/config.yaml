@@ -12,15 +12,20 @@ dvr_port: 554
 #
 # Confirm the exact path format with your DVR model before deploying.
 # Common variants:
-#   Hikvision : rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}01
-#   Dahua     : rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch:02d}&subtype=0
-#   Generic   : rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream
+#   Hikvision main   : rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}01
+#   Hikvision sub    : rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}02
+#   Dahua main       : rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=0
+#   Dahua substream  : rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=1
+#   Generic          : rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream
 rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream"
 
 # Active camera channels (DVR channel numbers, 1-indexed)
 channels: [1]
 
-# Stream resolution — must match DVR main stream output
+# Resolution fed to nvstreammux (and thus to inference).
+# For main stream (1 camera, max detail):     1920x1080
+# For substream (multi-camera, 16 ch):        960x544  (streammux will scale input to this)
+# The MJPEG output resolution matches this value.
 stream_width: 1920
 stream_height: 1080
 

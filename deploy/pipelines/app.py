@@ -40,9 +40,7 @@ logger = logging.getLogger(__name__)
 class _MjpegServer:
     """HTTP MJPEG server — no encoder dependency, works on any Jetson."""
 
-    def __init__(self, port: int, width: int, height: int):
-        self._width   = width
-        self._height  = height
+    def __init__(self, port: int):
         self._lock    = threading.Lock()
         self._jpeg    = b""
         self._running = True
@@ -87,26 +85,30 @@ class _MjpegServer:
         return _Handler
 
     def push_sample(self, sample: Gst.Sample):
-        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        s    = caps.get_structure(0)
+        w    = s.get_value("width")
+        h    = s.get_value("height")
+        buf  = sample.get_buffer()
         ok, info = buf.map(Gst.MapFlags.READ)
         if not ok:
             logger.error("appsink buf.map() failed — buffer may still be in NVMM")
             return
         try:
-            data = np.frombuffer(info.data, dtype=np.uint8)
-            expected = self._width * self._height * 3 // 2
+            data     = np.frombuffer(info.data, dtype=np.uint8)
+            expected = w * h * 3 // 2
             if data.size != expected:
                 logger.error("Buffer size mismatch: got %d bytes, expected %d", data.size, expected)
                 return
             # NV12: Y plane (H*W bytes) + interleaved UV plane (H/2*W bytes)
-            yuv = data.reshape(self._height * 3 // 2, self._width)
+            yuv = data.reshape(h * 3 // 2, w)
             bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
             _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
             with self._lock:
                 first = len(self._jpeg) == 0
                 self._jpeg = enc.tobytes()
             if first:
-                logger.info("First MJPEG frame encoded (%d bytes) — stream ready", len(self._jpeg))
+                logger.info("First MJPEG frame encoded (%dx%d, %d bytes) — stream ready", w, h, len(self._jpeg))
         finally:
             buf.unmap(info)
 
@@ -213,9 +215,7 @@ def main():
     # nvvideoconvert copies NVMM→system memory when downstream caps lack NVMM.
     nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
     caps_nv12  = Gst.ElementFactory.make("capsfilter",     "capsfilter-nv12")
-    caps_nv12.set_property("caps", Gst.Caps.from_string(
-        f"video/x-raw,format=NV12,width={cfg.stream_width},height={cfg.stream_height}"
-    ))
+    caps_nv12.set_property("caps", Gst.Caps.from_string("video/x-raw,format=NV12"))
     appsink = Gst.ElementFactory.make("appsink", "mjpeg-sink")
     appsink.set_property("emit-signals", True)
     appsink.set_property("sync",         False)
@@ -247,7 +247,7 @@ def main():
     osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
 
     # ── MJPEG server ──────────────────────────────────────────────────────────
-    mjpeg = _MjpegServer(port=8080, width=cfg.stream_width, height=cfg.stream_height)
+    mjpeg = _MjpegServer(port=8080)
 
     def _on_new_sample(sink):
         sample = sink.emit("pull-sample")
