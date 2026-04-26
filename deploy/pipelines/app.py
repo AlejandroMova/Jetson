@@ -197,7 +197,7 @@ def main():
     tracker.set_property("ll-lib-file",
         "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
     tracker.set_property("ll-config-file",
-        "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_accuracy.yml")
+        "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml")
     tracker.set_property("display-tracking-id", 1)
 
     # ── SGIE — Age/Gender ─────────────────────────────────────────────────────
