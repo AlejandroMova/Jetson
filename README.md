@@ -54,7 +54,9 @@ nano .env                           # fill API_KEY and API_BASE_URL
 sudo bash setup.sh --client <client_name> --authkey <tailscale-key>
 
 # 5. Watch inference from your laptop
-vlc rtsp://<jetson-tailscale-ip>:8554/ds-test
+vlc http://<jetson-tailscale-ip>:8080/stream
+# or with lower latency:
+vlc --network-caching=300 http://<jetson-tailscale-ip>:8080/stream
 ```
 
 > **First run**: TensorRT will build engines for both models (~5 min each).  
@@ -140,6 +142,7 @@ docker compose run --rm deepstream \
    stream_width: 1920
    stream_height: 1080
    pipeline: people_counting
+   tracker: nvdcf           # nvdcf (≤6 streams) | iou (up to 16 streams)
    ```
 
 3. **On the Jetson, pull and set credentials:**
@@ -168,6 +171,34 @@ docker compose run --rm deepstream \
 | `stream_width` | int | `1920` | DVR main stream width |
 | `stream_height` | int | `1080` | DVR main stream height |
 | `pipeline` | string or list | `people_counting` | Which pipeline(s) to run |
+| `tracker` | string | `nvdcf` | Tracker algorithm — see table below |
+| `stream_width` | int | `1920` | Resolution fed to `nvstreammux` (inference + MJPEG output) |
+| `stream_height` | int | `1080` | Same, height |
+
+#### Tracker selection
+
+| Value | Algorithm | Max stable streams (Orin Nano) | Best for |
+|-------|-----------|-------------------------------|----------|
+| `nvdcf` | NvDCF correlation filter | ~6 | Clients with few cameras, need precise re-ID through occlusions |
+| `iou` | IoU bounding-box matching | 16 | Clients with many cameras, people-counting use case |
+
+**Substream tip:** For multi-camera deployments use the DVR substream (`subtype=1` in Dahua URL) and set `stream_width: 960` / `stream_height: 544`. This reduces GPU memory pressure significantly.
+
+```yaml
+# Multi-camera example (Dahua, 16 channels, substream)
+rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=1"
+channels: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+stream_width: 960
+stream_height: 544
+tracker: iou
+
+# Single/few cameras example (main stream, full quality)
+rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=0"
+channels: [1]
+stream_width: 1920
+stream_height: 1080
+tracker: nvdcf
+```
 
 ### `deploy/clients/<name>/.env` (gitignored)
 
@@ -198,8 +229,15 @@ Copy from `deploy/.env.example` and fill in before first deploy.
 
 ```
 DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
-  → PeopleNet (PGIE) → NvDCF Tracker
+  → PeopleNet (PGIE) → Tracker (NvDCF or IOU, per config)
   → ResNet-18 Age/Gender (SGIE)
-  → nvdsosd → nvrtspoutsinkbin (port 8554)
-              → REST API (probes.py async client)
+  → nvmultistreamtiler → nvdsosd
+  → nvvideoconvert → appsink → HTTP MJPEG server (port 8080)
+                  → REST API (probes.py async client)
 ```
+
+View the live feed:
+```bash
+vlc --network-caching=300 http://<jetson-ip>:8080/stream
+```
+With multiple streams the output is a tiled grid (e.g. 4×4 for 16 cameras) at 1920×1080.
