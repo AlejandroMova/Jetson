@@ -7,8 +7,9 @@
 *.pth
 *.pt
 
-# Dev/experimental ONNX files — only deploy/models ONNX files are tracked
-dev/models/**/*.onnx
+# ONNX model files — binary, large, and auto-patched at container startup by docker-entrypoint.sh.
+# Distribute model files to each Jetson separately (not via git).
+*.onnx
 
 # Compiled shared libraries — must be recompiled per architecture (x86 vs ARM64)
 *.so
