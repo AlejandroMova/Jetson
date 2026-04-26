@@ -1,10 +1,10 @@
 #!/bin/bash
 # 1) Compiles libcustom_softmax_parser.so for current arch (arm64 on Jetson).
-# 2) Patches the age-gender ONNX to use dynamic batch in the Flatten reshape.
-#    The model was exported with a hardcoded batch size in the Reshape node.
-#    The shape can appear as a Constant node (not just an initializer) — both
-#    are patched here. Any value != -1 in position 0 of a [?, 512] reshape
-#    that feeds a Reshape op is replaced with -1 (dynamic batch).
+# 2) Patches the age-gender ONNX to use dynamic batch.
+#    Root cause: the model was exported from PyTorch with a static batch=16
+#    in the ONNX input/output tensor shapes. TRT cannot run with any other
+#    batch size. Fix: set the first dim of input and output to symbolic
+#    (dim_param="batch") so TRT treats it as dynamic.
 set -e
 
 PARSER_DIR="/nx_tech/models/resnet_age_gender_FB2"
@@ -28,50 +28,30 @@ ONNX_PATH="$PARSER_DIR/resnet18_finetuned_int8_fixed.onnx"
 if [[ -f "$ONNX_PATH" ]]; then
     python3 - <<'PYEOF'
 import onnx, os, glob
-from onnx import numpy_helper
-import numpy as np
 
 path = "/nx_tech/models/resnet_age_gender_FB2/resnet18_finetuned_int8_fixed.onnx"
 model = onnx.load(path)
-
-# Collect shape inputs of all Reshape nodes (second input = shape tensor)
-reshape_inputs = set()
-for node in model.graph.node:
-    if node.op_type == "Reshape" and len(node.input) > 1:
-        reshape_inputs.add(node.input[1])
-
 fixed = 0
 
-# Fix Constant nodes whose output feeds a Reshape shape input
-for node in model.graph.node:
-    if node.op_type == "Constant" and node.output[0] in reshape_inputs:
-        for attr in node.attribute:
-            if attr.name == "value":
-                arr = numpy_helper.to_array(attr.t)
-                if arr.dtype == np.int64 and arr.shape == (2,) and arr[1] == 512 and arr[0] != -1:
-                    print(f"[entrypoint] Patching Constant node reshape {arr.tolist()} → [-1, 512]")
-                    attr.t.CopyFrom(numpy_helper.from_array(np.array([-1, 512], dtype=np.int64)))
-                    fixed += 1
-
-# Fix named initializers whose name feeds a Reshape shape input
-for init in list(model.graph.initializer):
-    if init.name in reshape_inputs:
-        arr = numpy_helper.to_array(init)
-        if arr.dtype == np.int64 and arr.shape == (2,) and arr[1] == 512 and arr[0] != -1:
-            print(f"[entrypoint] Patching initializer reshape {arr.tolist()} → [-1, 512]")
-            new_init = numpy_helper.from_array(np.array([-1, 512], dtype=np.int64), name=init.name)
-            model.graph.initializer.remove(init)
-            model.graph.initializer.append(new_init)
+# The model was exported with input [16,3,224,224] and output [16,6].
+# Change the batch dimension (dim[0]) from static 16 to symbolic "batch".
+for tensor in list(model.graph.input) + list(model.graph.output):
+    if tensor.type.tensor_type.HasField("shape") and tensor.type.tensor_type.shape.dim:
+        dim = tensor.type.tensor_type.shape.dim[0]
+        if dim.dim_value == 16:
+            dim.ClearField("dim_value")
+            dim.dim_param = "batch"
+            print(f"[entrypoint] Fixed {tensor.name}: batch dim 16 → dynamic")
             fixed += 1
 
 if fixed:
     onnx.save(model, path)
-    for eng in glob.glob("/nx_tech/models/resnet_age_gender_FB2/*.engine"):
+    for eng in glob.glob(os.path.dirname(path) + "/*.engine"):
         os.remove(eng)
         print(f"[entrypoint] Removed stale engine: {eng}")
-    print(f"[entrypoint] Patched {fixed} reshape(s) — engine will rebuild on first run.")
+    print(f"[entrypoint] Patched {fixed} tensor(s) — engine will rebuild on first run.")
 else:
-    print("[entrypoint] ONNX reshape already dynamic — no patch needed.")
+    print("[entrypoint] ONNX already has dynamic batch — no patch needed.")
 PYEOF
 fi
 
