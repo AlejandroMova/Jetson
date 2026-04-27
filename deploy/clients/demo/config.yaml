@@ -24,13 +24,42 @@ channels: [1]
 
 # Resolution fed to nvstreammux (and thus to inference).
 # For main stream (1 camera, max detail):     1920x1080
-# For substream (multi-camera, 16 ch):        960x544  (streammux will scale input to this)
+# For substream (multi-camera, 16 ch):        960x544
 # The MJPEG output resolution matches this value.
 stream_width: 1920
 stream_height: 1080
 
-# Pipeline(s) to run: people_counting | hotspot | reid
-pipeline: people_counting
+# Pipeline capabilities — default for this client.
+# The active pipeline is resolved in this order (highest priority first):
+#   1. NX_PIPELINE env var  (e.g. docker compose run -e NX_PIPELINE=people_counting,age_gender)
+#   2. /etc/nx_pipeline     (written by setup.sh --package, recommended for production)
+#   3. This field           (fallback default)
+#
+# Available capabilities:
+#   people_counting  — Always active. PeopleNet PGIE + tracker. No extra model needed.
+#   age_gender       — ResNet-18 SGIE: gender + age group per detected person.
+#                      Required by: Comercio Total / Enterprise
+#   epp_detection    — SGIE: PPE compliance (helmet, vest). Model not yet integrated.
+#                      Required by: Industrial Avanzado / Total / Enterprise
+#   fire_smoke       — Frame classifier: fire & smoke detection. Model not yet integrated.
+#                      Required by: Industrial Total / Enterprise, Hogar Total
+#   license_plate    — LPD + LPR: read vehicle plates. Model not yet integrated.
+#                      Required by: Industrial Total / Enterprise
+#   fall_detection   — Pose-based fall events. Model not yet integrated.
+#                      Required by: Hogar Avanzado / Total
+#
+# Package → capability mapping (set automatically by setup.sh --package):
+#   comercio_basico      → people_counting
+#   comercio_avanzado    → people_counting
+#   comercio_total       → people_counting,age_gender
+#   industrial_basico    → people_counting
+#   industrial_avanzado  → people_counting,epp_detection
+#   industrial_total     → people_counting,epp_detection,license_plate,fire_smoke
+#   hogar_basico         → people_counting
+#   hogar_avanzado       → people_counting,fall_detection
+#   hogar_total          → people_counting,fall_detection,fire_smoke
+pipeline:
+  - people_counting
 
 # Tracker algorithm:
 #   nvdcf — NvDCF correlation filter. More precise tracking through occlusions.

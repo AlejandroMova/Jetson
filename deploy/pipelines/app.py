@@ -5,10 +5,10 @@ Source: RTSP stream(s) from DVR, configured per-client via config_loader.
 Sink  : MJPEG stream on port 8080 — view with VLC:
           vlc http://<jetson-ip>:8080/stream
 
-Pipeline:
+Pipeline (capabilities driven by config.yaml `pipeline` field or /etc/nx_pipeline):
   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
-    → nvstreammux → nvinfer (PeopleNet) → nvtracker
-    → nvinfer (Age/Gender) → nvvideoconvert → capsfilter(RGBA)
+    → nvstreammux → nvinfer (PeopleNet PGIE) → nvtracker
+    → [nvinfer SGIE per active capability] → nvvideoconvert → capsfilter(RGBA)
     → nvdsosd → nvvideoconvert → capsfilter(NV12/CPU)
     → appsink → [HTTP MJPEG server]
 """
@@ -19,6 +19,7 @@ import math
 import sys
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -29,7 +30,35 @@ from gi.repository import GLib, Gst
 
 import pyds
 from config_loader import load_config
-from probes import osd_sink_pad_buffer_probe, api_client, init_channel_map
+from probes import osd_sink_pad_buffer_probe, api_client, init_channel_map, init_handlers
+
+# Maps each pipeline capability to its nvinfer config file (relative to deploy/).
+# Add a new entry here when integrating a new model.
+_MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+SGIE_CONFIGS = {
+    "age_gender":    str(_MODELS_DIR / "resnet_age_gender_FB2/config_infer.txt"),
+    "epp_detection": str(_MODELS_DIR / "epp/config_infer.txt"),
+    "fire_smoke":    str(_MODELS_DIR / "fire_smoke/config_infer.txt"),
+    "license_plate": str(_MODELS_DIR / "license_plate/config_infer.txt"),
+    "fall_detection":str(_MODELS_DIR / "fall_detection/config_infer.txt"),
+}
+
+
+def _validate_pipeline_models(pipeline: list) -> None:
+    """Fail fast before GStreamer init if a required model config file is missing."""
+    missing = []
+    for cap in pipeline:
+        if cap == "people_counting":
+            continue
+        cfg_path = SGIE_CONFIGS.get(cap)
+        if not cfg_path or not Path(cfg_path).exists():
+            missing.append((cap, cfg_path or "no config path defined"))
+    if missing:
+        lines = "\n".join(f"  '{cap}' → {path}" for cap, path in missing)
+        raise RuntimeError(
+            f"Cannot start: model config(s) missing for requested capabilities:\n{lines}\n"
+            "Add the ONNX model + config_infer.txt before enabling these capabilities."
+        )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,7 +195,9 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
 def main():
     cfg = load_config()
     cfg.log_summary()
+    _validate_pipeline_models(cfg.pipeline)
     init_channel_map(cfg.channels)
+    init_handlers(cfg.pipeline)
 
     urls = cfg.rtsp_urls()
     n_streams = len(urls)
@@ -186,7 +217,7 @@ def main():
     for i, url in enumerate(urls):
         _add_rtsp_source(pipeline, streammux, url, i)
 
-    # ── PGIE — PeopleNet ──────────────────────────────────────────────────────
+    # ── PGIE — PeopleNet (always active) ─────────────────────────────────────
     pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
     pgie.set_property("config-file-path",
                       "models/peoplenet_vpruned_quantized_decrypted_v2.3.4/nvinfer_config.txt")
@@ -201,9 +232,19 @@ def main():
     tracker.set_property("ll-config-file", cfg.tracker_config_path())
     tracker.set_property("display-tracking-id", 1)
 
-    # ── SGIE — Age/Gender ─────────────────────────────────────────────────────
-    sgie = Gst.ElementFactory.make("nvinfer", "secondary-inference")
-    sgie.set_property("config-file-path", "models/resnet_age_gender_FB2/config_infer.txt")
+    # ── SGIEs — one per active capability beyond people_counting ──────────────
+    sgie_elements = []
+    for cap in cfg.active_sgies():
+        sgie = Gst.ElementFactory.make("nvinfer", f"sgie-{cap}")
+        if not sgie:
+            logger.error("Could not create nvinfer element for capability '%s'", cap)
+            sys.exit(1)
+        sgie.set_property("config-file-path", SGIE_CONFIGS[cap])
+        sgie_elements.append(sgie)
+        logger.info("SGIE loaded: %s → %s", cap, SGIE_CONFIGS[cap])
+
+    if not sgie_elements:
+        logger.info("No SGIEs loaded — running people_counting only")
 
     # ── Tiler — combines N streams into one tiled frame ───────────────────────
     tiler_cols = math.ceil(math.sqrt(n_streams))
@@ -222,7 +263,6 @@ def main():
     nvosd      = Gst.ElementFactory.make("nvdsosd",        "onscreendisplay")
 
     # ── GPU→CPU download then appsink ─────────────────────────────────────────
-    # nvvideoconvert copies NVMM→system memory when downstream caps lack NVMM.
     nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
     caps_nv12  = Gst.ElementFactory.make("capsfilter",     "capsfilter-nv12")
     caps_nv12.set_property("caps", Gst.Caps.from_string("video/x-raw,format=NV12"))
@@ -232,20 +272,26 @@ def main():
     appsink.set_property("max-buffers",  2)
     appsink.set_property("drop",         True)
 
-    elements = [pgie, tracker, sgie, tiler, nvvidconv1, caps_rgba, nvosd,
-                nvvidconv2, caps_nv12, appsink]
-    if not all(elements):
+    fixed_elements = [pgie, tracker, tiler, nvvidconv1, caps_rgba, nvosd,
+                      nvvidconv2, caps_nv12, appsink]
+    if not all(fixed_elements):
         logger.error("Failed to create one or more pipeline elements.")
         sys.exit(1)
 
-    for el in elements:
+    for el in fixed_elements + sgie_elements:
         pipeline.add(el)
 
     # ── Linking ───────────────────────────────────────────────────────────────
     streammux.link(pgie)
     pgie.link(tracker)
-    tracker.link(sgie)
-    sgie.link(tiler)
+
+    # Chain SGIEs in sequence after tracker, then continue to tiler
+    prev = tracker
+    for sgie in sgie_elements:
+        prev.link(sgie)
+        prev = sgie
+    prev.link(tiler)
+
     tiler.link(nvvidconv1)
     nvvidconv1.link(caps_rgba)
     caps_rgba.link(nvosd)

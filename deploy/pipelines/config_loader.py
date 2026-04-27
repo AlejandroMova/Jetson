@@ -1,11 +1,12 @@
 """
 config_loader.py — NX Computing AI | Client Configuration Loader
 
-Merges three sources at runtime:
-  1. /etc/nx_client   (or NX_CLIENT env var)   → which client folder to load
-  2. /etc/nx_dvr_ip   (or NX_DVR_IP env var)   → DVR IP discovered by setup.sh
-  3. clients/<name>/config.yaml                 → non-sensitive client config
-  4. clients/<name>/.env                        → DVR_USER / DVR_PASS (gitignored)
+Merges four sources at runtime (highest priority first):
+  1. NX_PIPELINE env var  (or /etc/nx_pipeline)  → active pipeline capabilities
+  2. NX_CLIENT env var    (or /etc/nx_client)     → which client folder to load
+  3. NX_DVR_IP env var    (or /etc/nx_dvr_ip)     → DVR IP discovered by setup.sh
+  4. clients/<name>/config.yaml                   → non-sensitive client config
+  5. clients/<name>/.env                          → DVR_USER / DVR_PASS (gitignored)
 
 Usage:
     from config_loader import load_config
@@ -32,6 +33,17 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 TRACKER_CONFIGS = {
     "nvdcf": "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml",
     "iou":   "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml",
+}
+
+# All known pipeline capabilities. Each capability beyond people_counting maps to a SGIE.
+# Model files must exist before a capability can be activated (validated at startup).
+VALID_CAPABILITIES = {
+    "people_counting",  # Always active — PeopleNet PGIE + tracker. No extra model needed.
+    "age_gender",       # ResNet-18 SGIE: gender (male/female) + age group (young/adult/senior)
+    "epp_detection",    # SGIE: PPE compliance — helmet, vest, gloves on person crops
+    "fire_smoke",       # Frame-level classifier: fire and smoke detection
+    "license_plate",    # LPD + LPR: detect and read vehicle license plates
+    "fall_detection",   # Pose-based SGIE: detects person fall events
 }
 
 
@@ -79,10 +91,13 @@ class ClientConfig:
         logger.info("Pipeline(s): %s", self.pipeline)
         logger.info("Resolution : %dx%d", self.stream_width, self.stream_height)
         logger.info("Tracker    : %s", self.tracker)
-        # Log URLs but mask the password
         for url in self.rtsp_urls():
             masked = url.replace(self.dvr_pass, "***") if self.dvr_pass else url
             logger.info("RTSP URL   : %s", masked)
+
+    def active_sgies(self) -> List[str]:
+        """Return capabilities that require a SGIE (everything except people_counting)."""
+        return [c for c in self.pipeline if c != "people_counting"]
 
 
 def _read_etc_file(path: str, env_var: str, label: str) -> str:
@@ -134,9 +149,34 @@ def load_config() -> ClientConfig:
             f"Copy {client_dir}/.env.example to {client_dir}/.env and fill in the values."
         )
 
-    pipeline = cfg.get("pipeline", ["people_counting"])
-    if isinstance(pipeline, str):
-        pipeline = [pipeline]
+    # Pipeline resolution order:
+    #   1. NX_PIPELINE env var  (e.g. docker compose run -e NX_PIPELINE=people_counting,age_gender)
+    #   2. /etc/nx_pipeline     (written by setup.sh --package)
+    #   3. config.yaml pipeline field (client default)
+    raw_pipeline = os.environ.get("NX_PIPELINE", "").strip()
+    if raw_pipeline:
+        pipeline = [c.strip() for c in raw_pipeline.split(",") if c.strip()]
+        logger.debug("Pipeline from NX_PIPELINE env var: %s", pipeline)
+    else:
+        try:
+            file_val = Path("/etc/nx_pipeline").read_text().strip()
+            pipeline = [c.strip() for c in file_val.split(",") if c.strip()]
+            logger.debug("Pipeline from /etc/nx_pipeline: %s", pipeline)
+        except FileNotFoundError:
+            pipeline = cfg.get("pipeline", ["people_counting"])
+            if isinstance(pipeline, str):
+                pipeline = [p.strip() for p in pipeline.split(",") if p.strip()]
+            logger.debug("Pipeline from config.yaml: %s", pipeline)
+
+    if "people_counting" not in pipeline:
+        pipeline = ["people_counting"] + pipeline
+
+    unknown = set(pipeline) - VALID_CAPABILITIES
+    if unknown:
+        raise RuntimeError(
+            f"Unknown pipeline capabilities: {unknown}\n"
+            f"Valid options: {sorted(VALID_CAPABILITIES)}"
+        )
 
     return ClientConfig(
         client_name=client_name,

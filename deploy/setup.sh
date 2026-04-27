@@ -9,6 +9,10 @@
 #  Flags opcionales:
 #    --authkey    Auth key de Tailscale
 #    --client     Nombre del cliente (escribe /etc/nx_client, e.g. demo)
+#    --package    Paquete contratado (escribe /etc/nx_pipeline con las capabilities)
+#                 Opciones: comercio_basico | comercio_avanzado | comercio_total |
+#                           industrial_basico | industrial_avanzado | industrial_total |
+#                           hogar_basico | hogar_avanzado | hogar_total
 #    --compose    Nombre del archivo compose (default: docker-compose.yml)
 #    --hostname   Nombre visible en Tailscale (default: hostname actual)
 #    --no-vnc     Omite la instalación de VNC
@@ -38,6 +42,22 @@ TS_HOSTNAME="$(hostname)"
 SKIP_VNC=false
 SKIP_DOCKER=false
 NX_CLIENT=""
+NX_PACKAGE=""
+
+# Mapeo paquete → capabilities (comma-separated, written to /etc/nx_pipeline)
+declare -A PACKAGE_CAPABILITIES=(
+  [comercio_basico]="people_counting"
+  [comercio_avanzado]="people_counting"
+  [comercio_total]="people_counting,age_gender"
+  [comercio_enterprise]="people_counting,age_gender"
+  [industrial_basico]="people_counting"
+  [industrial_avanzado]="people_counting,epp_detection"
+  [industrial_total]="people_counting,epp_detection,license_plate,fire_smoke"
+  [industrial_enterprise]="people_counting,epp_detection,license_plate,fire_smoke"
+  [hogar_basico]="people_counting"
+  [hogar_avanzado]="people_counting,fall_detection"
+  [hogar_total]="people_counting,fall_detection,fire_smoke"
+)
 
 # El script corre desde la carpeta del repo
 WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -49,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --compose)   COMPOSE_FILE="$2"; shift 2 ;;
     --hostname)  TS_HOSTNAME="$2";  shift 2 ;;
     --client)    NX_CLIENT="$2";    shift 2 ;;
+    --package)   NX_PACKAGE="$2";   shift 2 ;;
     --no-vnc)    SKIP_VNC=true;     shift ;;
     --no-docker) SKIP_DOCKER=true;  shift ;;
     *) die "Flag desconocido: $1" ;;
@@ -299,7 +320,7 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
-# 5. Cliente NX
+# 5. Cliente NX + Paquete contratado
 # ════════════════════════════════════════════════════════════
 log "Registrando nombre de cliente..."
 
@@ -311,6 +332,55 @@ elif [[ -f /etc/nx_client ]]; then
 else
   warn "/etc/nx_client no existe. Usa: sudo bash setup.sh --client <nombre>"
   warn "O escríbelo manualmente: echo 'demo' | sudo tee /etc/nx_client"
+fi
+
+# ── Paquete contratado → capabilities del pipeline ───────────────────────────
+log "Registrando paquete contratado..."
+
+if [[ -z "$NX_PACKAGE" && -t 0 ]]; then
+  # Modo interactivo: mostrar menú si no se pasó --package
+  echo ""
+  echo -e "${BOLD}Selecciona el paquete contratado:${NC}"
+  echo "  1) comercio_basico      — Conteo de personas"
+  echo "  2) comercio_avanzado    — Conteo + analytics de backend"
+  echo "  3) comercio_total       — + Clasificación edad/género"
+  echo "  4) industrial_basico    — Conteo de personas"
+  echo "  5) industrial_avanzado  — + Detección EPP (requiere modelo)"
+  echo "  6) industrial_total     — + Placas + Fuego (requieren modelos)"
+  echo "  7) hogar_basico         — Detección de personas"
+  echo "  8) hogar_avanzado       — + Detección de caídas (requiere modelo)"
+  echo "  9) hogar_total          — + Detección de incendios (requiere modelo)"
+  echo "  0) Omitir (configurar después)"
+  echo ""
+  read -rp "Opción [0-9]: " _pkg_opt
+  case $_pkg_opt in
+    1) NX_PACKAGE="comercio_basico" ;;
+    2) NX_PACKAGE="comercio_avanzado" ;;
+    3) NX_PACKAGE="comercio_total" ;;
+    4) NX_PACKAGE="industrial_basico" ;;
+    5) NX_PACKAGE="industrial_avanzado" ;;
+    6) NX_PACKAGE="industrial_total" ;;
+    7) NX_PACKAGE="hogar_basico" ;;
+    8) NX_PACKAGE="hogar_avanzado" ;;
+    9) NX_PACKAGE="hogar_total" ;;
+    *) NX_PACKAGE="" ;;
+  esac
+fi
+
+if [[ -n "$NX_PACKAGE" ]]; then
+  _caps="${PACKAGE_CAPABILITIES[$NX_PACKAGE]}"
+  if [[ -z "$_caps" ]]; then
+    warn "Paquete desconocido: '${NX_PACKAGE}'. Usa uno de: ${!PACKAGE_CAPABILITIES[*]}"
+  else
+    echo "$_caps" > /etc/nx_pipeline
+    ok "Paquete '${BOLD}${NX_PACKAGE}${NC}' → capabilities: ${BOLD}${_caps}${NC}"
+    ok "Guardado en /etc/nx_pipeline"
+  fi
+elif [[ -f /etc/nx_pipeline ]]; then
+  ok "Pipeline ya configurado: ${BOLD}$(cat /etc/nx_pipeline)${NC}"
+else
+  warn "/etc/nx_pipeline no configurado — el pipeline usará el valor de config.yaml"
+  warn "Para configurar después: echo 'people_counting,age_gender' | sudo tee /etc/nx_pipeline"
 fi
 
 # ════════════════════════════════════════════════════════════
@@ -414,6 +484,7 @@ echo -e "  IP local:     ${BOLD}${LOCAL_IP}${NC}"
 echo -e "  IP Tailscale: ${BOLD}${TS_IP}${NC}"
 echo -e "  IP DVR:       ${BOLD}${DVR_IP}${NC}"
 echo -e "  Cliente NX:   ${BOLD}$(cat /etc/nx_client 2>/dev/null || echo 'no configurado')${NC}"
+echo -e "  Pipeline:     ${BOLD}$(cat /etc/nx_pipeline 2>/dev/null || echo 'default (config.yaml)')${NC}"
 echo ""
 echo -e "  ${GREEN}SSH:${NC}  ssh NxComputingDemo@${TS_IP}"
 echo -e "  ${GREEN}VNC:${NC}  ${TS_IP}:5900  (VNC Viewer)"

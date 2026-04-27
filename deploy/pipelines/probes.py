@@ -2,12 +2,15 @@
 probes.py — NX Computing AI | Edge Inference Core
 Probe de GStreamer para extracción de metadatos DeepStream y envío a API REST.
 
-Arquitectura de inferencia:
-  PGIE (PeopleNet, gie-id=1)  →  SGIE (Pedestrian Attr ResNet-18, gie-id=2)
-  El PGIE detecta 3 clases: person(0), bag(1), face(2).
-  El SGIE clasifica el recorte de CUERPO COMPLETO de cada person(0) del PGIE.
-  En condiciones reales de CCTV los rostros rara vez son visibles; la clasificación
-  por cuerpo aprovecha ropa, postura y complexión física.
+Arquitectura:
+  PGIE (PeopleNet, gie-id=1) detecta person/bag/face en el frame completo.
+  Handlers opcionales (uno por capability activa) procesan cada persona detectada.
+  El pipeline de handlers es registrado en init_handlers() antes de arrancar.
+
+Para agregar un nuevo modelo:
+  1. Crear una clase que herede de _BaseHandler e implemente process().
+  2. Añadirla a init_handlers() bajo su capability name.
+  3. Añadir la entrada en SGIE_CONFIGS en app.py.
 """
 import gi
 gi.require_version('Gst', '1.0')
@@ -384,31 +387,205 @@ def _set_osd_text(
 
 
 # ==============================================================================
-# 4. PROBE PRINCIPAL — OSD + ENVÍO A API
+# 4. HANDLERS DE PIPELINE
+#    Cada capability activa instancia un handler que procesa cada objeto
+#    detectado por el PGIE. Los handlers son registrados en init_handlers()
+#    y despachados desde osd_sink_pad_buffer_probe().
+#
+#    Contrato de process():
+#      Inputs : obj_meta (NvDsObjectMeta), frame_num (int)
+#      Returns: HandlerResult o None (sin acción)
 # ==============================================================================
-# Resultado final de votación por track_id: (raw_label, gender_disp, age_disp, prob)
-# prob = fracción de votos ganadores (ej. 7/10 → 0.70)
-_person_cache: Dict[int, Tuple[str, str, str, float]] = {}
 
-# Votos acumulados por track_id mientras no se alcanza VOTES_REQUIRED
-_person_votes: Dict[int, List[str]] = {}
+class _HandlerResult:
+    """Resultado que un handler devuelve al probe para OSD y API."""
+    __slots__ = ("osd_text", "border_color", "event_type", "det_extra", "analytics_update")
 
-# Último frame_num en que se tomó muestra para cada track_id
-_person_vote_last_frame: Dict[int, int] = {}
+    def __init__(
+        self,
+        osd_text: str = "",
+        border_color: Tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
+        event_type: str = "",          # si no vacío → emite evento API adicional
+        det_extra: Optional[dict] = None,
+        analytics_update: Optional[dict] = None,
+    ):
+        self.osd_text = osd_text
+        self.border_color = border_color
+        self.event_type = event_type
+        self.det_extra = det_extra or {}
+        self.analytics_update = analytics_update or {}
 
-# IDs de personas ya notificadas a la API (evita spam de eventos por persona)
+
+class _AgeGenderHandler:
+    """
+    Clasificación de género y grupo de edad por votación sobre el SGIE ResNet-18.
+    Acumula VOTES_REQUIRED muestras del SGIE antes de fijar el resultado.
+    """
+
+    def __init__(self):
+        self._cache: Dict[int, Tuple[str, str, str, float]] = {}
+        self._votes: Dict[int, List[str]] = {}
+        self._vote_last_frame: Dict[int, int] = {}
+
+    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+        p_track_id = int(obj_meta.object_id)
+        bbox_w = int(obj_meta.rect_params.width)
+        bbox_h = int(obj_meta.rect_params.height)
+        person_too_small = bbox_w < VOTE_MIN_WIDTH or bbox_h < VOTE_MIN_HEIGHT
+
+        # Read current SGIE output for this object
+        raw_label, gender_disp, age_disp, prob = "", "", "", 0.0
+        _cls_items = 0
+        _seen_ids: list = []
+        for cls_meta in _iter_pyds_list(
+            obj_meta.classifier_meta_list, pyds.NvDsClassifierMeta.cast
+        ):
+            _cls_items += 1
+            _seen_ids.append(cls_meta.unique_component_id)
+            if cls_meta.unique_component_id == SGIE_AGE_GENDER_ID:
+                raw_label, gender_disp, age_disp, prob = _parse_age_gender(cls_meta)
+                break
+
+        if frame_num % 30 == 0:
+            logger.info(
+                "DIAG P#%d frame=%d | cls_items=%d ids=%s | label=%r prob=%.3f",
+                p_track_id, frame_num, _cls_items, _seen_ids, raw_label, prob,
+            )
+
+        is_new_classification = False
+        if p_track_id in self._cache:
+            raw_label, gender_disp, age_disp, prob = self._cache[p_track_id]
+        elif person_too_small:
+            return _HandlerResult(
+                osd_text=f"P#{p_track_id} | Muy lejos",
+                border_color=(0.8, 0.8, 0.0, 1.0),
+            )
+        else:
+            last_frame = self._vote_last_frame.get(p_track_id, -VOTE_SAMPLE_INTERVAL)
+            if (raw_label and prob >= MIN_CLASSIFICATION_PROB
+                    and (frame_num - last_frame) >= VOTE_SAMPLE_INTERVAL):
+                votes = self._votes.setdefault(p_track_id, [])
+                votes.append(raw_label)
+                self._vote_last_frame[p_track_id] = frame_num
+
+                if len(votes) >= VOTES_REQUIRED:
+                    winner = max(set(votes), key=votes.count)
+                    vote_prob = votes.count(winner) / len(votes)
+                    w_gender, w_age = _AGE_GENDER_LABEL_MAP[winner]
+                    self._cache[p_track_id] = (winner, w_gender, w_age, vote_prob)
+                    raw_label, gender_disp, age_disp, prob = self._cache[p_track_id]
+                    is_new_classification = True
+                    logger.debug(
+                        "P#%d votación completa: %s (%.0f%% de %d votos)",
+                        p_track_id, winner, vote_prob * 100, len(votes),
+                    )
+                else:
+                    n_votes = len(votes)
+                    return _HandlerResult(
+                        osd_text=f"P#{p_track_id} | Analizando... ({n_votes}/{VOTES_REQUIRED})",
+                        border_color=(0.0, 0.8, 1.0, 1.0),
+                    )
+            else:
+                n_votes = len(self._votes.get(p_track_id, []))
+                return _HandlerResult(
+                    osd_text=f"P#{p_track_id} | Analizando... ({n_votes}/{VOTES_REQUIRED})",
+                    border_color=(0.0, 0.8, 1.0, 1.0),
+                )
+
+        api_gender, api_age = _AGE_GENDER_API_MAP[raw_label]
+        analytics = {}
+        det_extra = {}
+        event_type = ""
+        if is_new_classification:
+            event_type = "person_classified"
+            det_extra = {
+                "demographics": {
+                    "gender":     api_gender,
+                    "age_group":  api_age,
+                    "label":      raw_label,
+                    "confidence": round(prob, 3),
+                }
+            }
+            analytics = {
+                "age_gender_classes": raw_label,
+                "gender_key": "gender_male" if raw_label.startswith("male") else "gender_female",
+            }
+
+        return _HandlerResult(
+            osd_text=f"P#{p_track_id} | {gender_disp} | {age_disp} {prob:.0%}",
+            border_color=(0.0, 1.0, 0.0, 1.0),
+            event_type=event_type,
+            det_extra=det_extra,
+            analytics_update=analytics,
+        )
+
+
+class _EppHandler:
+    """Stub: PPE/EPP compliance detection. Model not yet integrated."""
+    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+        return None
+
+
+class _FireSmokeHandler:
+    """Stub: fire and smoke frame-level classifier. Model not yet integrated."""
+    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+        return None
+
+
+class _LicensePlateHandler:
+    """Stub: LPD + LPR vehicle license plate reader. Model not yet integrated."""
+    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+        return None
+
+
+class _FallDetectionHandler:
+    """Stub: pose-based fall event detection. Model not yet integrated."""
+    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+        return None
+
+
+# Active handler instances — populated by init_handlers() before pipeline starts.
+_active_handlers: List = []
+
+_HANDLER_REGISTRY = {
+    "age_gender":    _AgeGenderHandler,
+    "epp_detection": _EppHandler,
+    "fire_smoke":    _FireSmokeHandler,
+    "license_plate": _LicensePlateHandler,
+    "fall_detection":_FallDetectionHandler,
+}
+
+
+def init_handlers(pipeline_capabilities: List[str]) -> None:
+    """Called from app.py after load_config() to register active handlers."""
+    global _active_handlers
+    _active_handlers = []
+    for cap in pipeline_capabilities:
+        cls = _HANDLER_REGISTRY.get(cap)
+        if cls:
+            _active_handlers.append(cls())
+    names = [type(h).__name__ for h in _active_handlers]
+    logger.info("Active handlers: %s", names if names else ["(none — people_counting only)"])
+
+
+# ==============================================================================
+# 5. PROBE PRINCIPAL — OSD + ENVÍO A API
+# ==============================================================================
+
+# IDs de personas ya notificadas a la API (primera aparición)
 _person_notified: set = set()
 
 # Crops capturados por track_id: cantidad guardada y último frame muestreado
 _crop_counts: Dict[int, int] = {}
 _crop_last_frame: Dict[int, int] = {}
 
-# Frame de referencia enviado por pad_index — uno por cámara, una sola vez por sesión
+# Frame de referencia enviado por pad_index — una vez por cámara por sesión
 _reference_frame_sent: Dict[int, bool] = {}
 
 # Analytics y timestamp por pad_index — conteos independientes por cámara
 _analytics: Dict[int, Dict] = {}
 _analytics_last_sent: Dict[int, float] = {}
+
 
 def _get_analytics(pad_index: int) -> Dict:
     if pad_index not in _analytics:
@@ -417,6 +594,7 @@ def _get_analytics(pad_index: int) -> Dict:
             "gender_female": 0, "age_gender_classes": {},
         }
     return _analytics[pad_index]
+
 
 def _get_analytics_last_sent(pad_index: int) -> float:
     if pad_index not in _analytics_last_sent:
@@ -431,7 +609,6 @@ def _save_and_send_crop(
     frame_num: int,
     bbox: dict,
 ) -> None:
-    """Guarda el recorte localmente y lo envía a la API de forma no bloqueante."""
     person_dir = Path(CROPS_DIR) / camera_id / str(track_id)
     person_dir.mkdir(parents=True, exist_ok=True)
     filepath = person_dir / f"frame_{frame_num:06d}.jpg"
@@ -444,19 +621,11 @@ def _save_and_send_crop(
 
 def osd_sink_pad_buffer_probe(_pad, info):
     """
-    Probe conectado al sink-pad del elemento nvdsosd.
-
-    Arquitectura (2 modelos):
-      PGIE (PeopleNet, gie-id=1) detecta person/bag/face en el frame completo.
-      SGIE (Pedestrian Attr, gie-id=2) clasifica el recorte de cuerpo completo
-      de cada person(0), inyectando NvDsClassifierMeta en el mismo objeto.
-
-    Por cada persona:
-      - Si el SGIE ya entregó resultado → muestra género/edad + confianza en OSD.
-      - Si aún no hay resultado          → muestra "P#N | Analizando..." en cyan.
-      - Si ya fue clasificada antes      → recupera de caché (no re-analiza).
+    Probe conectado al sink-pad de nvdsosd.
+    Itera sobre cada objeto persona del PGIE, despacha a los handlers activos
+    y envía eventos / analytics a la API REST.
     """
-    global _person_notified, _person_cache, _person_votes, _person_vote_last_frame, _crop_counts, _crop_last_frame
+    global _person_notified, _crop_counts, _crop_last_frame
 
     gst_buffer = info.get_buffer()
     if not gst_buffer:
@@ -474,7 +643,6 @@ def osd_sink_pad_buffer_probe(_pad, info):
         camera_id = _camera_id_for(pad_index)
         frame_detections: List[dict] = []
 
-        # Extraer frame como numpy (una sola vez por frame para todos los objetos)
         frame_np = None
         try:
             n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -494,77 +662,30 @@ def osd_sink_pad_buffer_probe(_pad, info):
 
             p_track_id = int(obj_meta.object_id)
 
-            # Leer clasificación del SGIE en este frame
-            raw_label, gender_disp, age_disp, prob = "", "", "", 0.0
-            _cls_items = 0
-            _seen_ids: list = []
-            for cls_meta in _iter_pyds_list(
-                obj_meta.classifier_meta_list, pyds.NvDsClassifierMeta.cast
-            ):
-                _cls_items += 1
-                _seen_ids.append(cls_meta.unique_component_id)
-                if cls_meta.unique_component_id == SGIE_AGE_GENDER_ID:
-                    raw_label, gender_disp, age_disp, prob = _parse_age_gender(cls_meta)
-                    break
+            # Default OSD — overridden by handlers below if active
+            _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
 
-            # --- DIAGNÓSTICO TEMPORAL (quitar cuando funcione) ---
-            if frame_num % 30 == 0:
-                logger.info(
-                    "DIAG P#%d frame=%d | cls_items=%d ids=%s | label=%r prob=%.3f",
-                    p_track_id, frame_num, _cls_items, _seen_ids, raw_label, prob,
-                )
+            # Dispatch to each registered handler
+            for handler in _active_handlers:
+                result = handler.process(obj_meta, frame_num)
+                if result is None:
+                    continue
+                if result.osd_text:
+                    _set_osd_text(obj_meta, result.osd_text, border_color=result.border_color)
+                if result.event_type:
+                    det = _build_detection_dict(obj_meta)
+                    det["type"] = result.event_type
+                    det.update(result.det_extra)
+                    frame_detections.append(det)
+                    an = _get_analytics(pad_index)
+                    au = result.analytics_update
+                    if "age_gender_classes" in au:
+                        lbl = au["age_gender_classes"]
+                        an["age_gender_classes"][lbl] = an["age_gender_classes"].get(lbl, 0) + 1
+                    if "gender_key" in au:
+                        an[au["gender_key"]] += 1
 
-            bbox_w = int(obj_meta.rect_params.width)
-            bbox_h = int(obj_meta.rect_params.height)
-            person_too_small = bbox_w < VOTE_MIN_WIDTH or bbox_h < VOTE_MIN_HEIGHT
-
-            is_new_classification = False
-            if p_track_id in _person_cache:
-                # Votación completada — usar resultado fijo
-                raw_label, gender_disp, age_disp, prob = _person_cache[p_track_id]
-            elif person_too_small:
-                # Persona demasiado pequeña — no clasificar
-                raw_label, gender_disp, age_disp, prob = "", "", "", 0.0
-            else:
-                # Acumular voto si el SGIE entregó resultado aceptable y pasó el intervalo
-                last_frame = _person_vote_last_frame.get(p_track_id, -VOTE_SAMPLE_INTERVAL)
-                if (raw_label and prob >= MIN_CLASSIFICATION_PROB
-                        and (frame_num - last_frame) >= VOTE_SAMPLE_INTERVAL):
-                    votes = _person_votes.setdefault(p_track_id, [])
-                    votes.append(raw_label)
-                    _person_vote_last_frame[p_track_id] = frame_num
-
-                    if len(votes) >= VOTES_REQUIRED:
-                        winner = max(set(votes), key=votes.count)
-                        vote_prob = votes.count(winner) / len(votes)
-                        w_gender, w_age = _AGE_GENDER_LABEL_MAP[winner]
-                        _person_cache[p_track_id] = (winner, w_gender, w_age, vote_prob)
-                        raw_label, gender_disp, age_disp, prob = _person_cache[p_track_id]
-                        is_new_classification = True
-                        logger.debug(
-                            "P#%d votación completa: %s (%.0f%% de %d votos)",
-                            p_track_id, winner, vote_prob * 100, len(votes),
-                        )
-                    else:
-                        raw_label, gender_disp, age_disp, prob = "", "", "", 0.0
-                else:
-                    raw_label, gender_disp, age_disp, prob = "", "", "", 0.0
-
-            # OSD
-            if raw_label:
-                osd_text = f"P#{p_track_id} | {gender_disp} | {age_disp} {prob:.0%}"
-                border   = (0.0, 1.0, 0.0, 1.0)    # Verde — clasificado
-            elif person_too_small:
-                osd_text = f"P#{p_track_id} | Muy lejos"
-                border   = (0.8, 0.8, 0.0, 1.0)    # Amarillo — fuera de rango
-            else:
-                n_votes  = len(_person_votes.get(p_track_id, []))
-                osd_text = f"P#{p_track_id} | Analizando... ({n_votes}/{VOTES_REQUIRED})"
-                border   = (0.0, 0.8, 1.0, 1.0)    # Cyan — recolectando votos
-
-            _set_osd_text(obj_meta, osd_text, border_color=border)
-
-            # Capturar crop para dataset
+            # Crop capture for dataset (always, regardless of handlers)
             if frame_np is not None:
                 last_crop = _crop_last_frame.get(p_track_id, -CROP_SAMPLE_INTERVAL)
                 count = _crop_counts.get(p_track_id, 0)
@@ -583,7 +704,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                         _crop_counts[p_track_id] = count + 1
                         _crop_last_frame[p_track_id] = frame_num
 
-            # Notificar primera aparición de la persona
+            # First appearance event (people_counting — always active)
             if p_track_id not in _person_notified:
                 _person_notified.add(p_track_id)
                 det = _build_detection_dict(obj_meta)
@@ -591,28 +712,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 frame_detections.append(det)
                 _get_analytics(pad_index)["person_count"] += 1
 
-            # Notificar primera clasificación confirmada
-            if is_new_classification:
-                det = _build_detection_dict(obj_meta)
-                det["type"] = "person_classified"
-                api_gender, api_age = _AGE_GENDER_API_MAP[raw_label]
-                det["demographics"] = {
-                    "gender":     api_gender,
-                    "age_group":  api_age,
-                    "label":      raw_label,
-                    "confidence": round(prob, 3),
-                }
-                frame_detections.append(det)
-                an = _get_analytics(pad_index)
-                an["age_gender_classes"][raw_label] = an["age_gender_classes"].get(raw_label, 0) + 1
-                if raw_label.startswith("male"):
-                    an["gender_male"] += 1
-                else:
-                    an["gender_female"] += 1
-
-        # ----------------------------------------------------------------
-        # Frame de referencia para heatmap — primer frame sin personas, por cámara
-        # ----------------------------------------------------------------
+        # Reference frame for heatmap — first empty frame per camera
         if (not _reference_frame_sent.get(pad_index, False)
                 and frame_np is not None
                 and not frame_detections
@@ -622,19 +722,15 @@ def osd_sink_pad_buffer_probe(_pad, info):
             frame_b64 = base64.b64encode(buf).decode("utf-8")
             api_client.post_reference_frame(camera_id, frame_num, frame_b64, w, h)
             _reference_frame_sent[pad_index] = True
-            logger.info("Frame de referencia enviado camera=%s (frame=%d, %dx%d)", camera_id, frame_num, w, h)
+            logger.info("Frame de referencia enviado camera=%s (frame=%d, %dx%d)",
+                        camera_id, frame_num, w, h)
 
-        # ----------------------------------------------------------------
-        # Enviar evento solo cuando hay detección nueva o clasificación nueva
-        # ----------------------------------------------------------------
         if frame_detections:
-            has_classified = any(d.get("type") == "person_classified" for d in frame_detections)
-            evt_type = "person_classified" if has_classified else "person_detection"
+            has_classified = any(d.get("type") not in ("person", "") for d in frame_detections)
+            evt_type = frame_detections[-1].get("type", "person_detection") if has_classified \
+                else "person_detection"
             api_client.post_detection_event(camera_id, frame_num, frame_detections, evt_type)
 
-        # ----------------------------------------------------------------
-        # Enviar analytics agregadas cada ANALYTICS_SEND_INTERVAL_SECS, por cámara
-        # ----------------------------------------------------------------
         now = time.monotonic()
         if now - _get_analytics_last_sent(pad_index) >= ANALYTICS_SEND_INTERVAL_SECS:
             an = _get_analytics(pad_index)

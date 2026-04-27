@@ -1,7 +1,9 @@
 # NX Computing AI — Jetson Edge Pipeline
 
-Real-time CCTV analytics on NVIDIA Jetson NX using DeepStream 7.1.  
-Detects people, classifies age/gender, and streams inference output via RTSP.
+Real-time CCTV analytics on NVIDIA Jetson using DeepStream 7.1.  
+Modular inference pipeline: people detection is always active; additional models
+(age/gender, EPP, fire/smoke, license plates, fall detection) load based on the
+client's contracted package.
 
 ---
 
@@ -50,28 +52,44 @@ nano .env                           # fill API_KEY and API_BASE_URL
 
 # 4. Run setup — does everything automatically:
 #    installs Docker + Tailscale, detects DVR IP, builds image,
-#    identifies DVR URL pattern, detects active channels, starts pipeline
-sudo bash setup.sh --client <client_name> --authkey <tailscale-key>
+#    identifies DVR URL pattern, detects active channels, starts pipeline.
+#    --package sets the contracted tier (writes /etc/nx_pipeline).
+sudo bash setup.sh \
+  --client <client_name> \
+  --package comercio_total \
+  --authkey <tailscale-key>
 
 # 5. Watch inference from your laptop
-vlc http://<jetson-tailscale-ip>:8080/stream
-# or with lower latency:
 vlc --network-caching=300 http://<jetson-tailscale-ip>:8080/stream
 ```
 
-> **First run**: TensorRT will build engines for both models (~5 min each).  
+> **First run**: TensorRT builds engines for active models (~5 min each).  
 > Subsequent starts take ~30 seconds.
 
 ### Manual mode (if you need to run steps individually)
 
 ```bash
 # Skip docker in setup, then run each step manually:
-sudo bash setup.sh --client <client_name> --authkey <tailscale-key> --no-docker
+sudo bash setup.sh --client <client_name> --package comercio_total \
+  --authkey <tailscale-key> --no-docker
 
 docker compose build
 docker compose run --rm deepstream python3 tools/identify_dvr.py --update-config
 docker compose run --rm deepstream python3 tools/probe_cameras.py --update-config
 docker compose up -d
+```
+
+### Overriding the pipeline without re-running setup
+
+```bash
+# Temporarily run a different package (does not persist):
+docker compose run --rm \
+  -e NX_PIPELINE=people_counting,age_gender \
+  deepstream python3 pipelines/app.py
+
+# Persist a new package on an already-deployed Jetson:
+echo "people_counting,age_gender" | sudo tee /etc/nx_pipeline
+docker compose restart deepstream
 ```
 
 ---
@@ -119,6 +137,44 @@ docker compose run --rm deepstream \
 
 ---
 
+## Pipeline packages
+
+The active models are controlled by the `pipeline` setting. Each capability maps to one SGIE
+loaded after PeopleNet. The startup sequence validates that all required model files exist
+before GStreamer initializes — missing models produce a clear error instead of a runtime crash.
+
+### Package → capability mapping
+
+| Package | `pipeline` value | Models loaded |
+|---------|-----------------|---------------|
+| Comercio Básico / Avanzado | `people_counting` | PeopleNet only |
+| Comercio Total / Enterprise | `people_counting, age_gender` | + ResNet-18 age/gender |
+| Industrial Básico | `people_counting` | PeopleNet only |
+| Industrial Avanzado | `people_counting, epp_detection` | + PPE SGIE *(model pending)* |
+| Industrial Total | `people_counting, epp_detection, license_plate, fire_smoke` | + LPD/LPR + fire *(pending)* |
+| Hogar Básico | `people_counting` | PeopleNet only |
+| Hogar Avanzado | `people_counting, fall_detection` | + fall SGIE *(model pending)* |
+| Hogar Total | `people_counting, fall_detection, fire_smoke` | + fire *(model pending)* |
+
+### Where pipeline is resolved (priority order)
+
+| Source | How to set | Use case |
+|--------|-----------|----------|
+| `NX_PIPELINE` env var | `docker compose run -e NX_PIPELINE=...` | One-off testing |
+| `/etc/nx_pipeline` | `setup.sh --package <tier>` or `tee /etc/nx_pipeline` | Production |
+| `config.yaml pipeline:` | Edit client config and push | Client default / fallback |
+
+### Adding a new model
+
+When a new model (e.g. EPP) is ready:
+
+1. Drop model files into `deploy/models/<capability>/` (ONNX + `config_infer.txt` + `labels.txt`)
+2. Add one line to `SGIE_CONFIGS` in [deploy/pipelines/app.py](deploy/pipelines/app.py)
+3. Activate the handler in `init_handlers()` in [deploy/pipelines/probes.py](deploy/pipelines/probes.py) (stub class already exists)
+4. Set the package on the Jetson: `echo "people_counting,epp_detection" | sudo tee /etc/nx_pipeline`
+
+---
+
 ## Adding a new client
 
 1. **On your laptop, create the client folder and commit it:**
@@ -141,17 +197,20 @@ docker compose run --rm deepstream \
    channels: [1, 2]        # DVR channel numbers to process
    stream_width: 1920
    stream_height: 1080
-   pipeline: people_counting
+   pipeline:               # default fallback — overridden by /etc/nx_pipeline on the Jetson
+     - people_counting
    tracker: nvdcf           # nvdcf (≤6 streams) | iou (up to 16 streams)
    ```
 
-3. **On the Jetson, pull and set credentials:**
+3. **On the Jetson, pull and set credentials + package:**
    ```bash
    cd ~/NX-JETSON && git pull
    cd deploy/
    cp clients/<client_name>/.env.example clients/<client_name>/.env
    nano clients/<client_name>/.env     # fill DVR_USER and DVR_PASS
    echo "<client_name>" | sudo tee /etc/nx_client
+   # Set contracted package (writes /etc/nx_pipeline):
+   echo "people_counting,age_gender" | sudo tee /etc/nx_pipeline
    docker compose restart deepstream
    ```
    `.env` is gitignored and stays only on the Jetson.
@@ -170,7 +229,7 @@ docker compose run --rm deepstream \
 | `channels` | list[int] | `[1]` | DVR channel numbers to ingest |
 | `stream_width` | int | `1920` | DVR main stream width |
 | `stream_height` | int | `1080` | DVR main stream height |
-| `pipeline` | string or list | `people_counting` | Which pipeline(s) to run |
+| `pipeline` | list | `[people_counting]` | Default capabilities for this client. Overridden by `/etc/nx_pipeline` or `NX_PIPELINE` env var. Valid values: `people_counting`, `age_gender`, `epp_detection`, `fire_smoke`, `license_plate`, `fall_detection` |
 | `tracker` | string | `nvdcf` | Tracker algorithm — see table below |
 | `stream_width` | int | `1920` | Resolution fed to `nvstreammux` (inference + MJPEG output) |
 | `stream_height` | int | `1080` | Same, height |
@@ -219,6 +278,7 @@ Copy from `deploy/.env.example` and fill in before first deploy.
 
 ### Runtime resolution order
 
+`NX_PIPELINE` env var → `/etc/nx_pipeline` (setup.sh `--package`) → `config.yaml pipeline:`  
 `NX_CLIENT` env var → `/etc/nx_client` (written by setup.sh)  
 `NX_DVR_IP` env var → `/etc/nx_dvr_ip` (written by setup.sh)  
 `DVR_USER` / `DVR_PASS` env vars → `clients/<name>/.env`
@@ -229,12 +289,19 @@ Copy from `deploy/.env.example` and fill in before first deploy.
 
 ```
 DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
-  → PeopleNet (PGIE) → Tracker (NvDCF or IOU, per config)
-  → ResNet-18 Age/Gender (SGIE)
+  → PeopleNet PGIE (always active) → Tracker (NvDCF or IOU, per config)
+  → [SGIE: age_gender]       ← loaded if pipeline includes age_gender
+  → [SGIE: epp_detection]    ← loaded if pipeline includes epp_detection
+  → [SGIE: ...]              ← one nvinfer element per active capability
   → nvmultistreamtiler → nvdsosd
   → nvvideoconvert → appsink → HTTP MJPEG server (port 8080)
                   → REST API (probes.py async client)
 ```
+
+The probe dispatcher calls each registered handler for every detected person.
+Handlers that have no model yet (`epp_detection`, `fire_smoke`, `license_plate`,
+`fall_detection`) are stub classes in [probes.py](deploy/pipelines/probes.py) —
+they become active once the model files are added and the class is implemented.
 
 View the live feed:
 ```bash
