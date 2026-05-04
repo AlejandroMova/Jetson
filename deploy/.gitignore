@@ -1,0 +1,24 @@
+# DVR credentials — never commit
+clients/*/.env
+
+# Face recognition database — per-deployment, not tracked
+clients/*/known_faces.json
+
+# Face photos used to generate embeddings — stay on admin laptop
+clients/*/faces/
+
+# TensorRT engines — rebuilt per device, large binaries
+models/**/*.engine
+
+# InsightFace downloaded models
+models/insightface/
+
+# MoveNet ONNX (downloaded by tools/download_models.py)
+models/movenet/
+
+# Person crops dataset
+crops/
+
+# Python
+__pycache__/
+*.pyc

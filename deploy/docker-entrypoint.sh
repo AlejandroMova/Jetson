@@ -55,4 +55,23 @@ else:
 PYEOF
 fi
 
+# Pre-download InsightFace buffalo_l if face_recognition is active
+NX_PIPELINE_VAL="${NX_PIPELINE:-$(cat /etc/nx_pipeline 2>/dev/null || echo '')}"
+if echo "$NX_PIPELINE_VAL" | grep -q "face_recognition"; then
+    INSIGHTFACE_ROOT="/nx_tech/models/insightface"
+    MODEL_MARKER="${INSIGHTFACE_ROOT}/models/buffalo_l/w600k_r50.onnx"
+    if [[ ! -f "$MODEL_MARKER" ]]; then
+        echo "[entrypoint] Pre-descargando InsightFace buffalo_l..."
+        python3 -c "
+from insightface.app import FaceAnalysis
+app = FaceAnalysis(name='buffalo_l', root='${INSIGHTFACE_ROOT}',
+                   providers=['CUDAExecutionProvider','CPUExecutionProvider'])
+app.prepare(ctx_id=0, det_size=(640, 640))
+print('[entrypoint] InsightFace buffalo_l listo.')
+"
+    else
+        echo "[entrypoint] InsightFace buffalo_l ya descargado — skip"
+    fi
+fi
+
 exec "$@"

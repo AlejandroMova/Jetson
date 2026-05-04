@@ -38,12 +38,13 @@ TRACKER_CONFIGS = {
 # All known pipeline capabilities. Each capability beyond people_counting maps to a SGIE.
 # Model files must exist before a capability can be activated (validated at startup).
 VALID_CAPABILITIES = {
-    "people_counting",  # Always active — PeopleNet PGIE + tracker. No extra model needed.
-    "age_gender",       # ResNet-18 SGIE: gender (male/female) + age group (young/adult/senior)
-    "epp_detection",    # SGIE: PPE compliance — helmet, vest, gloves on person crops
-    "fire_smoke",       # Frame-level classifier: fire and smoke detection
-    "license_plate",    # LPD + LPR: detect and read vehicle license plates
-    "fall_detection",   # Pose-based SGIE: detects person fall events
+    "people_counting",   # Always active — PeopleNet PGIE + tracker. No extra model needed.
+    "age_gender",        # ResNet-18 SGIE: gender (male/female) + age group (young/adult/senior)
+    "epp_detection",     # SGIE: PPE compliance — helmet, vest, gloves on person crops
+    "fire_smoke",        # Frame-level classifier: fire and smoke detection
+    "license_plate",     # LPD + LPR: detect and read vehicle license plates
+    "fall_detection",    # MoveNet ONNX Python worker: detects person fall events
+    "face_recognition",  # FaceDetectIR SGIE + InsightFace ArcFace: identifies known persons
 }
 
 

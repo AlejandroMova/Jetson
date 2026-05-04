@@ -2,8 +2,8 @@
 
 Real-time CCTV analytics on NVIDIA Jetson using DeepStream 7.1.  
 Modular inference pipeline: people detection is always active; additional models
-(age/gender, EPP, fire/smoke, license plates, fall detection) load based on the
-client's contracted package.
+(age/gender, EPP, fire/smoke, license plates, fall detection, face recognition) load
+based on the client's contracted package.
 
 ---
 
@@ -21,9 +21,11 @@ NX-JETSON/
 │   │   └── demo/
 │   │       ├── config.yaml         # Non-sensitive config (channels, port, pipeline)
 │   │       └── .env.example        # Template — copy to .env and fill credentials
-│   ├── tools/                      # Utility scripts (run inside container)
+│   ├── tools/                      # Utility scripts
 │   │   ├── identify_dvr.py         # Auto-detect DVR brand + URL pattern
 │   │   ├── probe_cameras.py        # Find which DVR channels have cameras
+│   │   ├── download_models.py      # Download optional models (MoveNet, etc.)
+│   │   ├── register_face.py        # Register known persons into face DB
 │   │   └── update.sh               # Smart pull + conditional rebuild
 │   ├── models/                     # Model files (TensorRT engines rebuilt per device)
 │   ├── Dockerfile.jetson           # Jetson arm64 container image
@@ -129,32 +131,57 @@ bash tools/update.sh --force-rebuild
 # Place an MP4 in deploy/test_videos/
 cp your_video.mp4 deploy/test_videos/
 
-# SSH into Jetson, then:
-cd ~/NX-JETSON/deploy
+# Default (people_counting + age_gender):
 docker compose run --rm deepstream \
     python3 pipelines/app_video_testing.py test_videos/your_video.mp4
+
+# Test fall detection:
+docker compose run --rm deepstream \
+    python3 pipelines/app_video_testing.py test_videos/fall.mp4 \
+    --capabilities people_counting,fall_detection
+
+# Test face recognition:
+docker compose run --rm deepstream \
+    python3 pipelines/app_video_testing.py test_videos/office.mp4 \
+    --capabilities people_counting,face_recognition --client demo
 ```
+
+View output at `rtsp://<jetson-ip>:8554/ds-test` (VLC).
 
 ---
 
 ## Pipeline packages
 
-The active models are controlled by the `pipeline` setting. Each capability maps to one SGIE
-loaded after PeopleNet. The startup sequence validates that all required model files exist
-before GStreamer initializes — missing models produce a clear error instead of a runtime crash.
+The active models are controlled by the `pipeline` setting. Each capability maps to either a
+DeepStream SGIE element or a Python worker thread. The startup sequence validates that all
+required model files exist before GStreamer initializes.
 
 ### Package → capability mapping
 
 | Package | `pipeline` value | Models loaded |
 |---------|-----------------|---------------|
 | Comercio Básico / Avanzado | `people_counting` | PeopleNet only |
-| Comercio Total / Enterprise | `people_counting, age_gender` | + ResNet-18 age/gender |
+| Comercio Total | `people_counting, age_gender` | + ResNet-18 age/gender |
+| Comercio Enterprise | `people_counting, age_gender, face_recognition` | + FaceDetectIR + InsightFace |
 | Industrial Básico | `people_counting` | PeopleNet only |
 | Industrial Avanzado | `people_counting, epp_detection` | + PPE SGIE *(model pending)* |
 | Industrial Total | `people_counting, epp_detection, license_plate, fire_smoke` | + LPD/LPR + fire *(pending)* |
+| Industrial Enterprise | `people_counting, epp_detection, license_plate, fire_smoke, face_recognition` | + face recognition |
 | Hogar Básico | `people_counting` | PeopleNet only |
-| Hogar Avanzado | `people_counting, fall_detection` | + fall SGIE *(model pending)* |
-| Hogar Total | `people_counting, fall_detection, fire_smoke` | + fire *(model pending)* |
+| Hogar Avanzado | `people_counting, fall_detection` | + MoveNet pose (Python worker) |
+| Hogar Total | `people_counting, fall_detection, fire_smoke, face_recognition` | + fire + face recognition |
+
+### Capability implementation
+
+| Capability | Type | Model | Notes |
+|-----------|------|-------|-------|
+| `people_counting` | PGIE | PeopleNet v2.3.4 | Always active |
+| `age_gender` | SGIE (gie-id=2) | ResNet-18 Pedestrian Attr | Full-body crop → 6 classes |
+| `fall_detection` | Python worker | MoveNet Lightning ONNX | Auto-downloaded by setup.sh |
+| `face_recognition` | SGIE (gie-id=3) + Python worker | FaceDetectIR + InsightFace buffalo_l | Requires NGC API key |
+| `epp_detection` | SGIE | *(pending)* | Helmet/vest/gloves |
+| `fire_smoke` | SGIE | *(pending)* | Frame-level classifier |
+| `license_plate` | SGIE | *(pending)* | LPD + LPR |
 
 ### Where pipeline is resolved (priority order)
 
@@ -164,13 +191,30 @@ before GStreamer initializes — missing models produce a clear error instead of
 | `/etc/nx_pipeline` | `setup.sh --package <tier>` or `tee /etc/nx_pipeline` | Production |
 | `config.yaml pipeline:` | Edit client config and push | Client default / fallback |
 
+### NGC API Key (required for face_recognition)
+
+FaceDetectIR is downloaded from NVIDIA GPU Cloud (NGC) and requires a free account:
+
+1. Create account at [ngc.nvidia.com](https://ngc.nvidia.com) (free)
+2. Generate an API key at **ngc.nvidia.com/setup/api-key**
+3. `setup.sh` will prompt for it automatically when `face_recognition` is in the pipeline  
+   — the key is saved to `/etc/nx_ngc_key` (mode 600) for future runs
+
+```bash
+# Manual download if needed:
+NGC_API_KEY=<your-key>
+wget --header="Authorization: ApiKey ${NGC_API_KEY}" \
+  -O deploy/models/facedetect_ir/resnet18_facedetectir_pruned_quantized.onnx \
+  "https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir/versions/pruned_quantized_v2.0/files/resnet18_facedetectir_pruned_quantized.onnx"
+```
+
 ### Adding a new model
 
 When a new model (e.g. EPP) is ready:
 
 1. Drop model files into `deploy/models/<capability>/` (ONNX + `config_infer.txt` + `labels.txt`)
-2. Add one line to `SGIE_CONFIGS` in [deploy/pipelines/app.py](deploy/pipelines/app.py)
-3. Activate the handler in `init_handlers()` in [deploy/pipelines/probes.py](deploy/pipelines/probes.py) (stub class already exists)
+2. Add one line to `SGIE_CONFIGS` in [deploy/pipelines/app.py](deploy/pipelines/app.py) (or `None` for Python workers)
+3. Implement the handler class in [deploy/pipelines/probes.py](deploy/pipelines/probes.py) (stub already exists)
 4. Set the package on the Jetson: `echo "people_counting,epp_detection" | sudo tee /etc/nx_pipeline`
 
 ---
@@ -229,7 +273,7 @@ When a new model (e.g. EPP) is ready:
 | `channels` | list[int] | `[1]` | DVR channel numbers to ingest |
 | `stream_width` | int | `1920` | DVR main stream width |
 | `stream_height` | int | `1080` | DVR main stream height |
-| `pipeline` | list | `[people_counting]` | Default capabilities for this client. Overridden by `/etc/nx_pipeline` or `NX_PIPELINE` env var. Valid values: `people_counting`, `age_gender`, `epp_detection`, `fire_smoke`, `license_plate`, `fall_detection` |
+| `pipeline` | list | `[people_counting]` | Default capabilities for this client. Overridden by `/etc/nx_pipeline` or `NX_PIPELINE` env var. Valid values: `people_counting`, `age_gender`, `epp_detection`, `fire_smoke`, `license_plate`, `fall_detection`, `face_recognition` |
 | `tracker` | string | `nvdcf` | Tracker algorithm — see table below |
 | `stream_width` | int | `1920` | Resolution fed to `nvstreammux` (inference + MJPEG output) |
 | `stream_height` | int | `1080` | Same, height |
@@ -285,23 +329,75 @@ Copy from `deploy/.env.example` and fill in before first deploy.
 
 ---
 
+## Face Recognition
+
+### Registering known persons (run on your laptop)
+
+Embeddings are generated on your laptop — photos never leave your machine. Only the
+resulting `known_faces.json` (~1 KB/person) is copied to the Jetson.
+
+```bash
+# Prerequisites (one-time):
+pip install insightface onnxruntime opencv-python
+
+# Option A — register one person from an image:
+python deploy/tools/register_face.py --name "Juan Perez" --image foto.jpg --client <client_name>
+
+# Option B — import a full folder at once (recommended for many people):
+#   Folder structure: clients/<client>/faces/<Name>/<photo.jpg>
+python deploy/tools/register_face.py --import-dir clients/<client_name>/faces/ --client <client_name>
+
+# List registered persons:
+python deploy/tools/register_face.py --list --client <client_name>
+
+# Delete a person:
+python deploy/tools/register_face.py --delete "Juan Perez" --client <client_name>
+```
+
+### Deploying the face database to a Jetson
+
+```bash
+# Copy the JSON (not the photos) to the Jetson:
+scp deploy/clients/<client_name>/known_faces.json \
+    jetson@<ip>:/nx_tech/clients/<client_name>/
+
+# Restart the container to reload the DB:
+ssh jetson@<ip> "cd /nx_tech && docker compose restart deepstream"
+```
+
+### What gets stored
+
+`known_faces.json` contains only 512-dimensional ArcFace embedding vectors (no photos):
+```json
+{
+  "Juan Perez": [[0.12, -0.34, ...], [0.11, -0.35, ...]],
+  "Ana Lopez":  [[0.55,  0.21, ...]]
+}
+```
+Multiple embeddings per person increase recognition robustness across poses/lighting.
+
+---
+
 ## Architecture
 
 ```
 DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
-  → PeopleNet PGIE (always active) → Tracker (NvDCF or IOU, per config)
-  → [SGIE: age_gender]       ← loaded if pipeline includes age_gender
-  → [SGIE: epp_detection]    ← loaded if pipeline includes epp_detection
-  → [SGIE: ...]              ← one nvinfer element per active capability
+  → PeopleNet PGIE (gie-id=1, always active) → Tracker (NvDCF or IOU)
+  → [SGIE: age_gender   gie-id=2]  ← one nvinfer per active SGIE capability
+  → [SGIE: facedetectir gie-id=3]  ← face detection (if face_recognition active)
+  → [SGIE: ...]
   → nvmultistreamtiler → nvdsosd
   → nvvideoconvert → appsink → HTTP MJPEG server (port 8080)
                   → REST API (probes.py async client)
+
+Python workers (background threads, non-blocking):
+  fall_detection  → PoseWorker    → MoveNet ONNX → 17 keypoints → fall rules
+  face_recognition→ FaceRecognizer→ InsightFace ArcFace → cosine match vs known_faces.json
 ```
 
-The probe dispatcher calls each registered handler for every detected person.
-Handlers that have no model yet (`epp_detection`, `fire_smoke`, `license_plate`,
-`fall_detection`) are stub classes in [probes.py](deploy/pipelines/probes.py) —
-they become active once the model files are added and the class is implemented.
+The probe dispatcher separates PGIE person detections from FaceDetectIR SGIE face detections.
+`fall_detection` and `face_recognition` use Python worker threads (same async pattern as the
+REST API client) so inference never blocks the GStreamer pipeline.
 
 View the live feed:
 ```bash

@@ -2,3 +2,6 @@ requests
 opencv-python-headless
 pyyaml
 python-dotenv
+numpy
+onnxruntime
+insightface>=0.7.3

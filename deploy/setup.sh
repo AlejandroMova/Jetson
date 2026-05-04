@@ -49,14 +49,14 @@ declare -A PACKAGE_CAPABILITIES=(
   [comercio_basico]="people_counting"
   [comercio_avanzado]="people_counting"
   [comercio_total]="people_counting,age_gender"
-  [comercio_enterprise]="people_counting,age_gender"
+  [comercio_enterprise]="people_counting,age_gender,face_recognition"
   [industrial_basico]="people_counting"
   [industrial_avanzado]="people_counting,epp_detection"
   [industrial_total]="people_counting,epp_detection,license_plate,fire_smoke"
-  [industrial_enterprise]="people_counting,epp_detection,license_plate,fire_smoke"
+  [industrial_enterprise]="people_counting,epp_detection,license_plate,fire_smoke,face_recognition"
   [hogar_basico]="people_counting"
   [hogar_avanzado]="people_counting,fall_detection"
-  [hogar_total]="people_counting,fall_detection,fire_smoke"
+  [hogar_total]="people_counting,fall_detection,fire_smoke,face_recognition"
 )
 
 # El script corre desde la carpeta del repo
@@ -384,6 +384,72 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
+# _download_models — descarga modelos según pipeline activo
+# ════════════════════════════════════════════════════════════
+_download_models() {
+  local pipeline
+  pipeline=$(cat /etc/nx_pipeline 2>/dev/null || echo "")
+
+  # ── MoveNet (fall_detection) — URL pública, sin auth ────────
+  if echo "$pipeline" | grep -q "fall_detection"; then
+    MOVENET_DEST="${WORK_DIR}/models/movenet/movenet_singlepose_lightning_192.onnx"
+    if [[ -f "$MOVENET_DEST" ]]; then
+      ok "MoveNet ya descargado — skip"
+    else
+      log "Descargando MoveNet SinglePose Lightning..."
+      mkdir -p "$(dirname "$MOVENET_DEST")"
+      python3 "${WORK_DIR}/tools/download_models.py" --fall-detection \
+        && ok "MoveNet descargado" \
+        || warn "Fallo al descargar MoveNet. Corre manualmente: python3 tools/download_models.py --fall-detection"
+    fi
+  fi
+
+  # ── FaceDetectIR (face_recognition) — requiere NGC API Key ──
+  if echo "$pipeline" | grep -q "face_recognition"; then
+    FACE_ONNX="${WORK_DIR}/models/facedetect_ir/resnet18_facedetectir_pruned_quantized.onnx"
+    if [[ -f "$FACE_ONNX" ]]; then
+      ok "FaceDetectIR ya descargado — skip"
+    else
+      # Leer o solicitar NGC API Key
+      NGC_KEY_FILE="/etc/nx_ngc_key"
+      if [[ -f "$NGC_KEY_FILE" ]]; then
+        NGC_API_KEY=$(cat "$NGC_KEY_FILE")
+        log "NGC API Key leída de ${NGC_KEY_FILE}"
+      else
+        echo ""
+        echo -e "${YELLOW}Se necesita una NGC API Key para descargar FaceDetectIR.${NC}"
+        echo -e "  Obtén tu key en: ${BOLD}https://ngc.nvidia.com/setup/api-key${NC}"
+        echo -n "  Ingresa tu NGC API Key: "
+        read -r NGC_API_KEY
+        if [[ -z "$NGC_API_KEY" ]]; then
+          warn "NGC API Key vacía — saltando descarga de FaceDetectIR."
+          warn "Para descargar manualmente más tarde: bash setup.sh --package <paquete>"
+          return 0
+        fi
+        echo "$NGC_API_KEY" > "$NGC_KEY_FILE"
+        chmod 600 "$NGC_KEY_FILE"
+        ok "NGC API Key guardada en ${NGC_KEY_FILE}"
+      fi
+
+      log "Descargando FaceDetectIR desde NGC..."
+      mkdir -p "${WORK_DIR}/models/facedetect_ir"
+      NGC_URL="https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir/versions/pruned_quantized_v2.0/files/resnet18_facedetectir_pruned_quantized.onnx"
+      if wget -q --show-progress \
+              --header="Authorization: ApiKey ${NGC_API_KEY}" \
+              -O "$FACE_ONNX" \
+              "$NGC_URL"; then
+        ok "FaceDetectIR descargado: ${FACE_ONNX}"
+      else
+        rm -f "$FACE_ONNX"
+        warn "Fallo al descargar FaceDetectIR desde NGC."
+        warn "Verifica tu API Key o descarga manualmente desde:"
+        warn "  https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tao/models/facedetectir"
+      fi
+    fi
+  fi
+}
+
+# ════════════════════════════════════════════════════════════
 # 6. Docker Compose
 # ════════════════════════════════════════════════════════════
 if [[ "$SKIP_DOCKER" == false ]]; then
@@ -412,6 +478,9 @@ if [[ "$SKIP_DOCKER" == false ]]; then
     log "Construyendo imagen Docker (~10 min la primera vez)..."
     $COMPOSE_CMD -f "$COMPOSE_FILE" build deepstream
     ok "Imagen construida"
+
+    # ── 6a-bis. Descargar modelos según pipeline activo ──────
+    _download_models
 
     # ── 6b. Auto-identificar DVR (patrón URL + resolución) ───
     CLIENT_NAME=$(cat /etc/nx_client 2>/dev/null || echo "")

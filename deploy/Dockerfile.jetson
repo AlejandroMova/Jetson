@@ -21,6 +21,15 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt \
     && pip3 install --no-cache-dir onnx
 
+# onnxruntime-gpu for arm64 (Jetson / aarch64) — pre-built wheel from NVIDIA
+# CPU-only onnxruntime is in requirements.txt for dev; this replaces it on Jetson.
+RUN pip3 install --no-cache-dir \
+    https://github.com/nschloe/onnxruntime-aarch64-ubuntu22/releases/download/v1.17.1/onnxruntime_gpu-1.17.1-cp310-cp310-linux_aarch64.whl \
+    || pip3 install --no-cache-dir onnxruntime  # fallback to CPU if wheel not compatible
+
+# InsightFace — face recognition (ArcFace embeddings)
+RUN pip3 install --no-cache-dir insightface>=0.7.3
+
 # Entrypoint: compiles custom softmax parser + patches ONNX dynamic batch
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

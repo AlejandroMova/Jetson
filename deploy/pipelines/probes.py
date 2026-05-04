@@ -5,12 +5,13 @@ Probe de GStreamer para extracción de metadatos DeepStream y envío a API REST.
 Arquitectura:
   PGIE (PeopleNet, gie-id=1) detecta person/bag/face en el frame completo.
   Handlers opcionales (uno por capability activa) procesan cada persona detectada.
-  El pipeline de handlers es registrado en init_handlers() antes de arrancar.
+  PoseWorker y FaceRecognizer corren en hilos de fondo (patrón async NxApiClient).
 
 Para agregar un nuevo modelo:
-  1. Crear una clase que herede de _BaseHandler e implemente process().
-  2. Añadirla a init_handlers() bajo su capability name.
-  3. Añadir la entrada en SGIE_CONFIGS en app.py.
+  1. Crear una clase que implemente process(obj_meta, frame_num, frame_np).
+  2. Añadirla a _HANDLER_REGISTRY bajo su capability name.
+  3. Si necesita un worker async, agregarlo en init_workers() y wirearlo en init_handlers().
+  4. Añadir la entrada en SGIE_CONFIGS en app.py (o None si es Python worker).
 """
 import gi
 gi.require_version('Gst', '1.0')
@@ -58,41 +59,43 @@ def _camera_id_for(pad_index: int) -> str:
     ch = _channel_map.get(pad_index, pad_index)
     return f"{JETSON_ID}-ch{ch:02d}"
 
-# gie-unique-id de cada modelo (deben coincidir con los configs de nvinfer)
-PGIE_UNIQUE_ID: int = 1       # PeopleNet
-SGIE_AGE_GENDER_ID: int = 2   # ResNet-18 Pedestrian Attr — opera sobre person(0) del PGIE
+# ── GIE unique-ids ────────────────────────────────────────────────────────────
+PGIE_UNIQUE_ID: int      = 1   # PeopleNet
+SGIE_AGE_GENDER_ID: int  = 2   # ResNet-18 Pedestrian Attr
+SGIE_FACE_DETECT_ID: int = 3   # FaceDetectIR SGIE
 
-# Clases del PGIE (PeopleNet)
+# ── PGIE class ids ────────────────────────────────────────────────────────────
 PGIE_CLASS_PERSON: int = 0
-PGIE_CLASS_BAG: int = 1
-PGIE_CLASS_FACE: int = 2
+PGIE_CLASS_BAG:    int = 1
+PGIE_CLASS_FACE:   int = 2
 
-# Umbral mínimo de confianza para pintar y reportar detecciones del PGIE
-OSD_CONFIDENCE_THRESHOLD: float = 0.40
+# ── Confidence thresholds ─────────────────────────────────────────────────────
+OSD_CONFIDENCE_THRESHOLD: float      = 0.40
+MIN_CLASSIFICATION_PROB: float       = 0.3
+FACE_DET_CONFIDENCE_THRESHOLD: float = 0.40
 
-# Confianza mínima para que un voto individual del SGIE sea aceptado.
-MIN_CLASSIFICATION_PROB: float = 0.3
-
-# Sistema de votación: se muestrea 1 frame cada VOTE_SAMPLE_INTERVAL frames
-# por persona. Al acumular VOTES_REQUIRED votos se fija la clasificación final.
-# Con intervalo=5 y 10 votos, una persona visible ~1.7s a 30fps queda clasificada.
+# ── Age/gender voting ─────────────────────────────────────────────────────────
 VOTE_SAMPLE_INTERVAL: int = 5
-VOTES_REQUIRED: int = 10
+VOTES_REQUIRED: int       = 10
+VOTE_MIN_WIDTH: int       = 64
+VOTE_MIN_HEIGHT: int      = 160
 
-# Intervalo en segundos para enviar analytics de sistema (conteos agregados)
+# ── Fall detection ────────────────────────────────────────────────────────────
+POSE_SAMPLE_INTERVAL: int  = 10   # enqueue crop every N frames per person
+POSE_MIN_PERSON_WIDTH: int = 40   # skip persons narrower than this (too far)
+
+# ── Face recognition ──────────────────────────────────────────────────────────
+FACE_SAMPLE_INTERVAL: int  = 30   # frames between recognition attempts per track
+
+# ── Analytics ─────────────────────────────────────────────────────────────────
 ANALYTICS_SEND_INTERVAL_SECS: float = 60.0
 
-# Tamaño mínimo del bounding box para clasificar age/gender con el SGIE.
-# Personas más pequeñas están demasiado lejos — su crop tiene poca calidad.
-VOTE_MIN_WIDTH: int = 64
-VOTE_MIN_HEIGHT: int = 160
-
-# Captura de crops para dataset
-CROPS_DIR: str = "crops"                # carpeta local donde se guardan los recortes
-CROP_SAMPLE_INTERVAL: int = 15          # capturar 1 crop cada N frames por persona
-CROP_MAX_PER_PERSON: int = 5            # máximo de crops a guardar por persona
-CROP_MIN_WIDTH: int = 40                # descartar recortes más pequeños que esto
-CROP_MIN_HEIGHT: int = 80
+# ── Crop capture ──────────────────────────────────────────────────────────────
+CROPS_DIR: str            = "crops"
+CROP_SAMPLE_INTERVAL: int = 15
+CROP_MAX_PER_PERSON: int  = 5
+CROP_MIN_WIDTH: int       = 40
+CROP_MIN_HEIGHT: int      = 80
 
 
 # ==============================================================================
@@ -427,7 +430,7 @@ class _AgeGenderHandler:
         self._votes: Dict[int, List[str]] = {}
         self._vote_last_frame: Dict[int, int] = {}
 
-    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+    def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
         p_track_id = int(obj_meta.object_id)
         bbox_w = int(obj_meta.rect_params.width)
         bbox_h = int(obj_meta.rect_params.height)
@@ -521,55 +524,218 @@ class _AgeGenderHandler:
 
 
 class _EppHandler:
-    """Stub: PPE/EPP compliance detection. Model not yet integrated."""
-    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+    def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
         return None
 
 
 class _FireSmokeHandler:
-    """Stub: fire and smoke frame-level classifier. Model not yet integrated."""
-    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+    def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
         return None
 
 
 class _LicensePlateHandler:
-    """Stub: LPD + LPR vehicle license plate reader. Model not yet integrated."""
-    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+    def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
         return None
 
 
 class _FallDetectionHandler:
-    """Stub: pose-based fall event detection. Model not yet integrated."""
-    def process(self, obj_meta, frame_num: int) -> Optional[_HandlerResult]:
+    """
+    Pose-based fall detection via async PoseWorker (MoveNet ONNX).
+    Enqueues person crops non-blocking; reads results on subsequent frames.
+    """
+
+    def __init__(self):
+        self._worker = None
+
+    def set_worker(self, worker) -> None:
+        self._worker = worker
+
+    def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
+        if self._worker is None:
+            return None
+
+        p_track_id = int(obj_meta.object_id)
+        r = obj_meta.rect_params
+        bbox_w, bbox_h = int(r.width), int(r.height)
+        bbox = {"left": max(0, int(r.left)), "top": max(0, int(r.top)),
+                "width": bbox_w, "height": bbox_h}
+
+        if (frame_np is not None
+                and frame_num % POSE_SAMPLE_INTERVAL == 0
+                and bbox_w >= POSE_MIN_PERSON_WIDTH):
+            l, t = bbox["left"], bbox["top"]
+            crop = frame_np[t:t + bbox_h, l:l + bbox_w]
+            if crop.size > 0:
+                self._worker.enqueue(crop, p_track_id, frame_num, bbox)
+
+        result = self._worker.get_result(p_track_id)
+        if result is None:
+            return None
+
+        if result.is_falling:
+            is_new_fall = self._worker.pop_new_fall(p_track_id)
+            return _HandlerResult(
+                osd_text=f"P#{p_track_id} | CAIDA",
+                border_color=(1.0, 0.0, 0.0, 1.0),
+                event_type="fall_detected" if is_new_fall else "",
+                det_extra={
+                    "fall_score":  result.fall_score,
+                    "avg_kp_conf": round(result.avg_conf, 3),
+                } if is_new_fall else {},
+            )
+
         return None
 
 
-# Active handler instances — populated by init_handlers() before pipeline starts.
+class _FaceRecognitionHandler:
+    """
+    Face recognition via async FaceRecognizer (InsightFace ArcFace).
+    Receives face detections from FaceDetectIR SGIE (gie-id=3), crops face from
+    the full frame, enqueues for embedding extraction, and caches results per track.
+
+    This handler is NOT in _HANDLER_REGISTRY — it is dispatched separately via
+    _face_handler because it processes SGIE_FACE_DETECT_ID objects, not PGIE objects.
+    """
+
+    def __init__(self, worker):
+        self._worker = worker
+        self._last_sample: Dict[int, int] = {}
+        self._cache: Dict[int, Tuple[str, float]] = {}
+
+    def process_face(
+        self,
+        face_obj_meta,
+        frame_num: int,
+        frame_np,
+        persons_meta: list,
+        camera_id: str,
+    ) -> None:
+        if self._worker is None or frame_np is None:
+            return
+        if face_obj_meta.confidence < FACE_DET_CONFIDENCE_THRESHOLD:
+            return
+
+        parent_track_id = self._find_parent_track(face_obj_meta, persons_meta)
+        if parent_track_id is None:
+            return
+
+        last = self._last_sample.get(parent_track_id, -FACE_SAMPLE_INTERVAL)
+        if frame_num - last < FACE_SAMPLE_INTERVAL:
+            return
+
+        r = face_obj_meta.rect_params
+        l = max(0, int(r.left))
+        t = max(0, int(r.top))
+        w = max(1, int(r.width))
+        h = max(1, int(r.height))
+        face_crop = frame_np[t:t + h, l:l + w]
+        if face_crop.size == 0:
+            return
+
+        self._last_sample[parent_track_id] = frame_num
+        self._worker.enqueue(face_crop, parent_track_id, frame_num, camera_id)
+
+        result = self._worker.get_result(parent_track_id)
+        if result:
+            self._cache[parent_track_id] = result
+
+    def get_identity(self, track_id: int) -> Optional[Tuple[str, float]]:
+        result = self._worker.get_result(track_id) if self._worker else None
+        if result:
+            self._cache[track_id] = result
+        return self._cache.get(track_id)
+
+    @staticmethod
+    def _find_parent_track(face_obj_meta, persons_meta: list) -> Optional[int]:
+        """Find the person whose bbox contains the center of this face detection."""
+        fr = face_obj_meta.rect_params
+        face_cx = fr.left + fr.width / 2
+        face_cy = fr.top + fr.height / 2
+        for p in persons_meta:
+            pr = p.rect_params
+            if (pr.left <= face_cx <= pr.left + pr.width
+                    and pr.top <= face_cy <= pr.top + pr.height):
+                return int(p.object_id)
+        return None
+
+
+# ==============================================================================
+# 5. WORKER GLOBALS + LIFECYCLE
+# ==============================================================================
+
+_pose_worker     = None   # PoseWorker (fall_detection)
+_face_recognizer = None   # FaceRecognizer (face_recognition)
+
+
+def init_workers(
+    pipeline_capabilities: List[str],
+    model_dir: str,
+    face_db_path: str = "",
+) -> None:
+    global _pose_worker, _face_recognizer
+
+    if "fall_detection" in pipeline_capabilities:
+        from pose_worker import PoseWorker
+        model_path = str(Path(model_dir) / "movenet" / "movenet_singlepose_lightning_192.onnx")
+        _pose_worker = PoseWorker(model_path)
+        _pose_worker.start()
+
+    if "face_recognition" in pipeline_capabilities:
+        from face_recognizer import FaceRecognizer
+        _face_recognizer = FaceRecognizer(db_path=face_db_path, model_root=str(Path(model_dir) / "insightface"))
+        _face_recognizer.start()
+
+
+def stop_workers() -> None:
+    if _pose_worker is not None:
+        _pose_worker.stop()
+    if _face_recognizer is not None:
+        _face_recognizer.stop()
+
+
+# ==============================================================================
+# 6. HANDLER REGISTRY + INIT
+# ==============================================================================
+
 _active_handlers: List = []
+_face_handler: Optional[_FaceRecognitionHandler] = None
 
 _HANDLER_REGISTRY = {
     "age_gender":    _AgeGenderHandler,
     "epp_detection": _EppHandler,
     "fire_smoke":    _FireSmokeHandler,
     "license_plate": _LicensePlateHandler,
-    "fall_detection":_FallDetectionHandler,
+    "fall_detection": _FallDetectionHandler,
+    # face_recognition is NOT here — handled separately via _face_handler
 }
 
 
 def init_handlers(pipeline_capabilities: List[str]) -> None:
-    """Called from app.py after load_config() to register active handlers."""
-    global _active_handlers
+    global _active_handlers, _face_handler
     _active_handlers = []
+    _face_handler = None
+
     for cap in pipeline_capabilities:
         cls = _HANDLER_REGISTRY.get(cap)
         if cls:
-            _active_handlers.append(cls())
+            handler = cls()
+            _active_handlers.append(handler)
+            if isinstance(handler, _FallDetectionHandler) and _pose_worker is not None:
+                handler.set_worker(_pose_worker)
+                logger.info("FallDetectionHandler → PoseWorker")
+
+        if cap == "face_recognition" and _face_recognizer is not None:
+            _face_handler = _FaceRecognitionHandler(_face_recognizer)
+            logger.info("FaceRecognitionHandler → FaceRecognizer")
+
     names = [type(h).__name__ for h in _active_handlers]
+    if _face_handler:
+        names.append("_FaceRecognitionHandler")
     logger.info("Active handlers: %s", names if names else ["(none — people_counting only)"])
 
 
 # ==============================================================================
-# 5. PROBE PRINCIPAL — OSD + ENVÍO A API
+# 7. PROBE PRINCIPAL — OSD + ENVÍO A API
 # ==============================================================================
 
 # IDs de personas ya notificadas a la API (primera aparición)
@@ -622,8 +788,8 @@ def _save_and_send_crop(
 def osd_sink_pad_buffer_probe(_pad, info):
     """
     Probe conectado al sink-pad de nvdsosd.
-    Itera sobre cada objeto persona del PGIE, despacha a los handlers activos
-    y envía eventos / analytics a la API REST.
+    Itera sobre objetos del frame: personas del PGIE y caras del FaceDetectIR SGIE.
+    Despacha handlers activos y envía eventos / analytics a la API REST.
     """
     global _person_notified, _crop_counts, _crop_last_frame
 
@@ -652,22 +818,35 @@ def osd_sink_pad_buffer_probe(_pad, info):
             if frame_num % 30 == 0:
                 logger.warning("get_nvds_buf_surface falló frame=%d: %s", frame_num, e)
 
+        # ── First pass: collect persons and face detections ───────────────────
+        persons_meta: List = []
+        face_metas: List   = []
         for obj_meta in _iter_pyds_list(
             frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast
         ):
-            if (obj_meta.unique_component_id != PGIE_UNIQUE_ID
-                    or obj_meta.confidence < OSD_CONFIDENCE_THRESHOLD
-                    or int(obj_meta.class_id) != PGIE_CLASS_PERSON):
-                continue
+            uid = obj_meta.unique_component_id
+            if (uid == PGIE_UNIQUE_ID
+                    and obj_meta.confidence >= OSD_CONFIDENCE_THRESHOLD
+                    and int(obj_meta.class_id) == PGIE_CLASS_PERSON):
+                persons_meta.append(obj_meta)
+            elif uid == SGIE_FACE_DETECT_ID:
+                face_metas.append(obj_meta)
 
+        # ── Face recognition: process SGIE detections ────────────────────────
+        if _face_handler and face_metas and frame_np is not None:
+            for face_obj_meta in face_metas:
+                _face_handler.process_face(
+                    face_obj_meta, frame_num, frame_np, persons_meta, camera_id
+                )
+
+        # ── Second pass: process each person ─────────────────────────────────
+        for obj_meta in persons_meta:
             p_track_id = int(obj_meta.object_id)
 
-            # Default OSD — overridden by handlers below if active
             _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
 
-            # Dispatch to each registered handler
             for handler in _active_handlers:
-                result = handler.process(obj_meta, frame_num)
+                result = handler.process(obj_meta, frame_num, frame_np=frame_np)
                 if result is None:
                     continue
                 if result.osd_text:
@@ -685,7 +864,20 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     if "gender_key" in au:
                         an[au["gender_key"]] += 1
 
-            # Crop capture for dataset (always, regardless of handlers)
+            # Overlay face identity on top of existing OSD text
+            if _face_handler:
+                identity = _face_handler.get_identity(p_track_id)
+                if identity:
+                    name, conf = identity
+                    if name != "Desconocido":
+                        cur = obj_meta.text_params.display_text or f"P#{p_track_id}"
+                        _set_osd_text(
+                            obj_meta,
+                            f"{cur} | {name} {conf:.0%}",
+                            border_color=(0.2, 1.0, 0.4, 1.0),
+                        )
+
+            # Crop capture for dataset (always active)
             if frame_np is not None:
                 last_crop = _crop_last_frame.get(p_track_id, -CROP_SAMPLE_INTERVAL)
                 count = _crop_counts.get(p_track_id, 0)

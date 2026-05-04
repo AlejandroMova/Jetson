@@ -30,17 +30,21 @@ from gi.repository import GLib, Gst
 
 import pyds
 from config_loader import load_config
-from probes import osd_sink_pad_buffer_probe, api_client, init_channel_map, init_handlers
+from probes import (
+    osd_sink_pad_buffer_probe, api_client,
+    init_channel_map, init_handlers, init_workers, stop_workers,
+)
 
 # Maps each pipeline capability to its nvinfer config file (relative to deploy/).
-# Add a new entry here when integrating a new model.
+# None = Python worker (no SGIE element created for that capability).
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 SGIE_CONFIGS = {
-    "age_gender":    str(_MODELS_DIR / "resnet_age_gender_FB2/config_infer.txt"),
-    "epp_detection": str(_MODELS_DIR / "epp/config_infer.txt"),
-    "fire_smoke":    str(_MODELS_DIR / "fire_smoke/config_infer.txt"),
-    "license_plate": str(_MODELS_DIR / "license_plate/config_infer.txt"),
-    "fall_detection":str(_MODELS_DIR / "fall_detection/config_infer.txt"),
+    "age_gender":      str(_MODELS_DIR / "resnet_age_gender_FB2/config_infer.txt"),
+    "epp_detection":   str(_MODELS_DIR / "epp/config_infer.txt"),
+    "fire_smoke":      str(_MODELS_DIR / "fire_smoke/config_infer.txt"),
+    "license_plate":   str(_MODELS_DIR / "license_plate/config_infer.txt"),
+    "fall_detection":  None,  # MoveNet Python worker — no SGIE
+    "face_recognition": str(_MODELS_DIR / "facedetect_ir/config_infer.txt"),
 }
 
 
@@ -51,8 +55,10 @@ def _validate_pipeline_models(pipeline: list) -> None:
         if cap == "people_counting":
             continue
         cfg_path = SGIE_CONFIGS.get(cap)
-        if not cfg_path or not Path(cfg_path).exists():
-            missing.append((cap, cfg_path or "no config path defined"))
+        if cfg_path is None:
+            continue  # Python worker — no file needed
+        if not Path(cfg_path).exists():
+            missing.append((cap, cfg_path))
     if missing:
         lines = "\n".join(f"  '{cap}' → {path}" for cap, path in missing)
         raise RuntimeError(
@@ -197,6 +203,10 @@ def main():
     cfg.log_summary()
     _validate_pipeline_models(cfg.pipeline)
     init_channel_map(cfg.channels)
+
+    client_dir = Path(__file__).resolve().parent.parent / "clients" / cfg.client_name
+    face_db_path = str(client_dir / "known_faces.json")
+    init_workers(cfg.pipeline, model_dir=str(_MODELS_DIR), face_db_path=face_db_path)
     init_handlers(cfg.pipeline)
 
     urls = cfg.rtsp_urls()
@@ -235,13 +245,17 @@ def main():
     # ── SGIEs — one per active capability beyond people_counting ──────────────
     sgie_elements = []
     for cap in cfg.active_sgies():
+        cfg_path = SGIE_CONFIGS.get(cap)
+        if cfg_path is None:
+            logger.info("Capability '%s' uses Python worker — skipping SGIE", cap)
+            continue
         sgie = Gst.ElementFactory.make("nvinfer", f"sgie-{cap}")
         if not sgie:
             logger.error("Could not create nvinfer element for capability '%s'", cap)
             sys.exit(1)
-        sgie.set_property("config-file-path", SGIE_CONFIGS[cap])
+        sgie.set_property("config-file-path", cfg_path)
         sgie_elements.append(sgie)
-        logger.info("SGIE loaded: %s → %s", cap, SGIE_CONFIGS[cap])
+        logger.info("SGIE loaded: %s → %s", cap, cfg_path)
 
     if not sgie_elements:
         logger.info("No SGIEs loaded — running people_counting only")
@@ -347,6 +361,7 @@ def main():
         pipeline.set_state(Gst.State.NULL)
         mjpeg.stop()
         api_client.stop()
+        stop_workers()
 
 
 if __name__ == "__main__":
