@@ -18,6 +18,7 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 import pyds
+import dataclasses
 import queue
 import logging
 import threading
@@ -26,8 +27,9 @@ import uuid
 import base64
 import os
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import cv2
@@ -48,11 +50,31 @@ API_KEY: str      = os.environ.get("API_KEY",    "your-api-key")
 # Ejemplo: channels=[1,3,5] → {0: 1, 1: 3, 2: 5}
 _channel_map: Dict[int, int] = {}
 
+# Sector del cliente: "comercio" | "industrial" | "hogar"
+# Controla el tipo de evento emitido por face_recognition y la severidad de fall_detected.
+_JETSON_SECTOR: str = "comercio"
+
+# Pad indices que corresponden a cámaras de entrada/salida
+_entry_exit_pads: set = set()
+
+
 def init_channel_map(channels: list):
     """Llamar desde app.py después de load_config(), antes de arrancar el pipeline."""
     global _channel_map
     _channel_map = {idx: ch for idx, ch in enumerate(channels)}
     logger.info("Channel map: %s", _channel_map)
+
+
+def init_sector(sector: str) -> None:
+    global _JETSON_SECTOR
+    _JETSON_SECTOR = sector
+    logger.info("Sector: %s", sector)
+
+
+def init_entry_exit_pads(pad_indices: set) -> None:
+    global _entry_exit_pads
+    _entry_exit_pads = pad_indices
+    logger.info("Entry/exit pad indices: %s", pad_indices)
 
 def _camera_id_for(pad_index: int) -> str:
     """Devuelve un camera_id con el canal real, ej. 'jetson-nx-001-ch03'."""
@@ -84,6 +106,9 @@ VOTE_MIN_HEIGHT: int      = 160
 POSE_SAMPLE_INTERVAL: int  = 10   # enqueue crop every N frames per person
 POSE_MIN_PERSON_WIDTH: int = 40   # skip persons narrower than this (too far)
 
+# ── Track lifecycle ───────────────────────────────────────────────────────────
+TRACK_LOST_TIMEOUT_FRAMES: int = 60  # frames without detection before declaring track lost
+
 # ── Face recognition ──────────────────────────────────────────────────────────
 FACE_SAMPLE_INTERVAL: int  = 30   # frames between recognition attempts per track
 
@@ -94,8 +119,22 @@ ANALYTICS_SEND_INTERVAL_SECS: float = 60.0
 CROPS_DIR: str            = "crops"
 CROP_SAMPLE_INTERVAL: int = 15
 CROP_MAX_PER_PERSON: int  = 5
-CROP_MIN_WIDTH: int       = 40
-CROP_MIN_HEIGHT: int      = 80
+CROP_MIN_WIDTH: int       = 64
+CROP_MIN_HEIGHT: int      = 128
+
+
+# ==============================================================================
+# 0. TRACK STATE — lifecycle per person per camera
+# ==============================================================================
+
+@dataclass
+class _TrackState:
+    first_frame:       int
+    last_frame:        int
+    first_ts:          float   # time.monotonic() when first seen
+    camera_id:         str
+    is_entry_exit_cam: bool = False
+    appearance_sent:   bool = False
 
 
 # ==============================================================================
@@ -206,49 +245,133 @@ class NxApiClient:
             logger.debug("Sin conexión: %s", url)
 
     # ------------------------------------------------------------------
-    # Métodos de negocio (wrappers de alto nivel)
+    # Helpers internos
     # ------------------------------------------------------------------
-    def post_detection_event(self, camera_id: str, frame_num: int, detections: List[dict],
-                             event_type: str = "person_detection"):
-        """
-        Envía un evento de detección al backend.
-        event_type: "person_detection" (primera aparición) o
-                    "person_classified" (clasificación demográfica confirmada).
-        """
-        payload = {
-            "event_id": str(uuid.uuid4()),
-            "camera_id": camera_id,
+    def _base_event(self, event_type: str, camera_id: str, severity: str = "info") -> dict:
+        return {
+            "event_id":  str(uuid.uuid4()),
+            "type":      event_type,
+            "sector":    _JETSON_SECTOR,
             "jetson_id": JETSON_ID,
-            "frame_num": frame_num,
+            "camera_id": camera_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "type": event_type,
-            "severity": "info",
-            "status": "open",
-            "detections": detections,
+            "severity":  severity,
         }
+
+    # ------------------------------------------------------------------
+    # Métodos de negocio — un evento por entidad, estructura plana
+    # ------------------------------------------------------------------
+
+    def post_person_entry(self, camera_id: str, track_id: int, bbox: dict,
+                          confidence: float, is_entry_exit_cam: bool) -> None:
+        payload = self._base_event("person_entry", camera_id)
+        payload.update({
+            "track_id": track_id,
+            "bbox": bbox,
+            "confidence": round(confidence, 3),
+            "is_entry_exit_camera": is_entry_exit_cam,
+        })
         self.enqueue("POST", "/api/events", payload)
 
-    def post_analytics_snapshot(self, camera_id: str, stats: dict):
-        """Envía un snapshot de analytics agregadas (edad/género, conteo) por cámara."""
-        payload = {
-            "camera_id": camera_id,
-            "jetson_id": JETSON_ID,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            **stats,
-        }
-        self.enqueue("POST", "/api/analytics/ingest", payload)
+    def post_person_exit(self, camera_id: str, track_id: int,
+                         dwell_seconds: float, is_entry_exit_cam: bool) -> None:
+        payload = self._base_event("person_exit", camera_id)
+        payload.update({
+            "track_id": track_id,
+            "dwell_seconds": round(dwell_seconds, 1),
+            "is_entry_exit_camera": is_entry_exit_cam,
+        })
+        self.enqueue("POST", "/api/events", payload)
 
-    def ack_event(self, event_id: str):
-        self.enqueue("POST", f"/api/events/{event_id}/ack")
+    def post_person_classified(self, camera_id: str, track_id: int,
+                               bbox: dict, demographics: dict) -> None:
+        payload = self._base_event("person_classified", camera_id)
+        payload.update({"track_id": track_id, "bbox": bbox, "demographics": demographics})
+        self.enqueue("POST", "/api/events", payload)
 
-    def resolve_event(self, event_id: str):
-        self.enqueue("POST", f"/api/events/{event_id}/resolve")
+    def post_person_appearance(self, camera_id: str, track_id: int,
+                               appearance_vector: list) -> None:
+        payload = self._base_event("person_appearance", camera_id)
+        payload.update({"track_id": track_id, "appearance_vector": appearance_vector})
+        self.enqueue("POST", "/api/events", payload)
 
-    def add_event_note(self, event_id: str, text: str):
-        self.enqueue("POST", f"/api/events/{event_id}/notes", {"text": text})
+    def post_fall_detected(self, camera_id: str, track_id: int, bbox: dict,
+                           fall_score: int, avg_kp_conf: float) -> None:
+        severity = "critical" if _JETSON_SECTOR == "hogar" else "high"
+        payload = self._base_event("fall_detected", camera_id, severity)
+        payload.update({
+            "track_id": track_id,
+            "bbox": bbox,
+            "fall_score": fall_score,
+            "avg_kp_conf": round(avg_kp_conf, 3),
+        })
+        self.enqueue("POST", "/api/events", payload)
 
-    def post_crop(self, camera_id: str, track_id: int, frame_num: int, crop_b64: str, bbox: dict):
-        """Envía un recorte de persona a la API para construcción de dataset."""
+    def post_employee_seen(self, camera_id: str, employee_id: str, track_id: int,
+                           similarity: float, bbox: dict) -> None:
+        evt = "known_person_seen" if _JETSON_SECTOR == "hogar" else "employee_seen"
+        payload = self._base_event(evt, camera_id)
+        payload.update({
+            "track_id": track_id,
+            "bbox": bbox,
+            "similarity": round(similarity, 3),
+            "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id,
+        })
+        self.enqueue("POST", "/api/events", payload)
+
+    def post_employee_presence(self, camera_id: str, employee_id: str, track_id: int) -> None:
+        payload = self._base_event("employee_presence", camera_id)
+        payload.update({"track_id": track_id,
+                        "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id})
+        self.enqueue("POST", "/api/events", payload)
+
+    def post_employee_exit(self, camera_id: str, employee_id: str,
+                           track_id: int, dwell_seconds: float) -> None:
+        evt = "known_person_exit" if _JETSON_SECTOR == "hogar" else "employee_exit"
+        payload = self._base_event(evt, camera_id)
+        payload.update({
+            "track_id": track_id,
+            "dwell_seconds": round(dwell_seconds, 1),
+            "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id,
+        })
+        self.enqueue("POST", "/api/events", payload)
+
+    def post_unknown_person_alert(self, camera_id: str, track_id: int,
+                                  face_snapshot_b64: str, bbox: dict) -> None:
+        payload = self._base_event("unknown_person_alert", camera_id, "medium")
+        payload.update({"track_id": track_id, "bbox": bbox,
+                        "face_snapshot_b64": face_snapshot_b64})
+        self.enqueue("POST", "/api/events", payload)
+
+    def post_epp_violation(self, camera_id: str, track_id: int, bbox: dict,
+                           violations: list, present: list, confidence: float) -> None:
+        payload = self._base_event("epp_violation", camera_id, "high")
+        payload.update({"track_id": track_id, "bbox": bbox, "violations": violations,
+                        "present": present, "confidence": round(confidence, 3)})
+        self.enqueue("POST", "/api/events", payload)
+
+    def post_fire_smoke_alert(self, camera_id: str, detected: list,
+                              confidence: float, frame_snapshot_b64: str = "") -> None:
+        payload = self._base_event("fire_smoke_alert", camera_id, "critical")
+        payload.update({"detected": detected, "confidence": round(confidence, 3),
+                        "frame_snapshot_b64": frame_snapshot_b64})
+        self.enqueue("POST", "/api/events", payload)
+
+    def post_vehicle_detected(self, camera_id: str, track_id: int, bbox: dict,
+                              plate: str, plate_confidence: float) -> None:
+        payload = self._base_event("vehicle_detected", camera_id)
+        payload.update({"track_id": track_id, "bbox": bbox,
+                        "plate": plate, "plate_confidence": round(plate_confidence, 3)})
+        self.enqueue("POST", "/api/events", payload)
+
+    def post_analytics_snapshot(self, camera_id: str, stats: dict,
+                                period_seconds: float = 60.0) -> None:
+        payload = self._base_event("analytics_snapshot", camera_id)
+        payload.update({"period_seconds": period_seconds, **stats})
+        self.enqueue("POST", "/api/analytics", payload)
+
+    def post_crop(self, camera_id: str, track_id: int, frame_num: int,
+                  crop_b64: str, bbox: dict) -> None:
         payload = {
             "camera_id": camera_id,
             "jetson_id": JETSON_ID,
@@ -260,12 +383,8 @@ class NxApiClient:
         }
         self.enqueue("POST", "/api/crops", payload)
 
-    def post_reference_frame(self, camera_id: str, frame_num: int, frame_b64: str, width: int, height: int):
-        """
-        Envía un frame de referencia sin personas al backend.
-        El dashboard lo usa como fondo para superponer el heatmap de posiciones.
-        Se envía una sola vez por sesión por cámara (primer frame limpio disponible).
-        """
+    def post_reference_frame(self, camera_id: str, frame_num: int,
+                             frame_b64: str, width: int, height: int) -> None:
         payload = {
             "camera_id": camera_id,
             "jetson_id": JETSON_ID,
@@ -524,18 +643,44 @@ class _AgeGenderHandler:
 
 
 class _EppHandler:
+    """
+    EPP (Personal Protective Equipment) compliance detection.
+    Model pending integration — stub returns None until model files are available.
+
+    When model is ready, fill in process() to read SGIE output and call:
+      api_client.post_epp_violation(camera_id, track_id, bbox,
+          violations=["no_helmet"], present=["gloves"], confidence=0.87)
+    Severity is always "high" (set in post_epp_violation).
+    """
     def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
-        return None
+        return None  # TODO: implement when epp SGIE model is integrated
 
 
 class _FireSmokeHandler:
+    """
+    Fire and smoke frame-level classifier.
+    Model pending integration — stub returns None until model files are available.
+
+    When model is ready, fill in process() to read SGIE output and call:
+      api_client.post_fire_smoke_alert(camera_id,
+          detected=["fire"], confidence=0.94, frame_snapshot_b64=frame_b64)
+    Severity is always "critical" (set in post_fire_smoke_alert).
+    """
     def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
-        return None
+        return None  # TODO: implement when fire_smoke SGIE model is integrated
 
 
 class _LicensePlateHandler:
+    """
+    License plate detection and reading (LPD + LPR).
+    Model pending integration — stub returns None until model files are available.
+
+    When model is ready, fill in process() to read SGIE output and call:
+      api_client.post_vehicle_detected(camera_id, track_id, bbox,
+          plate="ABC-1234", plate_confidence=0.93)
+    """
     def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
-        return None
+        return None  # TODO: implement when license_plate SGIE model is integrated
 
 
 class _FallDetectionHandler:
@@ -593,14 +738,25 @@ class _FaceRecognitionHandler:
     Receives face detections from FaceDetectIR SGIE (gie-id=3), crops face from
     the full frame, enqueues for embedding extraction, and caches results per track.
 
+    Emits sector-aware API events:
+      comercio/industrial → employee_seen / employee_presence / employee_exit
+      hogar               → known_person_seen / known_person_exit / unknown_person_alert
+
     This handler is NOT in _HANDLER_REGISTRY — it is dispatched separately via
     _face_handler because it processes SGIE_FACE_DETECT_ID objects, not PGIE objects.
     """
+    PRESENCE_HEARTBEAT_SECS: float = 30.0
 
     def __init__(self, worker):
         self._worker = worker
         self._last_sample: Dict[int, int] = {}
         self._cache: Dict[int, Tuple[str, float]] = {}
+        # tracks where we already fired employee_seen / known_person_seen
+        self._identity_reported: Set[int] = set()
+        # last time we sent a presence heartbeat per track
+        self._last_heartbeat: Dict[int, float] = {}
+        # tracks we already alerted as unknown (hogar only)
+        self._unknown_alerted: Set[int] = set()
 
     def process_face(
         self,
@@ -624,11 +780,11 @@ class _FaceRecognitionHandler:
             return
 
         r = face_obj_meta.rect_params
-        l = max(0, int(r.left))
-        t = max(0, int(r.top))
-        w = max(1, int(r.width))
-        h = max(1, int(r.height))
-        face_crop = frame_np[t:t + h, l:l + w]
+        fl = max(0, int(r.left))
+        ft = max(0, int(r.top))
+        fw = max(1, int(r.width))
+        fh = max(1, int(r.height))
+        face_crop = frame_np[ft:ft + fh, fl:fl + fw]
         if face_crop.size == 0:
             return
 
@@ -638,6 +794,56 @@ class _FaceRecognitionHandler:
         result = self._worker.get_result(parent_track_id)
         if result:
             self._cache[parent_track_id] = result
+
+        # Find parent bbox for event payloads
+        parent_obj = next(
+            (p for p in persons_meta if int(p.object_id) == parent_track_id), None
+        )
+        bbox: dict = {}
+        if parent_obj:
+            pr = parent_obj.rect_params
+            bbox = {"left": max(0, int(pr.left)), "top": max(0, int(pr.top)),
+                    "width": int(pr.width), "height": int(pr.height)}
+
+        identity = self._cache.get(parent_track_id)
+        if identity is None:
+            return
+
+        name, conf = identity
+        now = time.monotonic()
+
+        if name != "Desconocido":
+            if parent_track_id not in self._identity_reported:
+                self._identity_reported.add(parent_track_id)
+                api_client.post_employee_seen(camera_id, name, parent_track_id, conf, bbox)
+            # heartbeat
+            last_hb = self._last_heartbeat.get(parent_track_id, 0.0)
+            if now - last_hb >= self.PRESENCE_HEARTBEAT_SECS:
+                api_client.post_employee_presence(camera_id, name, parent_track_id)
+                self._last_heartbeat[parent_track_id] = now
+        elif _JETSON_SECTOR == "hogar" and parent_track_id not in self._unknown_alerted:
+            # Unknown person in hogar → alert with face snapshot
+            self._unknown_alerted.add(parent_track_id)
+            _, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            face_b64 = base64.b64encode(buf).decode("utf-8")
+            api_client.post_unknown_person_alert(camera_id, parent_track_id, face_b64, bbox)
+
+    def on_track_lost(self, track_id: int, dwell_seconds: float) -> None:
+        """Called from _expire_lost_tracks. Emits employee_exit / known_person_exit."""
+        identity = self._cache.get(track_id)
+        if identity and identity[0] != "Desconocido":
+            name, _ = identity
+            # We need camera_id — look it up from active track or use empty string (best effort)
+            state = _active_tracks.get(
+                next((k for k in _active_tracks if k[1] == track_id), (None, None))
+            )
+            camera_id = state.camera_id if state else ""
+            api_client.post_employee_exit(camera_id, name, track_id, dwell_seconds)
+        # clean state
+        self._cache.pop(track_id, None)
+        self._identity_reported.discard(track_id)
+        self._last_heartbeat.pop(track_id, None)
+        self._unknown_alerted.discard(track_id)
 
     def get_identity(self, track_id: int) -> Optional[Tuple[str, float]]:
         result = self._worker.get_result(track_id) if self._worker else None
@@ -663,16 +869,35 @@ class _FaceRecognitionHandler:
 # 5. WORKER GLOBALS + LIFECYCLE
 # ==============================================================================
 
-_pose_worker     = None   # PoseWorker (fall_detection)
-_face_recognizer = None   # FaceRecognizer (face_recognition)
+_pose_worker      = None   # PoseWorker (fall_detection)
+_face_recognizer  = None   # FaceRecognizer (face_recognition)
+_appearance_worker = None  # AppearanceWorker (cross-camera re-ID, always active)
+_ws_client        = None   # WsPositionClient (WebSocket position telemetry)
+
+# Position buffer: pad_index → list of {track_id, x_norm, y_norm}
+_position_buffer: Dict[int, List[dict]] = {}
+_position_last_sent: Dict[int, float]  = {}
+POSITION_SEND_INTERVAL: float = 10.0   # seconds between position snapshots per camera
 
 
 def init_workers(
     pipeline_capabilities: List[str],
     model_dir: str,
     face_db_path: str = "",
+    ws_base_url: str = "",
+    api_key: str = "",
 ) -> None:
-    global _pose_worker, _face_recognizer
+    global _pose_worker, _face_recognizer, _appearance_worker, _ws_client
+
+    # AppearanceWorker — always active (cross-camera re-ID, tied to people_counting)
+    osnet_path = str(Path(model_dir) / "osnet" / "osnet_x0_25_market1501.onnx")
+    if Path(osnet_path).exists():
+        from appearance_worker import AppearanceWorker
+        _appearance_worker = AppearanceWorker(osnet_path)
+        _appearance_worker.start()
+    else:
+        logger.warning("OSNet model not found at %s — appearance vectors disabled. "
+                       "Run: python3 tools/download_models.py --reid", osnet_path)
 
     if "fall_detection" in pipeline_capabilities:
         from pose_worker import PoseWorker
@@ -682,15 +907,34 @@ def init_workers(
 
     if "face_recognition" in pipeline_capabilities:
         from face_recognizer import FaceRecognizer
-        _face_recognizer = FaceRecognizer(db_path=face_db_path, model_root=str(Path(model_dir) / "insightface"))
+        _face_recognizer = FaceRecognizer(
+            db_path=face_db_path,
+            model_root=str(Path(model_dir) / "insightface"),
+        )
         _face_recognizer.start()
+
+    # WebSocket position client — active only if WS_BASE_URL is configured
+    if ws_base_url:
+        from ws_client import WsPositionClient
+        _ws_client = WsPositionClient(
+            ws_url=ws_base_url,
+            api_key=api_key,
+            sector=_JETSON_SECTOR,
+        )
+        _ws_client.start()
+    else:
+        logger.info("WS_BASE_URL not set — position WebSocket disabled.")
 
 
 def stop_workers() -> None:
+    if _appearance_worker is not None:
+        _appearance_worker.stop()
     if _pose_worker is not None:
         _pose_worker.stop()
     if _face_recognizer is not None:
         _face_recognizer.stop()
+    if _ws_client is not None:
+        _ws_client.stop()
 
 
 # ==============================================================================
@@ -738,8 +982,8 @@ def init_handlers(pipeline_capabilities: List[str]) -> None:
 # 7. PROBE PRINCIPAL — OSD + ENVÍO A API
 # ==============================================================================
 
-# IDs de personas ya notificadas a la API (primera aparición)
-_person_notified: set = set()
+# Active tracks per (pad_index, track_id)
+_active_tracks: Dict[Tuple[int, int], _TrackState] = {}
 
 # Crops capturados por track_id: cantidad guardada y último frame muestreado
 _crop_counts: Dict[int, int] = {}
@@ -768,6 +1012,26 @@ def _get_analytics_last_sent(pad_index: int) -> float:
     return _analytics_last_sent[pad_index]
 
 
+def _accumulate_positions(
+    pad_index: int, camera_id: str, persons_meta: list,
+    frame_width: int, frame_height: int, frame_num: int,
+) -> None:
+    """Accumulate normalized centroids and send position snapshot every POSITION_SEND_INTERVAL s."""
+    buf = _position_buffer.setdefault(pad_index, [])
+    for obj in persons_meta:
+        r = obj.rect_params
+        x_norm = round((r.left + r.width / 2) / frame_width, 3)
+        y_norm = round((r.top + r.height / 2) / frame_height, 3)
+        buf.append({"track_id": int(obj.object_id), "x_norm": x_norm, "y_norm": y_norm})
+
+    now = time.monotonic()
+    last = _position_last_sent.get(pad_index, 0.0)
+    if now - last >= POSITION_SEND_INTERVAL and buf:
+        _ws_client.send_positions(camera_id, buf)
+        _position_buffer[pad_index] = []
+        _position_last_sent[pad_index] = now
+
+
 def _save_and_send_crop(
     crop_bgr: np.ndarray,
     camera_id: str,
@@ -785,14 +1049,46 @@ def _save_and_send_crop(
     api_client.post_crop(camera_id, track_id, frame_num, crop_b64, bbox)
 
 
+def _expire_lost_tracks(pad_index: int, frame_num: int,
+                        visible_ids: Set[int]) -> None:
+    """Emit person_exit for tracks not seen for TRACK_LOST_TIMEOUT_FRAMES frames."""
+    expired = [
+        key for key, state in _active_tracks.items()
+        if key[0] == pad_index
+        and key[1] not in visible_ids
+        and (frame_num - state.last_frame) >= TRACK_LOST_TIMEOUT_FRAMES
+    ]
+    for key in expired:
+        state = _active_tracks.pop(key)
+        track_id = key[1]
+        dwell = time.monotonic() - state.first_ts
+        api_client.post_person_exit(
+            state.camera_id, track_id, dwell, state.is_entry_exit_cam
+        )
+        if _face_handler:
+            _face_handler.on_track_lost(track_id, dwell)
+        # clean per-track caches
+        _crop_counts.pop(track_id, None)
+        _crop_last_frame.pop(track_id, None)
+        for handler in _active_handlers:
+            _cleanup_handler_cache(handler, track_id)
+        logger.debug("Track lost: pad=%d track=%d dwell=%.1fs", pad_index, track_id, dwell)
+
+
+def _cleanup_handler_cache(handler, track_id: int) -> None:
+    """Remove track_id from any caches the handler holds."""
+    for attr in ("_cache", "_votes", "_vote_last_frame", "_last_sample"):
+        d = getattr(handler, attr, None)
+        if isinstance(d, dict):
+            d.pop(track_id, None)
+
+
 def osd_sink_pad_buffer_probe(_pad, info):
     """
     Probe conectado al sink-pad de nvdsosd.
     Itera sobre objetos del frame: personas del PGIE y caras del FaceDetectIR SGIE.
     Despacha handlers activos y envía eventos / analytics a la API REST.
     """
-    global _person_notified, _crop_counts, _crop_last_frame
-
     gst_buffer = info.get_buffer()
     if not gst_buffer:
         return Gst.PadProbeReturn.OK
@@ -807,7 +1103,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
         frame_num = frame_meta.frame_num
         pad_index = frame_meta.pad_index
         camera_id = _camera_id_for(pad_index)
-        frame_detections: List[dict] = []
+        is_entry_exit_cam = pad_index in _entry_exit_pads
 
         frame_np = None
         try:
@@ -840,22 +1136,72 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 )
 
         # ── Second pass: process each person ─────────────────────────────────
+        visible_ids: Set[int] = set()
         for obj_meta in persons_meta:
             p_track_id = int(obj_meta.object_id)
+            visible_ids.add(p_track_id)
+            r = obj_meta.rect_params
+            bbox = {
+                "left":   max(0, int(r.left)),
+                "top":    max(0, int(r.top)),
+                "width":  int(r.width),
+                "height": int(r.height),
+            }
+
+            track_key = (pad_index, p_track_id)
+            now = time.monotonic()
+
+            # ── Track entry ───────────────────────────────────────────────────
+            if track_key not in _active_tracks:
+                _active_tracks[track_key] = _TrackState(
+                    first_frame=frame_num,
+                    last_frame=frame_num,
+                    first_ts=now,
+                    camera_id=camera_id,
+                    is_entry_exit_cam=is_entry_exit_cam,
+                )
+                api_client.post_person_entry(
+                    camera_id, p_track_id, bbox,
+                    float(obj_meta.confidence), is_entry_exit_cam,
+                )
+                _get_analytics(pad_index)["person_count"] += 1
+            else:
+                _active_tracks[track_key].last_frame = frame_num
+
+            # ── AppearanceWorker: send appearance vector when ready ────────────
+            if _appearance_worker is not None:
+                state = _active_tracks[track_key]
+                if not state.appearance_sent:
+                    vec = _appearance_worker.get_result(p_track_id)
+                    if vec is not None:
+                        api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
+                        state.appearance_sent = True
+                # Enqueue crop for appearance extraction every 15 frames
+                if (frame_np is not None
+                        and frame_num % 15 == 0
+                        and not state.appearance_sent
+                        and bbox["width"] >= CROP_MIN_WIDTH
+                        and bbox["height"] >= CROP_MIN_HEIGHT):
+                    crop = frame_np[
+                        bbox["top"]:bbox["top"] + bbox["height"],
+                        bbox["left"]:bbox["left"] + bbox["width"],
+                    ]
+                    if crop.size > 0:
+                        _appearance_worker.enqueue(crop, p_track_id, frame_num)
 
             _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
 
+            # ── Active handlers ───────────────────────────────────────────────
             for handler in _active_handlers:
                 result = handler.process(obj_meta, frame_num, frame_np=frame_np)
                 if result is None:
                     continue
                 if result.osd_text:
                     _set_osd_text(obj_meta, result.osd_text, border_color=result.border_color)
-                if result.event_type:
-                    det = _build_detection_dict(obj_meta)
-                    det["type"] = result.event_type
-                    det.update(result.det_extra)
-                    frame_detections.append(det)
+                if result.event_type == "person_classified":
+                    api_client.post_person_classified(
+                        camera_id, p_track_id, bbox, result.det_extra.get("demographics", {})
+                    )
                     an = _get_analytics(pad_index)
                     au = result.analytics_update
                     if "age_gender_classes" in au:
@@ -863,8 +1209,14 @@ def osd_sink_pad_buffer_probe(_pad, info):
                         an["age_gender_classes"][lbl] = an["age_gender_classes"].get(lbl, 0) + 1
                     if "gender_key" in au:
                         an[au["gender_key"]] += 1
+                elif result.event_type == "fall_detected":
+                    api_client.post_fall_detected(
+                        camera_id, p_track_id, bbox,
+                        result.det_extra.get("fall_score", 0),
+                        result.det_extra.get("avg_kp_conf", 0.0),
+                    )
 
-            # Overlay face identity on top of existing OSD text
+            # ── Face identity OSD overlay ─────────────────────────────────────
             if _face_handler:
                 identity = _face_handler.get_identity(p_track_id)
                 if identity:
@@ -877,37 +1229,32 @@ def osd_sink_pad_buffer_probe(_pad, info):
                             border_color=(0.2, 1.0, 0.4, 1.0),
                         )
 
-            # Crop capture for dataset (always active)
+            # ── Crop capture for dataset (always active) ──────────────────────
             if frame_np is not None:
                 last_crop = _crop_last_frame.get(p_track_id, -CROP_SAMPLE_INTERVAL)
                 count = _crop_counts.get(p_track_id, 0)
                 if (count < CROP_MAX_PER_PERSON
-                        and (frame_num - last_crop) >= CROP_SAMPLE_INTERVAL):
-                    r = obj_meta.rect_params
-                    l = max(0, int(r.left))
-                    t = max(0, int(r.top))
-                    w, h = int(r.width), int(r.height)
-                    crop = frame_np[t:t + h, l:l + w]
-                    if crop.shape[0] >= CROP_MIN_HEIGHT and crop.shape[1] >= CROP_MIN_WIDTH:
+                        and (frame_num - last_crop) >= CROP_SAMPLE_INTERVAL
+                        and bbox["height"] >= CROP_MIN_HEIGHT
+                        and bbox["width"] >= CROP_MIN_WIDTH):
+                    crop = frame_np[
+                        bbox["top"]:bbox["top"] + bbox["height"],
+                        bbox["left"]:bbox["left"] + bbox["width"],
+                    ]
+                    if crop.size > 0:
                         _save_and_send_crop(
-                            crop, camera_id, p_track_id, frame_num,
-                            {"left": l, "top": t, "width": w, "height": h},
+                            crop, camera_id, p_track_id, frame_num, bbox,
                         )
                         _crop_counts[p_track_id] = count + 1
                         _crop_last_frame[p_track_id] = frame_num
 
-            # First appearance event (people_counting — always active)
-            if p_track_id not in _person_notified:
-                _person_notified.add(p_track_id)
-                det = _build_detection_dict(obj_meta)
-                det["type"] = "person"
-                frame_detections.append(det)
-                _get_analytics(pad_index)["person_count"] += 1
+        # ── Expire lost tracks ────────────────────────────────────────────────
+        _expire_lost_tracks(pad_index, frame_num, visible_ids)
 
-        # Reference frame for heatmap — first empty frame per camera
+        # ── Reference frame for heatmap ───────────────────────────────────────
         if (not _reference_frame_sent.get(pad_index, False)
                 and frame_np is not None
-                and not frame_detections
+                and len(visible_ids) == 0
                 and frame_meta.num_obj_meta == 0):
             h, w = frame_np.shape[:2]
             _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -917,12 +1264,12 @@ def osd_sink_pad_buffer_probe(_pad, info):
             logger.info("Frame de referencia enviado camera=%s (frame=%d, %dx%d)",
                         camera_id, frame_num, w, h)
 
-        if frame_detections:
-            has_classified = any(d.get("type") not in ("person", "") for d in frame_detections)
-            evt_type = frame_detections[-1].get("type", "person_detection") if has_classified \
-                else "person_detection"
-            api_client.post_detection_event(camera_id, frame_num, frame_detections, evt_type)
+        # ── Position snapshot (WebSocket) ─────────────────────────────────────
+        if _ws_client is not None and visible_ids and frame_np is not None:
+            fh, fw = frame_np.shape[:2]
+            _accumulate_positions(pad_index, camera_id, persons_meta, fw, fh, frame_num)
 
+        # ── Analytics snapshot ────────────────────────────────────────────────
         now = time.monotonic()
         if now - _get_analytics_last_sent(pad_index) >= ANALYTICS_SEND_INTERVAL_SECS:
             an = _get_analytics(pad_index)
@@ -931,7 +1278,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 "gender_male":        an["gender_male"],
                 "gender_female":      an["gender_female"],
                 "age_gender_classes": an["age_gender_classes"],
-            })
+            }, period_seconds=ANALYTICS_SEND_INTERVAL_SECS)
             _analytics[pad_index] = {
                 "person_count": 0, "gender_male": 0,
                 "gender_female": 0, "age_gender_classes": {},

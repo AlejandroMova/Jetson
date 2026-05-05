@@ -176,9 +176,10 @@ required model files exist before GStreamer initializes.
 | Capability | Type | Model | Notes |
 |-----------|------|-------|-------|
 | `people_counting` | PGIE | PeopleNet v2.3.4 | Always active |
+| `cross_camera_reid` | Python worker | OSNet-x0.25 ONNX | **Always active** (tied to people_counting). Auto-downloaded by setup.sh. Generates 512-dim appearance vectors for cross-camera re-ID. |
 | `age_gender` | SGIE (gie-id=2) | ResNet-18 Pedestrian Attr | Full-body crop → 6 classes |
-| `fall_detection` | Python worker | MoveNet Lightning ONNX | Auto-downloaded by setup.sh |
-| `face_recognition` | SGIE (gie-id=3) + Python worker | FaceDetectIR + InsightFace buffalo_l | Requires NGC API key |
+| `fall_detection` | Python worker | MoveNet Lightning ONNX | **Hogar only** (hogar_avanzado / hogar_total). Auto-downloaded by setup.sh. |
+| `face_recognition` | SGIE (gie-id=3) + Python worker | FaceDetectIR + InsightFace buffalo_l | Requires NGC API key. Event type depends on `sector`: `employee_seen` (comercio/industrial) or `known_person_seen` + `unknown_person_alert` (hogar). |
 | `epp_detection` | SGIE | *(pending)* | Helmet/vest/gloves |
 | `fire_smoke` | SGIE | *(pending)* | Frame-level classifier |
 | `license_plate` | SGIE | *(pending)* | LPD + LPR |
@@ -275,6 +276,8 @@ When a new model (e.g. EPP) is ready:
 | `stream_height` | int | `1080` | DVR main stream height |
 | `pipeline` | list | `[people_counting]` | Default capabilities for this client. Overridden by `/etc/nx_pipeline` or `NX_PIPELINE` env var. Valid values: `people_counting`, `age_gender`, `epp_detection`, `fire_smoke`, `license_plate`, `fall_detection`, `face_recognition` |
 | `tracker` | string | `nvdcf` | Tracker algorithm — see table below |
+| `sector` | string | `"comercio"` | Client vertical: `"comercio"` \| `"industrial"` \| `"hogar"`. Inferred automatically by `setup.sh --package`. Controls event types emitted by `face_recognition` and severity of `fall_detected`. |
+| `entry_exit_channels` | list[int] | `[]` | Subset of `channels` whose cameras cover entrance/exit doors. Used to calculate store dwell time and visit count. Leave empty if no camera directly covers the entrance. Can be set with `setup.sh --entry-exit-channels "1,2"` or edited manually later. |
 | `stream_width` | int | `1920` | Resolution fed to `nvstreammux` (inference + MJPEG output) |
 | `stream_height` | int | `1080` | Same, height |
 
@@ -315,14 +318,16 @@ tracker: nvdcf
 | Key | Description |
 |-----|-------------|
 | `API_BASE_URL` | NX backend URL (e.g. `https://api.nxcomputing.ai`) |
-| `API_KEY` | API token assigned to this Jetson |
+| `API_KEY` | API token assigned to this Jetson. Set with `setup.sh --api-key <token>` or edit `.env` manually. |
 | `JETSON_ID` | Device identifier sent with every event (e.g. `jetson-mova-001`) |
+| `WS_BASE_URL` | WebSocket base URL for position telemetry (e.g. `wss://api.nxcomputing.ai`). Leave empty to disable — the pipeline runs normally without it. |
 
 Copy from `deploy/.env.example` and fill in before first deploy.
 
 ### Runtime resolution order
 
 `NX_PIPELINE` env var → `/etc/nx_pipeline` (setup.sh `--package`) → `config.yaml pipeline:`  
+`NX_SECTOR` env var → `/etc/nx_sector` (inferred by setup.sh from `--package`) → `config.yaml sector:`  
 `NX_CLIENT` env var → `/etc/nx_client` (written by setup.sh)  
 `NX_DVR_IP` env var → `/etc/nx_dvr_ip` (written by setup.sh)  
 `DVR_USER` / `DVR_PASS` env vars → `clients/<name>/.env`
@@ -376,6 +381,70 @@ ssh jetson@<ip> "cd /nx_tech && docker compose restart deepstream"
 ```
 Multiple embeddings per person increase recognition robustness across poses/lighting.
 
+### Face recognition — setup by sector
+
+The same `face_recognition` capability emits different API events depending on the client's `sector`:
+
+| Sector | Known person event | Unknown person event | Use case |
+|--------|--------------------|---------------------|----------|
+| `comercio` / `industrial` | `employee_seen` + `employee_presence` + `employee_exit` | — | Employee attendance per zone |
+| `hogar` | `known_person_seen` + `known_person_exit` | `unknown_person_alert` (with face crop) | Family member arrival / intruder alert |
+
+For **comercio/industrial**: register employees with `register_face.py` as usual.  
+For **hogar**: register household members the same way — they appear as `known_person_seen` events. Anyone not in the database triggers an `unknown_person_alert` with a face snapshot.
+
+---
+
+## Cross-camera person tracking
+
+The pipeline generates a 512-dimensional **appearance embedding** (OSNet-x0.25 ONNX) for every detected person. This vector captures clothing/silhouette, not face — it works without `face_recognition` enabled.
+
+**How it works:**
+
+1. Person detected → `person_entry` event (immediate)
+2. AppearanceWorker processes the crop (~1-2s) → `person_appearance` event with 512-dim vector
+3. Both share the same `(jetson_id, camera_id, track_id)` triplet — the backend joins them
+4. When the same person appears on a different camera within 120s, the backend matches vectors (cosine similarity > 0.65) and assigns a `global_person_id` to link both sightings
+
+**What this enables:**
+- Count unique visitors (not camera views)
+- Build cross-camera movement paths
+- Calculate true store dwell time (entry cam → exit cam)
+- Identify employees in cameras where their face is not visible
+
+The cross-camera matching itself runs in the **backend** — the Jetson only generates and sends the vector. This allows matching across multiple Jetsons on the same client site.
+
+OSNet model is auto-downloaded by `setup.sh`. To download manually:
+```bash
+python3 deploy/tools/download_models.py --reid
+```
+
+---
+
+## WebSocket position stream
+
+The pipeline sends normalized person centroids to the backend every 10 seconds per camera via a persistent WebSocket connection (not REST). This enables real-time heatmaps in the dashboard.
+
+```
+WS /ws/positions  (Jetson is client, backend is server)
+Message: { type: "positions_snapshot", camera_id, timestamp, positions: [{track_id, x_norm, y_norm}] }
+```
+
+`x_norm` and `y_norm` are in the range [0, 1] relative to frame dimensions. To map to pixel coordinates:
+```
+pixel_x = x_norm × frame_width
+pixel_y = y_norm × frame_height
+```
+Overlay on the `reference-frame` image the pipeline sends at startup for accurate heatmap rendering.
+
+**Why WebSocket instead of REST:** WebSocket keeps a single TCP connection open. For 6 cameras × 6 snapshots/min = 36 messages/min, REST adds ~300 bytes HTTP overhead per request. WebSocket adds 2-10 bytes. Reconnects automatically with exponential backoff (1s → 2s → ... → 30s).
+
+To enable, set `WS_BASE_URL` in `deploy/.env`:
+```
+WS_BASE_URL=wss://api.nxcomputing.ai
+```
+Leave empty to disable — the pipeline runs normally, position data is silently dropped.
+
 ---
 
 ## Architecture
@@ -383,16 +452,18 @@ Multiple embeddings per person increase recognition robustness across poses/ligh
 ```
 DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
   → PeopleNet PGIE (gie-id=1, always active) → Tracker (NvDCF or IOU)
-  → [SGIE: age_gender   gie-id=2]  ← one nvinfer per active SGIE capability
-  → [SGIE: facedetectir gie-id=3]  ← face detection (if face_recognition active)
-  → [SGIE: ...]
+  → [SGIE: age_gender    gie-id=2]  ← one nvinfer per active SGIE capability
+  → [SGIE: facedetectir  gie-id=3]  ← face detection (if face_recognition active)
+  → [SGIE: epp/fire/lpr  gie-id=4+] ← pending models
   → nvmultistreamtiler → nvdsosd
   → nvvideoconvert → appsink → HTTP MJPEG server (port 8080)
-                  → REST API (probes.py async client)
 
-Python workers (background threads, non-blocking):
-  fall_detection  → PoseWorker    → MoveNet ONNX → 17 keypoints → fall rules
-  face_recognition→ FaceRecognizer→ InsightFace ArcFace → cosine match vs known_faces.json
+Async paths (background threads, never block pipeline):
+  people_counting → AppearanceWorker → OSNet ONNX → 512-dim vector → POST /api/events (person_appearance)
+  fall_detection  → PoseWorker       → MoveNet ONNX → 17 keypoints → POST /api/events (fall_detected)
+  face_recognition→ FaceRecognizer   → InsightFace ArcFace → POST /api/events (employee_seen / known_person_seen)
+  all cameras     → NxApiClient      → REST POST /api/events, /api/analytics, /api/crops
+  all cameras     → WsPositionClient → WS /ws/positions (positions_snapshot every 10s)
 ```
 
 The probe dispatcher separates PGIE person detections from FaceDetectIR SGIE face detections.

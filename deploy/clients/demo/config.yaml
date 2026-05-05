@@ -67,3 +67,14 @@ pipeline:
 #   iou   — IoU matching. Simpler, no CUDA kernels. Stable with 16 streams.
 #            Loses track ID on crossing/occlusion but sufficient for people counting.
 tracker: nvdcf
+
+# Sector — vertical del cliente. Inferido de --package en setup.sh; se puede sobrescribir aquí.
+#   comercio   — tiendas, supermercados, centros comerciales
+#   industrial — fábricas, bodegas, plantas
+#   hogar      — hogares, departamentos
+sector: comercio
+
+# Cámaras de entrada/salida (subconjunto de channels).
+# Usado para calcular tiempo en tienda y conteo de visitas.
+# Dejar vacío si ninguna cámara cubre directamente la puerta de entrada.
+entry_exit_channels: []

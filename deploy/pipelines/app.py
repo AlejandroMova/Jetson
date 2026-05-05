@@ -16,6 +16,7 @@ Pipeline (capabilities driven by config.yaml `pipeline` field or /etc/nx_pipelin
 import http.server
 import logging
 import math
+import os
 import sys
 import threading
 import time
@@ -32,7 +33,8 @@ import pyds
 from config_loader import load_config
 from probes import (
     osd_sink_pad_buffer_probe, api_client,
-    init_channel_map, init_handlers, init_workers, stop_workers,
+    init_channel_map, init_sector, init_entry_exit_pads,
+    init_handlers, init_workers, stop_workers,
 )
 
 # Maps each pipeline capability to its nvinfer config file (relative to deploy/).
@@ -203,10 +205,20 @@ def main():
     cfg.log_summary()
     _validate_pipeline_models(cfg.pipeline)
     init_channel_map(cfg.channels)
+    init_sector(cfg.sector)
+    init_entry_exit_pads(cfg.entry_exit_pad_indices())
 
     client_dir = Path(__file__).resolve().parent.parent / "clients" / cfg.client_name
     face_db_path = str(client_dir / "known_faces.json")
-    init_workers(cfg.pipeline, model_dir=str(_MODELS_DIR), face_db_path=face_db_path)
+    ws_base_url = os.environ.get("WS_BASE_URL", "").strip()
+    api_key = os.environ.get("API_KEY", "")
+    init_workers(
+        cfg.pipeline,
+        model_dir=str(_MODELS_DIR),
+        face_db_path=face_db_path,
+        ws_base_url=ws_base_url,
+        api_key=api_key,
+    )
     init_handlers(cfg.pipeline)
 
     urls = cfg.rtsp_urls()

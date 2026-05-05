@@ -61,6 +61,8 @@ class ClientConfig:
     stream_width: int = 1920
     stream_height: int = 1080
     tracker: str = "nvdcf"  # "nvdcf" (precise, ≤6 streams) | "iou" (stable, 16 streams)
+    sector: str = "comercio"  # "comercio" | "industrial" | "hogar"
+    entry_exit_channels: List[int] = field(default_factory=list)
 
     def tracker_config_path(self) -> str:
         if self.tracker not in TRACKER_CONFIGS:
@@ -100,6 +102,13 @@ class ClientConfig:
         """Return capabilities that require a SGIE (everything except people_counting)."""
         return [c for c in self.pipeline if c != "people_counting"]
 
+    def entry_exit_pad_indices(self) -> set:
+        """Return the pad indices that correspond to entry/exit cameras."""
+        return {
+            idx for idx, ch in enumerate(self.channels)
+            if ch in self.entry_exit_channels
+        }
+
 
 def _read_etc_file(path: str, env_var: str, label: str) -> str:
     """Read a value from an env var (priority) or /etc file."""
@@ -125,6 +134,14 @@ def load_config() -> ClientConfig:
     """
     client_name = _read_etc_file("/etc/nx_client", "NX_CLIENT", "Client name")
     dvr_ip      = _read_etc_file("/etc/nx_dvr_ip", "NX_DVR_IP", "DVR IP")
+
+    # Sector resolution: /etc/nx_sector (written by setup.sh) > NX_SECTOR env > config.yaml
+    raw_sector = os.environ.get("NX_SECTOR", "").strip()
+    if not raw_sector:
+        try:
+            raw_sector = Path("/etc/nx_sector").read_text().strip()
+        except FileNotFoundError:
+            raw_sector = ""  # fallback to config.yaml value below
 
     client_dir = _REPO_ROOT / "clients" / client_name
     config_path = client_dir / "config.yaml"
@@ -179,6 +196,12 @@ def load_config() -> ClientConfig:
             f"Valid options: {sorted(VALID_CAPABILITIES)}"
         )
 
+    sector = raw_sector or cfg.get("sector", "comercio")
+
+    entry_exit_channels = cfg.get("entry_exit_channels", [])
+    if isinstance(entry_exit_channels, str):
+        entry_exit_channels = [int(x.strip()) for x in entry_exit_channels.split(",") if x.strip()]
+
     return ClientConfig(
         client_name=client_name,
         dvr_ip=dvr_ip,
@@ -194,4 +217,6 @@ def load_config() -> ClientConfig:
         stream_width=int(cfg.get("stream_width", 1920)),
         stream_height=int(cfg.get("stream_height", 1080)),
         tracker=cfg.get("tracker", "nvdcf"),
+        sector=sector,
+        entry_exit_channels=entry_exit_channels,
     )

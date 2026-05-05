@@ -63,15 +63,20 @@ declare -A PACKAGE_CAPABILITIES=(
 WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Parse args ──────────────────────────────────────────────
+NX_API_KEY=""
+ENTRY_EXIT_CHANNELS=""
+
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --authkey)   TS_AUTHKEY="$2";   shift 2 ;;
-    --compose)   COMPOSE_FILE="$2"; shift 2 ;;
-    --hostname)  TS_HOSTNAME="$2";  shift 2 ;;
-    --client)    NX_CLIENT="$2";    shift 2 ;;
-    --package)   NX_PACKAGE="$2";   shift 2 ;;
-    --no-vnc)    SKIP_VNC=true;     shift ;;
-    --no-docker) SKIP_DOCKER=true;  shift ;;
+    --authkey)             TS_AUTHKEY="$2";          shift 2 ;;
+    --compose)             COMPOSE_FILE="$2";         shift 2 ;;
+    --hostname)            TS_HOSTNAME="$2";          shift 2 ;;
+    --client)              NX_CLIENT="$2";            shift 2 ;;
+    --package)             NX_PACKAGE="$2";           shift 2 ;;
+    --api-key)             NX_API_KEY="$2";           shift 2 ;;
+    --entry-exit-channels) ENTRY_EXIT_CHANNELS="$2";  shift 2 ;;
+    --no-vnc)              SKIP_VNC=true;             shift ;;
+    --no-docker)           SKIP_DOCKER=true;          shift ;;
     *) die "Flag desconocido: $1" ;;
   esac
 done
@@ -334,6 +339,39 @@ else
   warn "O escríbelo manualmente: echo 'demo' | sudo tee /etc/nx_client"
 fi
 
+# ── API Key ────────────────────────────────────────────────────────────────────
+if [[ -n "$NX_API_KEY" ]]; then
+  ENV_FILE="${WORK_DIR}/.env"
+  [[ ! -f "$ENV_FILE" ]] && cp "${WORK_DIR}/.env.example" "$ENV_FILE"
+  if grep -q "^API_KEY=" "$ENV_FILE"; then
+    sed -i "s|^API_KEY=.*|API_KEY=${NX_API_KEY}|" "$ENV_FILE"
+  else
+    echo "API_KEY=${NX_API_KEY}" >> "$ENV_FILE"
+  fi
+  ok "API_KEY configurado en .env"
+fi
+
+# ── Entry/Exit Channels ────────────────────────────────────────────────────────
+if [[ -n "$ENTRY_EXIT_CHANNELS" ]]; then
+  _client_name=$(cat /etc/nx_client 2>/dev/null || echo "")
+  if [[ -n "$_client_name" ]]; then
+    _client_config="${WORK_DIR}/clients/${_client_name}/config.yaml"
+    if [[ -f "$_client_config" ]]; then
+      python3 -c "
+import yaml
+with open('${_client_config}') as f: cfg = yaml.safe_load(f)
+cfg['entry_exit_channels'] = [int(x.strip()) for x in '${ENTRY_EXIT_CHANNELS}'.split(',') if x.strip()]
+with open('${_client_config}', 'w') as f: yaml.dump(cfg, f, default_flow_style=False)
+" && ok "entry_exit_channels configurado: ${ENTRY_EXIT_CHANNELS}" \
+      || warn "No se pudo actualizar entry_exit_channels en ${_client_config}"
+    else
+      warn "config.yaml no encontrado para cliente '${_client_name}' — entry_exit_channels no configurado"
+    fi
+  else
+    warn "--entry-exit-channels requiere --client para saber qué config.yaml actualizar"
+  fi
+fi
+
 # ── Paquete contratado → capabilities del pipeline ───────────────────────────
 log "Registrando paquete contratado..."
 
@@ -341,29 +379,33 @@ if [[ -z "$NX_PACKAGE" && -t 0 ]]; then
   # Modo interactivo: mostrar menú si no se pasó --package
   echo ""
   echo -e "${BOLD}Selecciona el paquete contratado:${NC}"
-  echo "  1) comercio_basico      — Conteo de personas"
-  echo "  2) comercio_avanzado    — Conteo + analytics de backend"
-  echo "  3) comercio_total       — + Clasificación edad/género"
-  echo "  4) industrial_basico    — Conteo de personas"
-  echo "  5) industrial_avanzado  — + Detección EPP (requiere modelo)"
-  echo "  6) industrial_total     — + Placas + Fuego (requieren modelos)"
-  echo "  7) hogar_basico         — Detección de personas"
-  echo "  8) hogar_avanzado       — + Detección de caídas (requiere modelo)"
-  echo "  9) hogar_total          — + Detección de incendios (requiere modelo)"
-  echo "  0) Omitir (configurar después)"
+  echo "  1)  comercio_basico       — Conteo de personas"
+  echo "  2)  comercio_avanzado     — Conteo + analytics de backend"
+  echo "  3)  comercio_total        — + Clasificación edad/género"
+  echo "  4)  comercio_enterprise   — + Face recognition (empleados)"
+  echo "  5)  industrial_basico     — Conteo de personas"
+  echo "  6)  industrial_avanzado   — + Detección EPP (requiere modelo)"
+  echo "  7)  industrial_total      — + Placas + Fuego (requieren modelos)"
+  echo "  8)  industrial_enterprise — + Face recognition (empleados)"
+  echo "  9)  hogar_basico          — Detección de personas"
+  echo "  10) hogar_avanzado        — + Detección de caídas (requiere modelo)"
+  echo "  11) hogar_total           — + Fuego + Face recognition"
+  echo "  0)  Omitir (configurar después)"
   echo ""
-  read -rp "Opción [0-9]: " _pkg_opt
+  read -rp "Opción [0-11]: " _pkg_opt
   case $_pkg_opt in
-    1) NX_PACKAGE="comercio_basico" ;;
-    2) NX_PACKAGE="comercio_avanzado" ;;
-    3) NX_PACKAGE="comercio_total" ;;
-    4) NX_PACKAGE="industrial_basico" ;;
-    5) NX_PACKAGE="industrial_avanzado" ;;
-    6) NX_PACKAGE="industrial_total" ;;
-    7) NX_PACKAGE="hogar_basico" ;;
-    8) NX_PACKAGE="hogar_avanzado" ;;
-    9) NX_PACKAGE="hogar_total" ;;
-    *) NX_PACKAGE="" ;;
+    1)  NX_PACKAGE="comercio_basico" ;;
+    2)  NX_PACKAGE="comercio_avanzado" ;;
+    3)  NX_PACKAGE="comercio_total" ;;
+    4)  NX_PACKAGE="comercio_enterprise" ;;
+    5)  NX_PACKAGE="industrial_basico" ;;
+    6)  NX_PACKAGE="industrial_avanzado" ;;
+    7)  NX_PACKAGE="industrial_total" ;;
+    8)  NX_PACKAGE="industrial_enterprise" ;;
+    9)  NX_PACKAGE="hogar_basico" ;;
+    10) NX_PACKAGE="hogar_avanzado" ;;
+    11) NX_PACKAGE="hogar_total" ;;
+    *)  NX_PACKAGE="" ;;
   esac
 fi
 
@@ -375,6 +417,14 @@ if [[ -n "$NX_PACKAGE" ]]; then
     echo "$_caps" > /etc/nx_pipeline
     ok "Paquete '${BOLD}${NX_PACKAGE}${NC}' → capabilities: ${BOLD}${_caps}${NC}"
     ok "Guardado en /etc/nx_pipeline"
+
+    # Infer sector from package name and write /etc/nx_sector
+    case "$NX_PACKAGE" in
+      comercio_*)   echo "comercio"   > /etc/nx_sector ;;
+      industrial_*) echo "industrial" > /etc/nx_sector ;;
+      hogar_*)      echo "hogar"      > /etc/nx_sector ;;
+    esac
+    ok "Sector → $(cat /etc/nx_sector)"
   fi
 elif [[ -f /etc/nx_pipeline ]]; then
   ok "Pipeline ya configurado: ${BOLD}$(cat /etc/nx_pipeline)${NC}"
@@ -402,6 +452,17 @@ _download_models() {
         && ok "MoveNet descargado" \
         || warn "Fallo al descargar MoveNet. Corre manualmente: python3 tools/download_models.py --fall-detection"
     fi
+  fi
+
+  # ── OSNet-x0.25 (siempre activo — cross-camera re-ID) ───────
+  OSNET_DEST="${WORK_DIR}/models/osnet/osnet_x0_25_market1501.onnx"
+  if [[ -f "$OSNET_DEST" ]]; then
+    ok "OSNet ya descargado — skip"
+  else
+    log "Descargando OSNet-x0.25 (cross-camera re-ID, ~1 MB, Apache 2.0)..."
+    python3 "${WORK_DIR}/tools/download_models.py" --reid \
+      && ok "OSNet descargado" \
+      || warn "Fallo al descargar OSNet. Corre: python3 tools/download_models.py --reid"
   fi
 
   # ── FaceDetectIR (face_recognition) — requiere NGC API Key ──
@@ -553,7 +614,10 @@ echo -e "  IP local:     ${BOLD}${LOCAL_IP}${NC}"
 echo -e "  IP Tailscale: ${BOLD}${TS_IP}${NC}"
 echo -e "  IP DVR:       ${BOLD}${DVR_IP}${NC}"
 echo -e "  Cliente NX:   ${BOLD}$(cat /etc/nx_client 2>/dev/null || echo 'no configurado')${NC}"
+echo -e "  Sector:       ${BOLD}$(cat /etc/nx_sector 2>/dev/null || echo 'no configurado')${NC}"
 echo -e "  Pipeline:     ${BOLD}$(cat /etc/nx_pipeline 2>/dev/null || echo 'default (config.yaml)')${NC}"
+echo -e "  API Key:      ${BOLD}$(grep '^API_KEY=' "${WORK_DIR}/.env" 2>/dev/null | cut -d= -f2 | sed 's/.\{8\}$/****/' || echo 'no configurado')${NC}"
+echo -e "  WS URL:       ${BOLD}$(grep '^WS_BASE_URL=' "${WORK_DIR}/.env" 2>/dev/null | cut -d= -f2 || echo 'no configurado')${NC}"
 echo ""
 echo -e "  ${GREEN}SSH:${NC}  ssh NxComputingDemo@${TS_IP}"
 echo -e "  ${GREEN}VNC:${NC}  ${TS_IP}:5900  (VNC Viewer)"

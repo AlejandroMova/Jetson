@@ -43,6 +43,30 @@ def _progress(block, block_size, total):
         print(f"\r  {pct}%", end="", flush=True)
 
 
+def download_osnet(dest_dir: Path):
+    """
+    OSNet-x0.25 (torchreid / KaiyangZhou), Apache 2.0. ~1 MB.
+    Input: NCHW float32 RGB ImageNet-normalized, 3×256×128.
+    Output: (1, 512) float32 L2-normalized embedding.
+    Latency: ~3-5 ms on Jetson Orin Nano GPU via ONNX Runtime.
+
+    Alternative if the URL below becomes unavailable:
+      python -c "
+      import torchreid, torch
+      m = torchreid.models.build_model('osnet_x0_25', num_classes=1, pretrained=True)
+      m.eval()
+      torch.onnx.export(m, torch.randn(1,3,256,128), 'osnet_x0_25_market1501.onnx',
+                        opset_version=11, input_names=['input'], output_names=['output'])
+      "
+    """
+    dest = dest_dir / "osnet" / "osnet_x0_25_market1501.onnx"
+    url = (
+        "https://huggingface.co/KaiyangZhou/torchreid-models/"
+        "resolve/main/osnet_x0_25_market1501.onnx"
+    )
+    _download(url, dest, "OSNet-x0.25 Re-ID (ONNX 3×256×128)")
+
+
 def download_movenet(dest_dir: Path):
     """
     MoveNet SinglePose Lightning — ONNX, 192×192 input.
@@ -63,15 +87,20 @@ def download_movenet(dest_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Download NX optional model files")
+    parser.add_argument("--reid", action="store_true",
+                        help="Download OSNet-x0.25 ONNX for cross-camera re-ID")
     parser.add_argument("--fall-detection", action="store_true",
-                        help="Download MoveNet ONNX for fall detection")
+                        help="Download MoveNet ONNX for fall detection (Hogar only)")
     parser.add_argument("--all", action="store_true",
                         help="Download all optional models")
     args = parser.parse_args()
 
-    if not any([args.fall_detection, args.all]):
+    if not any([args.reid, args.fall_detection, args.all]):
         parser.print_help()
         sys.exit(0)
+
+    if args.reid or args.all:
+        download_osnet(_MODELS_DIR)
 
     if args.fall_detection or args.all:
         download_movenet(_MODELS_DIR)
