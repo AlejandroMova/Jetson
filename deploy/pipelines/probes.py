@@ -894,7 +894,6 @@ def init_workers(
     if Path(osnet_path).exists():
         from appearance_worker import AppearanceWorker
         _appearance_worker = AppearanceWorker(osnet_path)
-        _appearance_worker.start()
     else:
         logger.warning("OSNet model not found at %s — appearance vectors disabled. "
                        "Run: python3 tools/download_models.py --reid", osnet_path)
@@ -903,7 +902,6 @@ def init_workers(
         from pose_worker import PoseWorker
         model_path = str(Path(model_dir) / "movenet" / "movenet_singlepose_lightning_192.onnx")
         _pose_worker = PoseWorker(model_path)
-        _pose_worker.start()
 
     if "face_recognition" in pipeline_capabilities:
         from face_recognizer import FaceRecognizer
@@ -911,7 +909,6 @@ def init_workers(
             db_path=face_db_path,
             model_root=str(Path(model_dir) / "insightface"),
         )
-        _face_recognizer.start()
 
     # WebSocket position client — active only if WS_BASE_URL is configured
     if ws_base_url:
@@ -921,9 +918,20 @@ def init_workers(
             api_key=api_key,
             sector=_JETSON_SECTOR,
         )
-        _ws_client.start()
     else:
         logger.info("WS_BASE_URL not set — position WebSocket disabled.")
+
+
+def start_workers() -> None:
+    """Start all workers. Call after pipeline.set_state(PLAYING)."""
+    if _appearance_worker is not None:
+        _appearance_worker.start()
+    if _pose_worker is not None:
+        _pose_worker.start()
+    if _face_recognizer is not None:
+        _face_recognizer.start()
+    if _ws_client is not None:
+        _ws_client.start()
 
 
 def stop_workers() -> None:

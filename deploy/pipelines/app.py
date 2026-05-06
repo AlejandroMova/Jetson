@@ -34,7 +34,7 @@ from config_loader import load_config
 from probes import (
     osd_sink_pad_buffer_probe, api_client,
     init_channel_map, init_sector, init_entry_exit_pads,
-    init_handlers, init_workers, stop_workers,
+    init_handlers, init_workers, start_workers, stop_workers,
 )
 
 # Maps each pipeline capability to its nvinfer config file (relative to deploy/).
@@ -364,6 +364,7 @@ def main():
 
     logger.info("Starting pipeline…")
     pipeline.set_state(Gst.State.PLAYING)
+    start_workers()
 
     try:
         loop.run()
