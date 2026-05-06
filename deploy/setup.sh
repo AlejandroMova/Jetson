@@ -339,10 +339,15 @@ else
   warn "O escríbelo manualmente: echo 'demo' | sudo tee /etc/nx_client"
 fi
 
+# ── .env — crear siempre si no existe ─────────────────────────────────────────
+ENV_FILE="${WORK_DIR}/.env"
+if [[ ! -f "$ENV_FILE" ]]; then
+  cp "${WORK_DIR}/.env.example" "$ENV_FILE"
+  ok ".env creado desde .env.example — edítalo para configurar API_KEY y JETSON_ID"
+fi
+
 # ── API Key ────────────────────────────────────────────────────────────────────
 if [[ -n "$NX_API_KEY" ]]; then
-  ENV_FILE="${WORK_DIR}/.env"
-  [[ ! -f "$ENV_FILE" ]] && cp "${WORK_DIR}/.env.example" "$ENV_FILE"
   if grep -q "^API_KEY=" "$ENV_FILE"; then
     sed -i "s|^API_KEY=.*|API_KEY=${NX_API_KEY}|" "$ENV_FILE"
   else
