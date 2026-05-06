@@ -464,9 +464,9 @@ _download_models() {
   if [[ -f "$OSNET_DEST" ]]; then
     ok "OSNet ya descargado — skip"
   else
-    log "Instalando torchreid para exportar OSNet (corre nativamente, una sola vez)..."
-    pip3 install --quiet torchreid \
-      || warn "pip3 install torchreid falló — verifica tu conexión"
+    log "Instalando torch + torchreid para exportar OSNet (una sola vez)..."
+    pip3 install --quiet torch torchreid \
+      || warn "pip3 install torch torchreid falló — verifica tu conexión"
     log "Exportando OSNet-x0.25 desde torchreid pretrained (Market-1501)..."
     python3 "${WORK_DIR}/tools/download_models.py" --reid \
       && ok "OSNet exportado" \
