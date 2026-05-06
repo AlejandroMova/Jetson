@@ -107,8 +107,7 @@ class AppearanceWorker:
             import onnxruntime as ort
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             sess = ort.InferenceSession(self._model_path, providers=providers)
-            logger.info("OSNet ONNX loaded (providers: %s)",
-                        [p.provider_name for p in sess.get_providers()])
+            logger.info("OSNet ONNX loaded (providers: %s)", sess.get_providers())
             return sess
         except Exception as e:
             logger.error("Failed to load OSNet ONNX from %s: %s", self._model_path, e)
