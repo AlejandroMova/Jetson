@@ -45,26 +45,48 @@ def _progress(block, block_size, total):
 
 def download_osnet(dest_dir: Path):
     """
-    OSNet-x0.25 (torchreid / KaiyangZhou), Apache 2.0. ~1 MB.
+    OSNet-x0.25 (torchreid / KaiyangZhou), Apache 2.0.
     Input: NCHW float32 RGB ImageNet-normalized, 3×256×128.
-    Output: (1, 512) float32 L2-normalized embedding.
-    Latency: ~3-5 ms on Jetson Orin Nano GPU via ONNX Runtime.
+    Output: (batch, 512) float32 embedding (AppearanceWorker L2-normalizes it).
 
-    Alternative if the URL below becomes unavailable:
-      python -c "
-      import torchreid, torch
-      m = torchreid.models.build_model('osnet_x0_25', num_classes=1, pretrained=True)
-      m.eval()
-      torch.onnx.export(m, torch.randn(1,3,256,128), 'osnet_x0_25_market1501.onnx',
-                        opset_version=11, input_names=['input'], output_names=['output'])
-      "
+    Exported on-the-fly from torchreid pretrained Market-1501 weights.
+    Run this script natively on the Jetson (not inside Docker):
+      pip3 install torchreid
+      python3 tools/download_models.py --reid
     """
     dest = dest_dir / "osnet" / "osnet_x0_25_market1501.onnx"
-    url = (
-        "https://huggingface.co/KaiyangZhou/torchreid-models/"
-        "resolve/main/osnet_x0_25_market1501.onnx"
-    )
-    _download(url, dest, "OSNet-x0.25 Re-ID (ONNX 3×256×128)")
+    if dest.exists():
+        logger.info("OSNet already exists — skipping.")
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import torch
+        import torchreid  # noqa: F401
+    except ImportError as exc:
+        logger.error("Missing dependency: %s", exc)
+        logger.error("Install with:  pip3 install torchreid")
+        logger.error("Then re-run outside Docker: python3 tools/download_models.py --reid")
+        sys.exit(1)
+
+    logger.info("Exporting OSNet-x0.25 from torchreid pretrained weights (Market-1501)...")
+    try:
+        model = torchreid.models.build_model("osnet_x0_25", num_classes=1, pretrained=True)
+        model.eval()
+        dummy = torch.randn(1, 3, 256, 128)
+        torch.onnx.export(
+            model, dummy, str(dest),
+            opset_version=11,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        )
+        logger.info("Saved: %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
+    except Exception as exc:
+        logger.error("Export failed: %s", exc)
+        if dest.exists():
+            dest.unlink()
+        sys.exit(1)
 
 
 def download_movenet(dest_dir: Path):

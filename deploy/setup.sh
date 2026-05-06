@@ -464,10 +464,13 @@ _download_models() {
   if [[ -f "$OSNET_DEST" ]]; then
     ok "OSNet ya descargado — skip"
   else
-    log "Descargando OSNet-x0.25 (cross-camera re-ID, ~1 MB, Apache 2.0)..."
+    log "Instalando torchreid para exportar OSNet (corre nativamente, una sola vez)..."
+    pip3 install --quiet torchreid \
+      || warn "pip3 install torchreid falló — verifica tu conexión"
+    log "Exportando OSNet-x0.25 desde torchreid pretrained (Market-1501)..."
     python3 "${WORK_DIR}/tools/download_models.py" --reid \
-      && ok "OSNet descargado" \
-      || warn "Fallo al descargar OSNet. Corre: python3 tools/download_models.py --reid"
+      && ok "OSNet exportado" \
+      || warn "Fallo al exportar OSNet. Corre manualmente: pip3 install torchreid && python3 tools/download_models.py --reid"
   fi
 
   # ── FaceDetectIR (face_recognition) — requiere NGC API Key ──

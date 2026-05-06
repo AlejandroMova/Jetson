@@ -62,6 +62,16 @@ echo ""
 git pull origin main
 ok "Code updated to $(git rev-parse --short HEAD)"
 
+# ── 1b. Modelos faltantes (idempotente — skip si ya existen) ─────────────────
+OSNET_PATH="${WORK_DIR}/models/osnet/osnet_x0_25_market1501.onnx"
+if [[ ! -f "$OSNET_PATH" ]]; then
+  log "OSNet no encontrado — instalando torchreid y exportando..."
+  pip3 install --quiet torchreid
+  python3 "${WORK_DIR}/tools/download_models.py" --reid \
+    && ok "OSNet exportado" \
+    || warn "Falló. Manual: pip3 install torchreid && python3 tools/download_models.py --reid"
+fi
+
 # ── 2. Decide: restart only, or full rebuild ──────────────────────────────────
 NEEDS_REBUILD=false
 
