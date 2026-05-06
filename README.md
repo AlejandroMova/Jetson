@@ -161,11 +161,11 @@ required model files exist before GStreamer initializes.
 | Package | `pipeline` value | Models loaded |
 |---------|-----------------|---------------|
 | Comercio Básico / Avanzado | `people_counting` | PeopleNet only |
-| Comercio Total | `people_counting, age_gender` | + ResNet-18 age/gender |
+| Comercio Total | `people_counting, age_gender, face_recognition` | + ResNet-18 age/gender + FaceDetectIR + InsightFace |
 | Comercio Enterprise | `people_counting, age_gender, face_recognition` | + FaceDetectIR + InsightFace |
 | Industrial Básico | `people_counting` | PeopleNet only |
 | Industrial Avanzado | `people_counting, epp_detection` | + PPE SGIE *(model pending)* |
-| Industrial Total | `people_counting, epp_detection, license_plate, fire_smoke` | + LPD/LPR + fire *(pending)* |
+| Industrial Total | `people_counting, epp_detection, license_plate, fire_smoke, face_recognition` | + LPD/LPR + fire *(pending)* + FaceDetectIR + InsightFace |
 | Industrial Enterprise | `people_counting, epp_detection, license_plate, fire_smoke, face_recognition` | + face recognition |
 | Hogar Básico | `people_counting` | PeopleNet only |
 | Hogar Avanzado | `people_counting, fall_detection` | + MoveNet pose (Python worker) |
