@@ -173,40 +173,62 @@ class _MjpegServer:
 
 
 def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
-    """Add one RTSP source branch and link it to streammux sink_{stream_idx}."""
+    """Add one RTSP source branch and link it to streammux sink_{stream_idx}.
+
+    Depayloader and parser are created dynamically in pad-added to support both
+    H.264 and H.265 cameras on the same DVR without prior knowledge of each codec.
+    """
     source  = Gst.ElementFactory.make("rtspsrc",       f"source-{stream_idx}")
-    depay   = Gst.ElementFactory.make("rtph264depay",  f"depay-{stream_idx}")
-    parser  = Gst.ElementFactory.make("h264parse",     f"parser-{stream_idx}")
     decoder = Gst.ElementFactory.make("nvv4l2decoder", f"decoder-{stream_idx}")
 
-    if not all([source, depay, parser, decoder]):
-        logger.error("Could not create source elements for stream %d", stream_idx)
+    if not all([source, decoder]):
+        logger.error("Could not create source/decoder for stream %d", stream_idx)
         sys.exit(1)
 
     source.set_property("location",        rtsp_url)
     source.set_property("latency",         200)
     source.set_property("drop-on-latency", True)
-    source.set_property("protocols",       4)      # TCP only
-    source.set_property("tcp-timeout",     5000000) # 5 s TCP keepalive — prevents Dahua 180 s session cut
+    source.set_property("protocols",       4)       # TCP only
+    source.set_property("tcp-timeout",     5000000) # 5 s keepalive — prevents Dahua 180 s session cut
 
     decoder.set_property("drop-frame-interval", 0)
 
-    for el in [source, depay, parser, decoder]:
+    for el in [source, decoder]:
         pipeline.add(el)
-
-    depay.link(parser)
-    parser.link(decoder)
 
     decoder_srcpad    = decoder.get_static_pad("src")
     streammux_sinkpad = streammux.get_request_pad(f"sink_{stream_idx}")
     decoder_srcpad.link(streammux_sinkpad)
 
-    def _on_pad_added(_src, pad, _depay=depay):
+    def _on_pad_added(_src, pad, _pipeline=pipeline, _decoder=decoder):
         caps = pad.get_current_caps() or pad.query_caps(None)
-        if caps and "video" in caps.to_string():
-            sink = _depay.get_static_pad("sink")
-            if not sink.is_linked():
-                pad.link(sink)
+        caps_str = caps.to_string() if caps else ""
+        if "video" not in caps_str:
+            return
+
+        if "H265" in caps_str.upper():
+            depay  = Gst.ElementFactory.make("rtph265depay", f"depay-{stream_idx}")
+            parser = Gst.ElementFactory.make("h265parse",    f"parser-{stream_idx}")
+            logger.info("Stream %d: H.265 codec detected", stream_idx)
+        else:
+            depay  = Gst.ElementFactory.make("rtph264depay", f"depay-{stream_idx}")
+            parser = Gst.ElementFactory.make("h264parse",    f"parser-{stream_idx}")
+
+        if not depay or not parser:
+            logger.error("Could not create depay/parser for stream %d", stream_idx)
+            return
+
+        _pipeline.add(depay)
+        _pipeline.add(parser)
+        depay.sync_state_with_parent()
+        parser.sync_state_with_parent()
+
+        depay.link(parser)
+        parser.link(_decoder)
+
+        sink = depay.get_static_pad("sink")
+        if not sink.is_linked():
+            pad.link(sink)
 
     source.connect("pad-added", _on_pad_added)
     logger.info(

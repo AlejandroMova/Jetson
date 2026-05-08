@@ -9,7 +9,7 @@ labelfile-path=labels.txt
 
 # Dimensiones estándar para PeopleNet
 infer-dims=3;544;960
-batch-size=1
+batch-size=16
 process-mode=1
 model-color-format=0
 
@@ -17,19 +17,15 @@ model-color-format=0
 int8-calib-file=resnet34_peoplenet_int8.txt
 network-mode=1
 num-detected-classes=3
-interval=0
+interval=2
 gie-unique-id=1
 
 # Capas de salida específicas de PeopleNet (ONNX conserva los nombres TF con :0)
 output-blob-names=output_bbox/BiasAdd:0;output_cov/Sigmoid:0
 cluster-mode=2
 
-# Umbral general para todas las clases
+# Umbral general para todas las clases (person, bag, face)
 [class-attrs-all]
 topk=20
 nms-iou-threshold=0.5
 pre-cluster-threshold=0.3
-
-# Suprimir clase Face (2) completamente — nueva arquitectura usa cuerpo completo
-[class-attrs-2]
-pre-cluster-threshold=1.1
