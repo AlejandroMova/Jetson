@@ -23,6 +23,7 @@ services:
     working_dir: /nx_tech
     environment:
       PYTHONPATH: /nx_tech/pipelines
+      PYTHONDONTWRITEBYTECODE: "1"
       # NX_CLIENT overrides /etc/nx_client — set this per deployment or leave commented
       # to read from /etc/nx_client (written by setup.sh --client <name>).
       # NX_CLIENT: demo
