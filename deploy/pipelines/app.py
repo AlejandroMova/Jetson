@@ -51,7 +51,7 @@ SGIE_CONFIGS = {
 
 
 def _validate_pipeline_models(pipeline: list) -> None:
-    """Fail fast before GStreamer init if a required model config file is missing."""
+    """Fail fast before GStreamer init if a required model config or ONNX file is missing."""
     missing = []
     for cap in pipeline:
         if cap == "people_counting":
@@ -59,13 +59,30 @@ def _validate_pipeline_models(pipeline: list) -> None:
         cfg_path = SGIE_CONFIGS.get(cap)
         if cfg_path is None:
             continue  # Python worker — no file needed
-        if not Path(cfg_path).exists():
-            missing.append((cap, cfg_path))
+        p = Path(cfg_path)
+        if not p.exists():
+            missing.append((cap, cfg_path, "config_infer.txt not found"))
+            continue
+        # Also verify the ONNX file referenced inside the config exists.
+        # Without this check the error only surfaces much later when DeepStream
+        # tries to build the TRT engine — after GStreamer is already initialised.
+        try:
+            for line in p.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("onnx-file="):
+                    onnx_name = stripped.split("=", 1)[1].strip()
+                    onnx_path = p.parent / onnx_name
+                    if not onnx_path.exists():
+                        missing.append((cap, str(onnx_path),
+                                        "ONNX model not found — download it first"))
+                    break
+        except OSError:
+            pass
     if missing:
-        lines = "\n".join(f"  '{cap}' → {path}" for cap, path in missing)
+        lines = "\n".join(f"  '{cap}' → {path}  ({reason})" for cap, path, reason in missing)
         raise RuntimeError(
-            f"Cannot start: model config(s) missing for requested capabilities:\n{lines}\n"
-            "Add the ONNX model + config_infer.txt before enabling these capabilities."
+            f"Cannot start: model file(s) missing for requested capabilities:\n{lines}\n"
+            "Run:  docker compose run --rm deepstream python3 tools/download_models.py --help"
         )
 
 logging.basicConfig(

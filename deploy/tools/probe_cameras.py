@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import List
 
 import yaml
+from ruamel.yaml import YAML as _YAML
 from dotenv import dotenv_values
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -198,11 +199,13 @@ def _load_runtime(client_name: str):
 
 
 def _update_config(config_path: Path, channels: List[int]):
+    ryaml = _YAML()
+    ryaml.preserve_quotes = True
     with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+        cfg = ryaml.load(f) or {}
     cfg["channels"] = channels
     with open(config_path, "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+        ryaml.dump(cfg, f)
     print(f"\n[OK] Updated {config_path}  channels: {channels}")
 
 

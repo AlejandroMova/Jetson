@@ -1,6 +1,7 @@
 requests
 opencv-python-headless
 pyyaml
+ruamel.yaml
 python-dotenv
 numpy
 onnxruntime

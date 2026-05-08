@@ -366,10 +366,11 @@ if [[ -n "$ENTRY_EXIT_CHANNELS" ]]; then
     _client_config="${WORK_DIR}/clients/${_client_name}/config.yaml"
     if [[ -f "$_client_config" ]]; then
       python3 -c "
-import yaml
-with open('${_client_config}') as f: cfg = yaml.safe_load(f)
+from ruamel.yaml import YAML
+ry = YAML(); ry.preserve_quotes = True
+with open('${_client_config}') as f: cfg = ry.load(f) or {}
 cfg['entry_exit_channels'] = [int(x.strip()) for x in '${ENTRY_EXIT_CHANNELS}'.split(',') if x.strip()]
-with open('${_client_config}', 'w') as f: yaml.dump(cfg, f, default_flow_style=False)
+with open('${_client_config}', 'w') as f: ry.dump(cfg, f)
 " && ok "entry_exit_channels configurado: ${ENTRY_EXIT_CHANNELS}" \
       || warn "No se pudo actualizar entry_exit_channels en ${_client_config}"
     else
@@ -440,10 +441,11 @@ if [[ -n "$NX_PACKAGE" ]]; then
       _client_config="${WORK_DIR}/clients/${_client_name}/config.yaml"
       if [[ -f "$_client_config" ]]; then
         python3 -c "
-import yaml
-with open('${_client_config}') as f: cfg = yaml.safe_load(f) or {}
+from ruamel.yaml import YAML
+ry = YAML(); ry.preserve_quotes = True
+with open('${_client_config}') as f: cfg = ry.load(f) or {}
 cfg['package'] = '${NX_PACKAGE}'
-with open('${_client_config}', 'w') as f: yaml.dump(cfg, f, default_flow_style=False)
+with open('${_client_config}', 'w') as f: ry.dump(cfg, f)
 " && ok "package: ${NX_PACKAGE} escrito en ${_client_config}" \
         || warn "No se pudo actualizar package en ${_client_config}"
       fi

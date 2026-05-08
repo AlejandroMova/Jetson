@@ -56,9 +56,17 @@ nano .env                           # fill API_KEY and API_BASE_URL
 #    installs Docker + Tailscale, detects DVR IP, builds image,
 #    identifies DVR URL pattern, detects active channels, starts pipeline.
 #    --package sets the contracted tier (writes /etc/nx_pipeline).
+#    --stream-type sub  →  use DVR sub-stream (960×544) for 16-camera deployments.
 sudo bash setup.sh \
   --client <client_name> \
   --package comercio_total \
+  --authkey <tailscale-key>
+
+# 16-camera deployment (sub-stream to avoid NVDEC overload):
+sudo bash setup.sh \
+  --client <client_name> \
+  --package industrial_basico \
+  --stream-type sub \
   --authkey <tailscale-key>
 
 # 5. Watch inference from your laptop
@@ -158,18 +166,20 @@ required model files exist before GStreamer initializes.
 
 ### Package → capability mapping
 
-| Package | `pipeline` value | Models loaded |
-|---------|-----------------|---------------|
-| Comercio Básico / Avanzado | `people_counting` | PeopleNet only |
-| Comercio Total | `people_counting, age_gender, face_recognition` | + ResNet-18 age/gender + FaceDetectIR + InsightFace |
-| Comercio Enterprise | `people_counting, age_gender, face_recognition` | + FaceDetectIR + InsightFace |
-| Industrial Básico | `people_counting` | PeopleNet only |
-| Industrial Avanzado | `people_counting, epp_detection` | + PPE SGIE *(model pending)* |
-| Industrial Total | `people_counting, epp_detection, license_plate, fire_smoke, face_recognition` | + LPD/LPR + fire *(pending)* + FaceDetectIR + InsightFace |
-| Industrial Enterprise | `people_counting, epp_detection, license_plate, fire_smoke, face_recognition` | + face recognition |
-| Hogar Básico | `people_counting` | PeopleNet only |
-| Hogar Avanzado | `people_counting, fall_detection` | + MoveNet pose (Python worker) |
-| Hogar Total | `people_counting, fall_detection, fire_smoke, face_recognition` | + fire + face recognition |
+Set `package:` in `config.yaml` — pipeline capabilities and sector are derived automatically.
+Use `package: manual` to set `pipeline:` and `sector:` explicitly (testing / custom deployments).
+
+| `package:` value | Pipeline capabilities | Sector |
+|------------------|-----------------------|--------|
+| `comercio_basico` / `comercio_avanzado` | `people_counting` | comercio |
+| `comercio_total` / `comercio_enterprise` | `people_counting, age_gender, face_recognition` | comercio |
+| `industrial_basico` | `people_counting` | industrial |
+| `industrial_avanzado` | `people_counting, epp_detection` | industrial |
+| `industrial_total` / `industrial_enterprise` | `people_counting, epp_detection, license_plate, fire_smoke, face_recognition` | industrial |
+| `hogar_basico` | `people_counting` | hogar |
+| `hogar_avanzado` | `people_counting, fall_detection` | hogar |
+| `hogar_total` | `people_counting, fall_detection, fire_smoke, face_recognition` | hogar |
+| `manual` | explicit `pipeline:` + `sector:` in config.yaml | — |
 
 ### Capability implementation
 
@@ -190,7 +200,10 @@ required model files exist before GStreamer initializes.
 |--------|-----------|----------|
 | `NX_PIPELINE` env var | `docker compose run -e NX_PIPELINE=...` | One-off testing |
 | `/etc/nx_pipeline` | `setup.sh --package <tier>` or `tee /etc/nx_pipeline` | Production |
-| `config.yaml pipeline:` | Edit client config and push | Client default / fallback |
+| `config.yaml package:` | `setup.sh --package <tier>` or edit and push | Client default (recommended) |
+| `config.yaml pipeline:` | Only when `package: manual` | Custom / testing |
+
+Sector follows the same order: `NX_SECTOR` env → `/etc/nx_sector` → derived from `package:` → explicit `sector:` (only when `package: manual`).
 
 ### NGC API Key (required for face_recognition)
 
@@ -202,7 +215,15 @@ FaceDetectIR is downloaded from NVIDIA GPU Cloud (NGC) and requires a free accou
    — the key is saved to `/etc/nx_ngc_key` (mode 600) for future runs
 
 ```bash
-# Manual download if needed:
+# Download via the helper script (recommended):
+docker compose run --rm deepstream \
+  python3 tools/download_models.py --face-recognition --ngc-key <your-key>
+
+# Or with env var:
+NGC_API_KEY=<your-key> docker compose run --rm deepstream \
+  python3 tools/download_models.py --face-recognition
+
+# Or manually with wget:
 NGC_API_KEY=<your-key>
 wget --header="Authorization: ApiKey ${NGC_API_KEY}" \
   -O deploy/models/facedetect_ir/resnet18_facedetectir_pruned_quantized.onnx \
@@ -239,13 +260,14 @@ When a new model (e.g. EPP) is ready:
    client_name: <client_name>
    dvr_port: 554
    rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream"
-   channels: [1, 2]        # DVR channel numbers to process
-   stream_width: 1920
-   stream_height: 1080
-   pipeline:               # default fallback — overridden by /etc/nx_pipeline on the Jetson
-     - people_counting
-   tracker: nvdcf           # nvdcf (≤6 streams) | iou (up to 16 streams)
+   channels: [1, 2]
+   package: comercio_basico   # sets pipeline + sector automatically; use "manual" for custom
+   stream_type: main          # main (1080p, ≤6 cams) | sub (960×544, 16+ cams)
+   tracker: nvdcf             # nvdcf (≤6 streams) | iou (up to 16 streams)
+   entry_exit_channels: []
    ```
+   > `setup.sh --package` and `setup.sh --stream-type` write these fields automatically.
+   > `identify_dvr.py --update-config` sets `rtsp_url_pattern` and `stream_type` automatically.
 
 3. **On the Jetson, pull and set credentials + package:**
    ```bash
@@ -253,10 +275,8 @@ When a new model (e.g. EPP) is ready:
    cd deploy/
    cp clients/<client_name>/.env.example clients/<client_name>/.env
    nano clients/<client_name>/.env     # fill DVR_USER and DVR_PASS
-   echo "<client_name>" | sudo tee /etc/nx_client
-   # Set contracted package (writes /etc/nx_pipeline):
-   echo "people_counting,age_gender" | sudo tee /etc/nx_pipeline
-   docker compose restart deepstream
+   # Re-run setup to apply the new client config:
+   sudo bash setup.sh --client <client_name> --package comercio_basico
    ```
    `.env` is gitignored and stays only on the Jetson.
 
@@ -270,16 +290,14 @@ When a new model (e.g. EPP) is ready:
 |-----|------|---------|-------------|
 | `client_name` | string | — | Must match the folder name |
 | `dvr_port` | int | `554` | RTSP port on the DVR |
-| `rtsp_url_pattern` | string | generic | URL template with `{user}`, `{password}`, `{dvr_ip}`, `{port}`, `{ch:02d}` |
-| `channels` | list[int] | `[1]` | DVR channel numbers to ingest |
-| `stream_width` | int | `1920` | DVR main stream width |
-| `stream_height` | int | `1080` | DVR main stream height |
-| `pipeline` | list | `[people_counting]` | Default capabilities for this client. Overridden by `/etc/nx_pipeline` or `NX_PIPELINE` env var. Valid values: `people_counting`, `age_gender`, `epp_detection`, `fire_smoke`, `license_plate`, `fall_detection`, `face_recognition` |
-| `tracker` | string | `nvdcf` | Tracker algorithm — see table below |
-| `sector` | string | `"comercio"` | Client vertical: `"comercio"` \| `"industrial"` \| `"hogar"`. Inferred automatically by `setup.sh --package`. Controls event types emitted by `face_recognition` and severity of `fall_detected`. |
-| `entry_exit_channels` | list[int] | `[]` | Subset of `channels` whose cameras cover entrance/exit doors. Used to calculate store dwell time and visit count. Leave empty if no camera directly covers the entrance. Can be set with `setup.sh --entry-exit-channels "1,2"` or edited manually later. |
-| `stream_width` | int | `1920` | Resolution fed to `nvstreammux` (inference + MJPEG output) |
-| `stream_height` | int | `1080` | Same, height |
+| `rtsp_url_pattern` | string | generic | URL template with `{user}`, `{password}`, `{dvr_ip}`, `{port}`, `{ch:02d}`. Set automatically by `identify_dvr.py --update-config`. |
+| `channels` | list[int] | `[1]` | DVR channel numbers to ingest. Set automatically by `probe_cameras.py --update-config`. |
+| `package` | string | `"manual"` | Contracted package — derives `pipeline` capabilities and `sector` automatically. Set by `setup.sh --package`. Use `"manual"` to specify `pipeline` and `sector` explicitly. |
+| `stream_type` | string | `"main"` | `"main"` — 1920×1080, up to 6 cameras. `"sub"` — 960×544, up to 16 cameras (requires sub-stream URL in `rtsp_url_pattern`). Set by `setup.sh --stream-type` and `identify_dvr.py --stream-type`. |
+| `tracker` | string | `"nvdcf"` | Tracker algorithm — see table below |
+| `entry_exit_channels` | list[int] | `[]` | Subset of `channels` whose cameras cover entrance/exit doors. Used to calculate store dwell time and visit count. Set with `setup.sh --entry-exit-channels "1,2"` or edited manually. |
+| `pipeline` | list | `[people_counting]` | Only used when `package: manual`. Valid values: `people_counting`, `age_gender`, `epp_detection`, `fire_smoke`, `license_plate`, `fall_detection`, `face_recognition`. |
+| `sector` | string | `"comercio"` | Only used when `package: manual`. `"comercio"` \| `"industrial"` \| `"hogar"`. Controls event types for `face_recognition` and severity of `fall_detected`. |
 
 #### Tracker selection
 
@@ -288,23 +306,34 @@ When a new model (e.g. EPP) is ready:
 | `nvdcf` | NvDCF correlation filter | ~6 | Clients with few cameras, need precise re-ID through occlusions |
 | `iou` | IoU bounding-box matching | 16 | Clients with many cameras, people-counting use case |
 
-**Substream tip:** For multi-camera deployments use the DVR substream (`subtype=1` in Dahua URL) and set `stream_width: 960` / `stream_height: 544`. This reduces GPU memory pressure significantly.
+**Sub-stream tip:** For 16-camera deployments the Jetson Orin Nano NVDEC will overload at 1080p.
+Use the DVR sub-stream (960×544) to keep NVDEC within its rated capacity.
+`setup.sh --stream-type sub` and `identify_dvr.py --stream-type sub --update-config` handle this automatically — they set the correct sub-stream URL for the detected DVR brand and write `stream_type: sub` to config.yaml.
 
 ```yaml
-# Multi-camera example (Dahua, 16 channels, substream)
+# 16-camera example (Dahua, sub-stream — set automatically by identify_dvr.py)
 rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=1"
 channels: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-stream_width: 960
-stream_height: 544
+stream_type: sub
 tracker: iou
 
-# Single/few cameras example (main stream, full quality)
+# 1–6 camera example (main stream, full quality)
 rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=0"
 channels: [1]
-stream_width: 1920
-stream_height: 1080
+stream_type: main
 tracker: nvdcf
 ```
+
+Sub-stream URL paths by brand (set automatically by `identify_dvr.py`):
+
+| Brand | Main stream | Sub-stream |
+|-------|-------------|------------|
+| Generic / QSee / Swann / Annke | `/ch{ch:02d}/main/av_stream` | `/ch{ch:02d}/sub/av_stream` |
+| Hikvision | `/Streaming/Channels/{ch:02d}01` | `/Streaming/Channels/{ch:02d}02` |
+| Dahua / Amcrest / Lorex | `?channel={ch}&subtype=0` | `?channel={ch}&subtype=1` |
+| Reolink | `/h264Preview_{ch:02d}_main` | `/h264Preview_{ch:02d}_sub` |
+| Uniview / UNV | `/media/video{ch}` | `/unicast/c{ch}/s1/live` |
+| Axis / Hanwha | device-specific | set manually via DVR web UI |
 
 ### `deploy/clients/<name>/.env` (gitignored)
 
@@ -326,8 +355,8 @@ Copy from `deploy/.env.example` and fill in before first deploy.
 
 ### Runtime resolution order
 
-`NX_PIPELINE` env var → `/etc/nx_pipeline` (setup.sh `--package`) → `config.yaml pipeline:`  
-`NX_SECTOR` env var → `/etc/nx_sector` (inferred by setup.sh from `--package`) → `config.yaml sector:`  
+`NX_PIPELINE` env var → `/etc/nx_pipeline` → `config.yaml package:` (derives pipeline) → `config.yaml pipeline:` (only when `package: manual`)  
+`NX_SECTOR` env var → `/etc/nx_sector` → derived from `config.yaml package:` → `config.yaml sector:` (only when `package: manual`)  
 `NX_CLIENT` env var → `/etc/nx_client` (written by setup.sh)  
 `NX_DVR_IP` env var → `/etc/nx_dvr_ip` (written by setup.sh)  
 `DVR_USER` / `DVR_PASS` env vars → `clients/<name>/.env`
@@ -416,7 +445,7 @@ The cross-camera matching itself runs in the **backend** — the Jetson only gen
 
 OSNet model is auto-downloaded by `setup.sh`. To download manually:
 ```bash
-python3 deploy/tools/download_models.py --reid
+docker compose run --rm deepstream python3 tools/download_models.py --reid
 ```
 
 ---

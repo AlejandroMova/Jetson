@@ -5,10 +5,17 @@ Downloads optional model files that are not tracked in git.
 
 Usage:
   python tools/download_models.py --fall-detection
-  python tools/download_models.py --all
+  python tools/download_models.py --reid
+  python tools/download_models.py --face-recognition --ngc-key <key>
+  python tools/download_models.py --all --ngc-key <key>
+
+NGC API key (required for --face-recognition):
+  Get a free key at https://ngc.nvidia.com/setup/api-key
+  Pass via --ngc-key or the NGC_API_KEY environment variable.
 """
 import argparse
 import logging
+import os
 import sys
 import urllib.request
 from pathlib import Path
@@ -107,17 +114,79 @@ def download_movenet(dest_dir: Path):
     _download(url, dest, "MoveNet SinglePose Lightning (ONNX 192×192)")
 
 
+def download_facedetectir(dest_dir: Path, ngc_key: str):
+    """
+    FaceDetectIR — ResNet-18 pruned+quantized ONNX from NVIDIA NGC.
+    Input: 3×136×240 (BGR). Used as secondary GIE for face detection on person crops.
+    Source: nvidia/tao/facedetectir, version pruned_quantized_v2.0 (NGC, requires API key).
+    Get a free key at https://ngc.nvidia.com/setup/api-key
+    """
+    dest = dest_dir / "facedetect_ir" / "resnet18_facedetectir_pruned_quantized.onnx"
+    if dest.exists():
+        logger.info("FaceDetectIR already exists — skipping.")
+        return
+
+    if not ngc_key:
+        logger.error("NGC API key required to download FaceDetectIR.")
+        logger.error("Get a free key at: https://ngc.nvidia.com/setup/api-key")
+        logger.error("Then run:  python3 tools/download_models.py --face-recognition --ngc-key <key>")
+        logger.error("Or set:    NGC_API_KEY=<key> python3 tools/download_models.py --face-recognition")
+        sys.exit(1)
+
+    url = (
+        "https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir"
+        "/versions/pruned_quantized_v2.0/files/resnet18_facedetectir_pruned_quantized.onnx"
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading FaceDetectIR from NGC...")
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": f"ApiKey {ngc_key}"})
+        with urllib.request.urlopen(req) as response:
+            total = int(response.headers.get("Content-Length", 0))
+            block_size = 65536
+            downloaded = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = response.read(block_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = min(100, downloaded * 100 // total)
+                        print(f"\r  {pct}%", end="", flush=True)
+        print()
+        logger.info("Saved: %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
+    except urllib.error.HTTPError as e:
+        logger.error("Download failed (HTTP %d): %s", e.code, e.reason)
+        if e.code == 401:
+            logger.error("Invalid NGC API key — verify at https://ngc.nvidia.com/setup/api-key")
+        if dest.exists():
+            dest.unlink()
+        sys.exit(1)
+    except Exception as e:
+        logger.error("Download failed: %s", e)
+        if dest.exists():
+            dest.unlink()
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download NX optional model files")
     parser.add_argument("--reid", action="store_true",
                         help="Download OSNet-x0.25 ONNX for cross-camera re-ID")
     parser.add_argument("--fall-detection", action="store_true",
                         help="Download MoveNet ONNX for fall detection (Hogar only)")
+    parser.add_argument("--face-recognition", action="store_true",
+                        help="Download FaceDetectIR ONNX from NGC (requires --ngc-key or NGC_API_KEY)")
+    parser.add_argument("--ngc-key", default=None,
+                        help="NGC API key for downloading FaceDetectIR "
+                             "(also read from NGC_API_KEY env var)")
     parser.add_argument("--all", action="store_true",
-                        help="Download all optional models")
+                        help="Download all optional models (--ngc-key required for face-recognition)")
     args = parser.parse_args()
 
-    if not any([args.reid, args.fall_detection, args.all]):
+    if not any([args.reid, args.fall_detection, args.face_recognition, args.all]):
         parser.print_help()
         sys.exit(0)
 
@@ -126,6 +195,10 @@ def main():
 
     if args.fall_detection or args.all:
         download_movenet(_MODELS_DIR)
+
+    if args.face_recognition or args.all:
+        ngc_key = args.ngc_key or os.environ.get("NGC_API_KEY", "")
+        download_facedetectir(_MODELS_DIR, ngc_key)
 
     logger.info("Done.")
 

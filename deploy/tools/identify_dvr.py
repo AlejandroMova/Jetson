@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 
 import yaml
 from dotenv import dotenv_values
+from ruamel.yaml import YAML as _YAML
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT   = 5   # seconds per pattern attempt
@@ -388,17 +389,19 @@ def main():
     if args.update_config:
         cfg_path = REPO_ROOT / "clients" / client_name / "config.yaml"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        ryaml = _YAML()
+        ryaml.preserve_quotes = True
         cfg = {}
         if cfg_path.exists():
             with open(cfg_path) as f:
-                cfg = yaml.safe_load(f) or {}
+                cfg = ryaml.load(f) or {}
         cfg["dvr_port"]         = dvr_port
         cfg["rtsp_url_pattern"] = chosen_pattern
         cfg["stream_type"]      = stream_type
         cfg["stream_width"]     = width
         cfg["stream_height"]    = height
         with open(cfg_path, "w") as f:
-            yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+            ryaml.dump(cfg, f)
         print(f"\n  ✓  config.yaml updated: {cfg_path}")
         if res_note:
             print(f"     {res_note.strip()}")
