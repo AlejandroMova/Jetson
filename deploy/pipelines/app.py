@@ -46,7 +46,7 @@ SGIE_CONFIGS = {
     "fire_smoke":      str(_MODELS_DIR / "fire_smoke/config_infer.txt"),
     "license_plate":   str(_MODELS_DIR / "license_plate/config_infer.txt"),
     "fall_detection":  None,  # MoveNet Python worker — no SGIE
-    "face_recognition": str(_MODELS_DIR / "facedetect_ir/config_infer.txt"),
+    "face_recognition": None,  # PeopleNet class 2 (face) detections fed directly to worker
 }
 
 

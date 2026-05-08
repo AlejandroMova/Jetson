@@ -495,49 +495,6 @@ _download_models() {
       || warn "Fallo al exportar OSNet. Corre manualmente: pip3 install torchreid && python3 tools/download_models.py --reid"
   fi
 
-  # ── FaceDetectIR (face_recognition) — requiere NGC API Key ──
-  if echo "$pipeline" | grep -q "face_recognition"; then
-    FACE_ETLT="${WORK_DIR}/models/facedetect_ir/resnet18_facedetectir_pruned.etlt"
-    if [[ -f "$FACE_ETLT" ]]; then
-      ok "FaceDetectIR ya descargado — skip"
-    else
-      # Leer o solicitar NGC API Key
-      NGC_KEY_FILE="/etc/nx_ngc_key"
-      if [[ -f "$NGC_KEY_FILE" ]]; then
-        NGC_API_KEY=$(cat "$NGC_KEY_FILE")
-        log "NGC API Key leída de ${NGC_KEY_FILE}"
-      else
-        echo ""
-        echo -e "${YELLOW}Se necesita una NGC API Key para descargar FaceDetectIR.${NC}"
-        echo -e "  Obtén tu key en: ${BOLD}https://ngc.nvidia.com/setup/api-key${NC}"
-        echo -n "  Ingresa tu NGC API Key: "
-        read -r NGC_API_KEY
-        if [[ -z "$NGC_API_KEY" ]]; then
-          warn "NGC API Key vacía — saltando descarga de FaceDetectIR."
-          warn "Para descargar manualmente más tarde: bash setup.sh --package <paquete>"
-          return 0
-        fi
-        echo "$NGC_API_KEY" > "$NGC_KEY_FILE"
-        chmod 600 "$NGC_KEY_FILE"
-        ok "NGC API Key guardada en ${NGC_KEY_FILE}"
-      fi
-
-      log "Descargando FaceDetectIR desde NGC..."
-      mkdir -p "${WORK_DIR}/models/facedetect_ir"
-      NGC_URL="https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir/versions/pruned_v1.0.1/files/resnet18_facedetectir_pruned.etlt"
-      if wget -q --show-progress \
-              --header="Authorization: ApiKey ${NGC_API_KEY}" \
-              -O "$FACE_ETLT" \
-              "$NGC_URL"; then
-        ok "FaceDetectIR descargado: ${FACE_ETLT}"
-      else
-        rm -f "$FACE_ETLT"
-        warn "Fallo al descargar FaceDetectIR desde NGC."
-        warn "Verifica tu API Key o descarga manualmente desde:"
-        warn "  https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tao/models/facedetectir"
-      fi
-    fi
-  fi
 }
 
 # ════════════════════════════════════════════════════════════

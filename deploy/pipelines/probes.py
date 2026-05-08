@@ -1133,10 +1133,11 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     and obj_meta.confidence >= OSD_CONFIDENCE_THRESHOLD
                     and int(obj_meta.class_id) == PGIE_CLASS_PERSON):
                 persons_meta.append(obj_meta)
-            elif uid == SGIE_FACE_DETECT_ID:
+            elif (uid == PGIE_UNIQUE_ID
+                    and int(obj_meta.class_id) == PGIE_CLASS_FACE):
                 face_metas.append(obj_meta)
 
-        # ── Face recognition: process SGIE detections ────────────────────────
+        # ── Face recognition: process PeopleNet face detections (class 2) ────
         if _face_handler and face_metas and frame_np is not None:
             for face_obj_meta in face_metas:
                 _face_handler.process_face(

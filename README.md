@@ -189,7 +189,7 @@ Use `package: manual` to set `pipeline:` and `sector:` explicitly (testing / cus
 | `cross_camera_reid` | Python worker | OSNet-x0.25 ONNX | **Always active** (tied to people_counting). Auto-downloaded by setup.sh. Generates 512-dim appearance vectors for cross-camera re-ID. |
 | `age_gender` | SGIE (gie-id=2) | ResNet-18 Pedestrian Attr | Full-body crop → 6 classes |
 | `fall_detection` | Python worker | MoveNet Lightning ONNX | **Hogar only** (hogar_avanzado / hogar_total). Auto-downloaded by setup.sh. |
-| `face_recognition` | SGIE (gie-id=3) + Python worker | FaceDetectIR + InsightFace buffalo_l | Requires NGC API key. Event type depends on `sector`: `employee_seen` (comercio/industrial) or `known_person_seen` + `unknown_person_alert` (hogar). |
+| `face_recognition` | Python worker | PeopleNet class 2 (face) + InsightFace buffalo_l | No extra model needed — uses face detections already produced by PeopleNet PGIE. Event type depends on `sector`: `employee_seen` (comercio/industrial) or `known_person_seen` + `unknown_person_alert` (hogar). |
 | `epp_detection` | SGIE | *(pending)* | Helmet/vest/gloves |
 | `fire_smoke` | SGIE | *(pending)* | Frame-level classifier |
 | `license_plate` | SGIE | *(pending)* | LPD + LPR |
@@ -205,30 +205,9 @@ Use `package: manual` to set `pipeline:` and `sector:` explicitly (testing / cus
 
 Sector follows the same order: `NX_SECTOR` env → `/etc/nx_sector` → derived from `package:` → explicit `sector:` (only when `package: manual`).
 
-### NGC API Key (required for face_recognition)
+### No NGC API key needed
 
-FaceDetectIR is downloaded from NVIDIA GPU Cloud (NGC) and requires a free account:
-
-1. Create account at [ngc.nvidia.com](https://ngc.nvidia.com) (free)
-2. Generate an API key at **ngc.nvidia.com/setup/api-key**
-3. `setup.sh` will prompt for it automatically when `face_recognition` is in the pipeline  
-   — the key is saved to `/etc/nx_ngc_key` (mode 600) for future runs
-
-```bash
-# Download via the helper script (recommended):
-docker compose run --rm deepstream \
-  python3 tools/download_models.py --face-recognition --ngc-key <your-key>
-
-# Or with env var:
-NGC_API_KEY=<your-key> docker compose run --rm deepstream \
-  python3 tools/download_models.py --face-recognition
-
-# Or manually with wget:
-NGC_API_KEY=<your-key>
-wget --header="Authorization: ApiKey ${NGC_API_KEY}" \
-  -O deploy/models/facedetect_ir/resnet18_facedetectir_pruned.etlt \
-  "https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir/versions/pruned_v1.0.1/files/resnet18_facedetectir_pruned.etlt"
-```
+`face_recognition` uses the face detections already produced by PeopleNet (class 2) — no separate face detector model is required. InsightFace `buffalo_l` (auto-downloaded on first run) handles the recognition step. No NGC account or API key needed.
 
 ### Adding a new model
 
@@ -481,9 +460,10 @@ Leave empty to disable — the pipeline runs normally, position data is silently
 ```
 DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
   → PeopleNet PGIE (gie-id=1, always active) → Tracker (NvDCF or IOU)
+      ├── class 0 (person) → age_gender SGIE (gie-id=2), tracker lifecycle, appearance
+      └── class 2 (face)   → FaceRecognizer worker (if face_recognition active)
   → [SGIE: age_gender    gie-id=2]  ← one nvinfer per active SGIE capability
-  → [SGIE: facedetectir  gie-id=3]  ← face detection (if face_recognition active)
-  → [SGIE: epp/fire/lpr  gie-id=4+] ← pending models
+  → [SGIE: epp/fire/lpr  gie-id=3+] ← pending models
   → nvmultistreamtiler → nvdsosd
   → nvvideoconvert → appsink → HTTP MJPEG server (port 8080)
 
@@ -495,9 +475,9 @@ Async paths (background threads, never block pipeline):
   all cameras     → WsPositionClient → WS /ws/positions (positions_snapshot every 10s)
 ```
 
-The probe dispatcher separates PGIE person detections from FaceDetectIR SGIE face detections.
-`fall_detection` and `face_recognition` use Python worker threads (same async pattern as the
-REST API client) so inference never blocks the GStreamer pipeline.
+The probe dispatcher reads PeopleNet class 0 (person) for tracking and class 2 (face) for
+recognition — both come from the same PGIE pass at zero extra cost.
+`fall_detection` and `face_recognition` are pure Python worker threads (no extra SGIE element).
 
 View the live feed:
 ```bash
