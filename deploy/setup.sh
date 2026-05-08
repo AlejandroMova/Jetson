@@ -433,12 +433,27 @@ if [[ -n "$NX_PACKAGE" ]]; then
       hogar_*)      echo "hogar"      > /etc/nx_sector ;;
     esac
     ok "Sector → $(cat /etc/nx_sector)"
+
+    # Also write package name into config.yaml so it's self-documenting
+    _client_name=$(cat /etc/nx_client 2>/dev/null || echo "")
+    if [[ -n "$_client_name" ]]; then
+      _client_config="${WORK_DIR}/clients/${_client_name}/config.yaml"
+      if [[ -f "$_client_config" ]]; then
+        python3 -c "
+import yaml
+with open('${_client_config}') as f: cfg = yaml.safe_load(f) or {}
+cfg['package'] = '${NX_PACKAGE}'
+with open('${_client_config}', 'w') as f: yaml.dump(cfg, f, default_flow_style=False)
+" && ok "package: ${NX_PACKAGE} escrito en ${_client_config}" \
+        || warn "No se pudo actualizar package en ${_client_config}"
+      fi
+    fi
   fi
 elif [[ -f /etc/nx_pipeline ]]; then
   ok "Pipeline ya configurado: ${BOLD}$(cat /etc/nx_pipeline)${NC}"
 else
   warn "/etc/nx_pipeline no configurado — el pipeline usará el valor de config.yaml"
-  warn "Para configurar después: echo 'people_counting,age_gender' | sudo tee /etc/nx_pipeline"
+  warn "Para configurar después: bash setup.sh --package <nombre>"
 fi
 
 # ════════════════════════════════════════════════════════════

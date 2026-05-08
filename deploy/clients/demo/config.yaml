@@ -27,37 +27,35 @@ rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_s
 # Active camera channels (DVR channel numbers, 1-indexed)
 channels: [1]
 
-# Pipeline capabilities — default for this client.
-# The active pipeline is resolved in this order (highest priority first):
-#   1. NX_PIPELINE env var  (e.g. docker compose run -e NX_PIPELINE=people_counting,age_gender)
-#   2. /etc/nx_pipeline     (written by setup.sh --package, recommended for production)
-#   3. This field           (fallback default)
+# Contracted package — defines the AI pipeline and sector automatically.
+# Set by setup.sh --package <name>, or edit manually here.
 #
-# Available capabilities:
-#   people_counting  — Always active. PeopleNet PGIE + tracker. No extra model needed.
-#   age_gender       — ResNet-18 SGIE: gender + age group per detected person.
-#                      Required by: Comercio Total / Enterprise
-#   epp_detection    — SGIE: PPE compliance (helmet, vest). Model not yet integrated.
-#                      Required by: Industrial Avanzado / Total / Enterprise
-#   fire_smoke       — Frame classifier: fire & smoke detection. Model not yet integrated.
-#                      Required by: Industrial Total / Enterprise, Hogar Total
-#   license_plate    — LPD + LPR: read vehicle plates. Model not yet integrated.
-#                      Required by: Industrial Total / Enterprise
-#   fall_detection   — Pose-based fall events. Model not yet integrated.
-#                      Required by: Hogar Avanzado / Total
+#   Package                  Pipeline capabilities                            Sector
+#   ──────────────────────── ──────────────────────────────────────────────── ──────────────
+#   comercio_basico          people_counting                                  comercio
+#   comercio_avanzado        people_counting                                  comercio
+#   comercio_total           people_counting, age_gender, face_recognition    comercio
+#   comercio_enterprise      people_counting, age_gender, face_recognition    comercio
+#   industrial_basico        people_counting                                  industrial
+#   industrial_avanzado      people_counting, epp_detection                   industrial
+#   industrial_total         people_counting, epp_detection, license_plate,   industrial
+#                              fire_smoke, face_recognition
+#   industrial_enterprise    people_counting, epp_detection, license_plate,   industrial
+#                              fire_smoke, face_recognition
+#   hogar_basico             people_counting                                  hogar
+#   hogar_avanzado           people_counting, fall_detection                  hogar
+#   hogar_total              people_counting, fall_detection, fire_smoke,     hogar
+#                              face_recognition
+#   manual                   uses pipeline + sector fields below (testing)    —
 #
-# Package → capability mapping (set automatically by setup.sh --package):
-#   comercio_basico      → people_counting
-#   comercio_avanzado    → people_counting
-#   comercio_total       → people_counting,age_gender
-#   industrial_basico    → people_counting
-#   industrial_avanzado  → people_counting,epp_detection
-#   industrial_total     → people_counting,epp_detection,license_plate,fire_smoke
-#   hogar_basico         → people_counting
-#   hogar_avanzado       → people_counting,fall_detection
-#   hogar_total          → people_counting,fall_detection,fire_smoke
-pipeline:
-  - people_counting
+# Priority: NX_PIPELINE env var > /etc/nx_pipeline > this field.
+package: comercio_basico
+
+# ── Only used when package: manual ───────────────────────────────────────────
+# pipeline:
+#   - people_counting
+#   - age_gender
+# sector: comercio
 
 # Stream type — which RTSP stream the Jetson pulls from the DVR.
 #
@@ -82,12 +80,6 @@ stream_type: main
 #   iou   — IoU matching. Simpler, no CUDA kernels. Stable with 16 streams.
 #            Loses track ID on crossing/occlusion but sufficient for people counting.
 tracker: nvdcf
-
-# Sector — vertical del cliente. Inferido de --package en setup.sh; se puede sobrescribir aquí.
-#   comercio   — tiendas, supermercados, centros comerciales
-#   industrial — fábricas, bodegas, plantas
-#   hogar      — hogares, departamentos
-sector: comercio
 
 # Cámaras de entrada/salida (subconjunto de channels).
 # Usado para calcular tiempo en tienda y conteo de visitas.

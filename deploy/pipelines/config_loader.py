@@ -8,6 +8,9 @@ Merges four sources at runtime (highest priority first):
   4. clients/<name>/config.yaml                   → non-sensitive client config
   5. clients/<name>/.env                          → DVR_USER / DVR_PASS (gitignored)
 
+Pipeline + sector are normally derived from the `package` field in config.yaml.
+Set `package: manual` to specify them explicitly (for testing or custom deployments).
+
 Usage:
     from config_loader import load_config
     cfg = load_config()
@@ -58,6 +61,24 @@ VALID_CAPABILITIES = {
     "face_recognition",  # FaceDetectIR SGIE + InsightFace ArcFace: identifies known persons
 }
 
+# Package → pipeline capabilities + sector.
+# Mirrors PACKAGE_CAPABILITIES in setup.sh. Set package: manual in config.yaml to
+# specify pipeline and sector explicitly instead of deriving them from a package.
+PACKAGE_DEFINITIONS = {
+    "comercio_basico":      {"pipeline": ["people_counting"],                                                                "sector": "comercio"},
+    "comercio_avanzado":    {"pipeline": ["people_counting"],                                                                "sector": "comercio"},
+    "comercio_total":       {"pipeline": ["people_counting", "age_gender", "face_recognition"],                              "sector": "comercio"},
+    "comercio_enterprise":  {"pipeline": ["people_counting", "age_gender", "face_recognition"],                              "sector": "comercio"},
+    "industrial_basico":    {"pipeline": ["people_counting"],                                                                "sector": "industrial"},
+    "industrial_avanzado":  {"pipeline": ["people_counting", "epp_detection"],                                               "sector": "industrial"},
+    "industrial_total":     {"pipeline": ["people_counting", "epp_detection", "license_plate", "fire_smoke", "face_recognition"], "sector": "industrial"},
+    "industrial_enterprise":{"pipeline": ["people_counting", "epp_detection", "license_plate", "fire_smoke", "face_recognition"], "sector": "industrial"},
+    "hogar_basico":         {"pipeline": ["people_counting"],                                                                "sector": "hogar"},
+    "hogar_avanzado":       {"pipeline": ["people_counting", "fall_detection"],                                              "sector": "hogar"},
+    "hogar_total":          {"pipeline": ["people_counting", "fall_detection", "fire_smoke", "face_recognition"],            "sector": "hogar"},
+    "manual":               None,  # pipeline and sector must be set explicitly in config.yaml
+}
+
 
 @dataclass
 class ClientConfig:
@@ -72,8 +93,9 @@ class ClientConfig:
     stream_width: int = 1920
     stream_height: int = 1080
     tracker: str = "nvdcf"      # "nvdcf" (precise, ≤6 streams) | "iou" (stable, 16 streams)
-    stream_type: str = "main"  # "main" (1920×1080, ≤6 cams) | "sub" (960×544, ≤16 cams)
-    sector: str = "comercio"   # "comercio" | "industrial" | "hogar"
+    stream_type: str = "main"   # "main" (1920×1080, ≤6 cams) | "sub" (960×544, ≤16 cams)
+    sector: str = "comercio"    # "comercio" | "industrial" | "hogar"
+    package: str = "manual"     # contracted package; "manual" = custom/testing
     entry_exit_channels: List[int] = field(default_factory=list)
 
     def tracker_config_path(self) -> str:
@@ -101,6 +123,8 @@ class ClientConfig:
 
     def log_summary(self):
         logger.info("Client     : %s", self.client_name)
+        logger.info("Package    : %s", self.package)
+        logger.info("Sector     : %s", self.sector)
         logger.info("DVR        : %s:%d", self.dvr_ip, self.dvr_port)
         logger.info("Channels   : %s", self.channels)
         logger.info("Pipeline(s): %s", self.pipeline)
@@ -147,14 +171,6 @@ def load_config() -> ClientConfig:
     client_name = _read_etc_file("/etc/nx_client", "NX_CLIENT", "Client name")
     dvr_ip      = _read_etc_file("/etc/nx_dvr_ip", "NX_DVR_IP", "DVR IP")
 
-    # Sector resolution: /etc/nx_sector (written by setup.sh) > NX_SECTOR env > config.yaml
-    raw_sector = os.environ.get("NX_SECTOR", "").strip()
-    if not raw_sector:
-        try:
-            raw_sector = Path("/etc/nx_sector").read_text().strip()
-        except FileNotFoundError:
-            raw_sector = ""  # fallback to config.yaml value below
-
     client_dir = _REPO_ROOT / "clients" / client_name
     config_path = client_dir / "config.yaml"
     env_path    = client_dir / ".env"
@@ -179,10 +195,21 @@ def load_config() -> ClientConfig:
             f"Copy {client_dir}/.env.example to {client_dir}/.env and fill in the values."
         )
 
-    # Pipeline resolution order:
-    #   1. NX_PIPELINE env var  (e.g. docker compose run -e NX_PIPELINE=people_counting,age_gender)
-    #   2. /etc/nx_pipeline     (written by setup.sh --package)
-    #   3. config.yaml pipeline field (client default)
+    # ── Package resolution ────────────────────────────────────────────────────
+    # Reads the contracted package from config.yaml and derives pipeline + sector.
+    # "manual" skips derivation — pipeline and sector must be set explicitly.
+    package = str(cfg.get("package", "manual")).strip()
+    if package not in PACKAGE_DEFINITIONS:
+        raise RuntimeError(
+            f"Unknown package '{package}' in config.yaml.\n"
+            f"Valid options: {sorted(PACKAGE_DEFINITIONS)}"
+        )
+
+    # ── Pipeline resolution order ─────────────────────────────────────────────
+    #   1. NX_PIPELINE env var  (docker compose run -e NX_PIPELINE=... for one-off overrides)
+    #   2. /etc/nx_pipeline     (written by setup.sh --package, used in production)
+    #   3. package field        (derives pipeline from contracted package — recommended)
+    #   4. pipeline field       (explicit list, only used when package: manual)
     raw_pipeline = os.environ.get("NX_PIPELINE", "").strip()
     if raw_pipeline:
         pipeline = [c.strip() for c in raw_pipeline.split(",") if c.strip()]
@@ -193,10 +220,15 @@ def load_config() -> ClientConfig:
             pipeline = [c.strip() for c in file_val.split(",") if c.strip()]
             logger.debug("Pipeline from /etc/nx_pipeline: %s", pipeline)
         except FileNotFoundError:
-            pipeline = cfg.get("pipeline", ["people_counting"])
-            if isinstance(pipeline, str):
-                pipeline = [p.strip() for p in pipeline.split(",") if p.strip()]
-            logger.debug("Pipeline from config.yaml: %s", pipeline)
+            if package != "manual":
+                pipeline = list(PACKAGE_DEFINITIONS[package]["pipeline"])
+                logger.debug("Pipeline from package '%s': %s", package, pipeline)
+            else:
+                raw = cfg.get("pipeline", ["people_counting"])
+                if isinstance(raw, str):
+                    raw = [p.strip() for p in raw.split(",") if p.strip()]
+                pipeline = raw
+                logger.debug("Pipeline from config.yaml (manual): %s", pipeline)
 
     if "people_counting" not in pipeline:
         pipeline = ["people_counting"] + pipeline
@@ -208,7 +240,23 @@ def load_config() -> ClientConfig:
             f"Valid options: {sorted(VALID_CAPABILITIES)}"
         )
 
-    sector = raw_sector or cfg.get("sector", "comercio")
+    # ── Sector resolution order ───────────────────────────────────────────────
+    #   1. NX_SECTOR env var  /  /etc/nx_sector  (written by setup.sh --package)
+    #   2. package field (derives sector automatically)
+    #   3. sector field in config.yaml (only when package: manual)
+    raw_sector = os.environ.get("NX_SECTOR", "").strip()
+    if not raw_sector:
+        try:
+            raw_sector = Path("/etc/nx_sector").read_text().strip()
+        except FileNotFoundError:
+            raw_sector = ""
+
+    if raw_sector:
+        sector = raw_sector
+    elif package != "manual":
+        sector = PACKAGE_DEFINITIONS[package]["sector"]
+    else:
+        sector = cfg.get("sector", "comercio")
 
     entry_exit_channels = cfg.get("entry_exit_channels", [])
     if isinstance(entry_exit_channels, str):
@@ -238,6 +286,7 @@ def load_config() -> ClientConfig:
         tracker=cfg.get("tracker", "nvdcf"),
         stream_type=stream_type,
         sector=sector,
+        package=package,
         entry_exit_channels=entry_exit_channels,
     )
     _warn_decoder_load(config)
