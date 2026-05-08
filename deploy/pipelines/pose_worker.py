@@ -130,7 +130,7 @@ class PoseWorker:
                 logger.error("MoveNet model not found: %s", path)
                 logger.error("Run: python tools/download_models.py --fall-detection")
                 return None
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            providers = ["CPUExecutionProvider"]
             sess = ort.InferenceSession(str(path), providers=providers)
             logger.info("MoveNet loaded (%s)", sess.get_providers()[0])
             return sess
