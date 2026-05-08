@@ -58,7 +58,7 @@ class PoseWorker:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._session = None
+        self._session = self._load_model()
 
     def start(self):
         self._running = True
@@ -96,7 +96,6 @@ class PoseWorker:
     # ── Worker thread ─────────────────────────────────────────────────────────
 
     def _worker_loop(self):
-        self._session = self._load_model()
         if self._session is None:
             logger.error("PoseWorker: failed to load model — worker inactive.")
             return

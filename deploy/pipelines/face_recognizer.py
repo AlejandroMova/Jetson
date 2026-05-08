@@ -40,8 +40,8 @@ class FaceRecognizer:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._app = None
-        self._db: Dict[str, List[np.ndarray]] = {}
+        self._app = self._load_model()
+        self._db = self._load_db()
 
     def start(self):
         self._running = True
@@ -72,8 +72,6 @@ class FaceRecognizer:
     # ── Worker thread ─────────────────────────────────────────────────────────
 
     def _worker_loop(self):
-        self._app = self._load_model()
-        self._db = self._load_db()
         if self._app is None:
             logger.error("FaceRecognizer: failed to load InsightFace — worker inactive.")
             return

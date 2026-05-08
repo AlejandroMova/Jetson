@@ -49,7 +49,7 @@ class AppearanceWorker:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._session = None
+        self._session = self._load_model()
 
     def start(self) -> None:
         self._running = True
@@ -79,7 +79,6 @@ class AppearanceWorker:
     # ── Worker ────────────────────────────────────────────────────────────────
 
     def _worker_loop(self) -> None:
-        self._session = self._load_model()
         if self._session is None:
             logger.error("AppearanceWorker: ONNX model failed to load — worker inactive.")
             return
