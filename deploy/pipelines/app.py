@@ -63,18 +63,18 @@ def _validate_pipeline_models(pipeline: list) -> None:
         if not p.exists():
             missing.append((cap, cfg_path, "config_infer.txt not found"))
             continue
-        # Also verify the ONNX file referenced inside the config exists.
+        # Also verify the model file referenced inside the config exists.
         # Without this check the error only surfaces much later when DeepStream
         # tries to build the TRT engine — after GStreamer is already initialised.
         try:
             for line in p.read_text().splitlines():
                 stripped = line.strip()
-                if stripped.startswith("onnx-file="):
-                    onnx_name = stripped.split("=", 1)[1].strip()
-                    onnx_path = p.parent / onnx_name
-                    if not onnx_path.exists():
-                        missing.append((cap, str(onnx_path),
-                                        "ONNX model not found — download it first"))
+                if stripped.startswith("onnx-file=") or stripped.startswith("tlt-encoded-model="):
+                    model_name = stripped.split("=", 1)[1].strip()
+                    model_path = p.parent / model_name
+                    if not model_path.exists():
+                        missing.append((cap, str(model_path),
+                                        "model file not found — download it first"))
                     break
         except OSError:
             pass

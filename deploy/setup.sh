@@ -497,8 +497,8 @@ _download_models() {
 
   # ── FaceDetectIR (face_recognition) — requiere NGC API Key ──
   if echo "$pipeline" | grep -q "face_recognition"; then
-    FACE_ONNX="${WORK_DIR}/models/facedetect_ir/resnet18_facedetectir_pruned_quantized.onnx"
-    if [[ -f "$FACE_ONNX" ]]; then
+    FACE_ETLT="${WORK_DIR}/models/facedetect_ir/resnet18_facedetectir_pruned.etlt"
+    if [[ -f "$FACE_ETLT" ]]; then
       ok "FaceDetectIR ya descargado — skip"
     else
       # Leer o solicitar NGC API Key
@@ -524,14 +524,14 @@ _download_models() {
 
       log "Descargando FaceDetectIR desde NGC..."
       mkdir -p "${WORK_DIR}/models/facedetect_ir"
-      NGC_URL="https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir/versions/pruned_quantized_v2.0/files/resnet18_facedetectir_pruned_quantized.onnx"
+      NGC_URL="https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir/versions/pruned_v1.0.1/files/resnet18_facedetectir_pruned.etlt"
       if wget -q --show-progress \
               --header="Authorization: ApiKey ${NGC_API_KEY}" \
-              -O "$FACE_ONNX" \
+              -O "$FACE_ETLT" \
               "$NGC_URL"; then
-        ok "FaceDetectIR descargado: ${FACE_ONNX}"
+        ok "FaceDetectIR descargado: ${FACE_ETLT}"
       else
-        rm -f "$FACE_ONNX"
+        rm -f "$FACE_ETLT"
         warn "Fallo al descargar FaceDetectIR desde NGC."
         warn "Verifica tu API Key o descarga manualmente desde:"
         warn "  https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tao/models/facedetectir"

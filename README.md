@@ -226,8 +226,8 @@ NGC_API_KEY=<your-key> docker compose run --rm deepstream \
 # Or manually with wget:
 NGC_API_KEY=<your-key>
 wget --header="Authorization: ApiKey ${NGC_API_KEY}" \
-  -O deploy/models/facedetect_ir/resnet18_facedetectir_pruned_quantized.onnx \
-  "https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir/versions/pruned_quantized_v2.0/files/resnet18_facedetectir_pruned_quantized.onnx"
+  -O deploy/models/facedetect_ir/resnet18_facedetectir_pruned.etlt \
+  "https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir/versions/pruned_v1.0.1/files/resnet18_facedetectir_pruned.etlt"
 ```
 
 ### Adding a new model

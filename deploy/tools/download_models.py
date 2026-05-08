@@ -116,12 +116,12 @@ def download_movenet(dest_dir: Path):
 
 def download_facedetectir(dest_dir: Path, ngc_key: str):
     """
-    FaceDetectIR — ResNet-18 pruned+quantized ONNX from NVIDIA NGC.
+    FaceDetectIR — ResNet-18 pruned ETLT from NVIDIA NGC.
     Input: 3×136×240 (BGR). Used as secondary GIE for face detection on person crops.
-    Source: nvidia/tao/facedetectir, version pruned_quantized_v2.0 (NGC, requires API key).
+    Source: nvidia/tao/facedetectir, version pruned_v1.0.1 (NGC, requires API key).
     Get a free key at https://ngc.nvidia.com/setup/api-key
     """
-    dest = dest_dir / "facedetect_ir" / "resnet18_facedetectir_pruned_quantized.onnx"
+    dest = dest_dir / "facedetect_ir" / "resnet18_facedetectir_pruned.etlt"
     if dest.exists():
         logger.info("FaceDetectIR already exists — skipping.")
         return
@@ -135,7 +135,7 @@ def download_facedetectir(dest_dir: Path, ngc_key: str):
 
     url = (
         "https://api.ngc.nvidia.com/v2/models/nvidia/tao/facedetectir"
-        "/versions/pruned_quantized_v2.0/files/resnet18_facedetectir_pruned_quantized.onnx"
+        "/versions/pruned_v1.0.1/files/resnet18_facedetectir_pruned.etlt"
     )
     dest.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Downloading FaceDetectIR from NGC...")
