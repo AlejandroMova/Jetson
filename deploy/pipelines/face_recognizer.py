@@ -40,10 +40,11 @@ class FaceRecognizer:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._app = self._load_model()
+        self._app = None   # loaded in start(), after TRT initializes its CUDA context
         self._db = self._load_db()
 
     def start(self):
+        self._app = self._load_model()  # must run after pipeline.set_state(PLAYING)
         self._running = True
         self._thread = threading.Thread(
             target=self._worker_loop, daemon=True, name="face-recognizer"

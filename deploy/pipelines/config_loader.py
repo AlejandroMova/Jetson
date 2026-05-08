@@ -202,7 +202,7 @@ def load_config() -> ClientConfig:
     if isinstance(entry_exit_channels, str):
         entry_exit_channels = [int(x.strip()) for x in entry_exit_channels.split(",") if x.strip()]
 
-    return ClientConfig(
+    config = ClientConfig(
         client_name=client_name,
         dvr_ip=dvr_ip,
         dvr_port=int(cfg.get("dvr_port", 554)),
@@ -220,3 +220,30 @@ def load_config() -> ClientConfig:
         sector=sector,
         entry_exit_channels=entry_exit_channels,
     )
+    _warn_decoder_load(config)
+    return config
+
+
+# Jetson Orin Nano: 1 NVDEC engine rated at 8× 1080p30 H.264.
+# Beyond 2× that limit (~16× 1080p30), expect cudaErrorIllegalAddress crashes.
+_NVDEC_SAFE_MPIX  = 8  * 1920 * 1080   # 8× 1080p — rated capacity
+_NVDEC_HARD_MPIX  = 16 * 1920 * 1080   # 16× 1080p — known crash threshold
+
+
+def _warn_decoder_load(cfg: "ClientConfig") -> None:
+    total = len(cfg.channels) * cfg.stream_width * cfg.stream_height
+    if total > _NVDEC_HARD_MPIX:
+        logger.error(
+            "NVDEC OVERLOAD: %d streams × %dx%d = %.1f× the Orin Nano decoder capacity. "
+            "Expect cudaErrorIllegalAddress crashes. "
+            "Use sub-streams (subtype=1, 960×544) or distribute across multiple Jetsons.",
+            len(cfg.channels), cfg.stream_width, cfg.stream_height,
+            total / _NVDEC_SAFE_MPIX,
+        )
+    elif total > _NVDEC_SAFE_MPIX:
+        logger.warning(
+            "NVDEC near capacity: %d streams × %dx%d = %.1f× the Orin Nano rated load. "
+            "Monitor for instability; use sub-streams (subtype=1) if crashes occur.",
+            len(cfg.channels), cfg.stream_width, cfg.stream_height,
+            total / _NVDEC_SAFE_MPIX,
+        )
