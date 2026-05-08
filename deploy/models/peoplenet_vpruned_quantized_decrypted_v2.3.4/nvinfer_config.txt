@@ -9,12 +9,13 @@ labelfile-path=labels.txt
 
 # Dimensiones estándar para PeopleNet
 infer-dims=3;544;960
-batch-size=16
+batch-size=1
 process-mode=1
 model-color-format=0
 
-# 0=FP32, 1=INT8, 2=FP16 (Usamos 0 para máxima compatibilidad ahora)
-network-mode=2
+# 0=FP32, 1=INT8, 2=FP16
+int8-calib-file=resnet34_peoplenet_int8.txt
+network-mode=1
 num-detected-classes=3
 interval=2
 gie-unique-id=1
