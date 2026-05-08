@@ -10,24 +10,22 @@ dvr_port: 554
 #   {port}      → dvr_port above
 #   {ch:02d}    → zero-padded channel number (01, 03, 05, ...)
 #
-# Confirm the exact path format with your DVR model before deploying.
-# Common variants:
-#   Hikvision main   : rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}01
-#   Hikvision sub    : rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}02
-#   Dahua main       : rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=0
-#   Dahua substream  : rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=1
-#   Generic          : rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream
+# identify_dvr.py sets this automatically. Common variants by brand:
+#
+#   Brand                   Main stream                                      Sub-stream (stream_type: sub)
+#   ─────────────────────── ──────────────────────────────────────────────── ──────────────────────────────────────────────────
+#   Generic/QSee/Swann/Annke  .../ch{ch:02d}/main/av_stream                   .../ch{ch:02d}/sub/av_stream
+#   Hikvision               .../Streaming/Channels/{ch:02d}01               .../Streaming/Channels/{ch:02d}02
+#   Dahua/Amcrest/Lorex     .../cam/realmonitor?channel={ch}&subtype=0      .../cam/realmonitor?channel={ch}&subtype=1
+#   Reolink                 .../h264Preview_{ch:02d}_main                   .../h264Preview_{ch:02d}_sub
+#   Uniview/Unv             .../media/video{ch}                             .../unicast/c{ch}/s1/live  (firmware-dependent)
+#   Generic h264            .../h264/ch{ch:02d}/main/av_stream              .../h264/ch{ch:02d}/sub/av_stream
+#   Generic live            .../live/ch{ch:02d}                             .../live/ch{ch:02d}_1
+#   Axis / Hanwha-Samsung   Sub-stream path is device-specific — set manually after checking DVR web UI.
 rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream"
 
 # Active camera channels (DVR channel numbers, 1-indexed)
 channels: [1]
-
-# Resolution fed to nvstreammux (and thus to inference).
-# For main stream (1 camera, max detail):     1920x1080
-# For substream (multi-camera, 16 ch):        960x544
-# The MJPEG output resolution matches this value.
-stream_width: 1920
-stream_height: 1080
 
 # Pipeline capabilities — default for this client.
 # The active pipeline is resolved in this order (highest priority first):
@@ -67,10 +65,9 @@ pipeline:
 #          Use for ≤6 cameras on a single Jetson Orin Nano.
 #
 #   sub  — DVR sub-stream (960×544). Required for 16-camera deployments.
-#          IMPORTANT: also update rtsp_url_pattern to point to the sub-stream path:
-#            Dahua:      .../cam/realmonitor?channel={ch}&subtype=1
-#            Hikvision:  .../Streaming/Channels/{ch:02d}02
-#            Generic:    .../ch{ch:02d}/sub/av_stream
+#          Run: setup.sh --stream-type sub  OR  identify_dvr.py --stream-type sub --update-config
+#          This sets rtsp_url_pattern to the correct sub-stream path automatically.
+#          For Axis and Hanwha/Samsung the path is device-specific — set manually.
 #
 #          Accuracy impact: PeopleNet natively targets 960×544 — zero detection loss.
 #          SGIEs (age/gender, face) see smaller crops; people far from camera may be

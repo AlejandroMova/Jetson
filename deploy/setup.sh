@@ -13,10 +13,11 @@
 #                 Opciones: comercio_basico | comercio_avanzado | comercio_total |
 #                           industrial_basico | industrial_avanzado | industrial_total |
 #                           hogar_basico | hogar_avanzado | hogar_total
-#    --compose    Nombre del archivo compose (default: docker-compose.yml)
-#    --hostname   Nombre visible en Tailscale (default: hostname actual)
-#    --no-vnc     Omite la instalación de VNC
-#    --no-docker  Omite docker compose
+#    --compose     Nombre del archivo compose (default: docker-compose.yml)
+#    --hostname    Nombre visible en Tailscale (default: hostname actual)
+#    --stream-type Tipo de stream RTSP: main (1080p, default) | sub (960×544, 16+ cámaras)
+#    --no-vnc      Omite la instalación de VNC
+#    --no-docker   Omite docker compose
 #
 #  Prerequisito:
 #    Clonar el repo manualmente antes de correr este script:
@@ -43,6 +44,7 @@ SKIP_VNC=false
 SKIP_DOCKER=false
 NX_CLIENT=""
 NX_PACKAGE=""
+NX_STREAM_TYPE="main"
 
 # Mapeo paquete → capabilities (comma-separated, written to /etc/nx_pipeline)
 declare -A PACKAGE_CAPABILITIES=(
@@ -75,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --package)             NX_PACKAGE="$2";           shift 2 ;;
     --api-key)             NX_API_KEY="$2";           shift 2 ;;
     --entry-exit-channels) ENTRY_EXIT_CHANNELS="$2";  shift 2 ;;
+    --stream-type)         NX_STREAM_TYPE="$2";       shift 2 ;;
     --no-vnc)              SKIP_VNC=true;             shift ;;
     --no-docker)           SKIP_DOCKER=true;          shift ;;
     *) die "Flag desconocido: $1" ;;
@@ -565,8 +568,7 @@ if [[ "$SKIP_DOCKER" == false ]]; then
         cat > "${CLIENT_DIR}/config.yaml" << CFGEOF
 dvr_port: 554
 rtsp_url_pattern: ""
-stream_width: 1920
-stream_height: 1080
+stream_type: main
 channels: []
 CFGEOF
         ok "config.yaml inicial creado en ${CLIENT_DIR}/"
@@ -574,11 +576,11 @@ CFGEOF
 
       log "Identificando marca/patrón del DVR..."
       if $COMPOSE_CMD -f "$COMPOSE_FILE" run --rm deepstream \
-          python3 tools/identify_dvr.py --update-config; then
-        ok "Patrón de URL del DVR identificado y config.yaml actualizado"
+          python3 tools/identify_dvr.py --update-config --stream-type "$NX_STREAM_TYPE"; then
+        ok "Patrón de URL del DVR identificado y config.yaml actualizado (stream-type: ${NX_STREAM_TYPE})"
       else
         warn "No se pudo identificar el patrón de URL del DVR (IP sí encontrada: ${DVR_IP})."
-        warn "Corre manualmente: docker compose run --rm deepstream python3 tools/identify_dvr.py --update-config"
+        warn "Corre manualmente: docker compose run --rm deepstream python3 tools/identify_dvr.py --update-config --stream-type ${NX_STREAM_TYPE}"
       fi
 
       log "Detectando canales activos..."

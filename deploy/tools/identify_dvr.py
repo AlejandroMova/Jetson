@@ -12,6 +12,7 @@ Usage (run inside the Docker container on the Jetson):
     python3 tools/identify_dvr.py
     python3 tools/identify_dvr.py --client demo
     python3 tools/identify_dvr.py --dvr-ip 192.168.10.68
+    python3 tools/identify_dvr.py --stream-type sub --update-config
 """
 
 import argparse
@@ -33,38 +34,69 @@ TIMEOUT   = 5   # seconds per pattern attempt
 # ── Known RTSP URL patterns (most common first) ───────────────────────────────
 # {ch}     = channel number as-is  (1, 2, 3 ...)
 # {ch:02d} = zero-padded           (01, 02, 03 ...)
+#
+# Detection always probes the "main" pattern (more reliable).
+# Once the brand is identified, "sub" is used when --stream-type sub is set.
+# sub=None means the sub-stream path is device-specific; operator must set it manually.
 
 PATTERNS = [
-    # Name,                          Pattern
-    ("Generic / QSee / Swann / Annke",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream"),
-
-    ("Hikvision",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}01"),
-
-    ("Dahua / Amcrest / Lorex",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=0"),
-
-    ("Reolink",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/h264Preview_{ch:02d}_main"),
-
-    ("Uniview / Unv",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/media/video{ch}"),
-
-    ("Axis",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/axis-media/media.amp?videocodec=h264&camera={ch}"),
-
-    ("Hanwha / Samsung",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/profile{ch}/media.smp"),
-
-    ("Generic variant — h264 path",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/h264/ch{ch:02d}/main/av_stream"),
-
-    ("Generic variant — live path",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/live/ch{ch:02d}"),
-
-    ("Generic variant — stream path",
-     "rtsp://{user}:{password}@{dvr_ip}:{port}/stream{ch}"),
+    {
+        "name": "Generic / QSee / Swann / Annke",
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream",
+        "sub":  "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/sub/av_stream",
+    },
+    {
+        "name": "Hikvision",
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}01",
+        "sub":  "rtsp://{user}:{password}@{dvr_ip}:{port}/Streaming/Channels/{ch:02d}02",
+    },
+    {
+        "name": "Dahua / Amcrest / Lorex",
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=0",
+        "sub":  "rtsp://{user}:{password}@{dvr_ip}:{port}/cam/realmonitor?channel={ch}&subtype=1",
+    },
+    {
+        "name": "Reolink",
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/h264Preview_{ch:02d}_main",
+        "sub":  "rtsp://{user}:{password}@{dvr_ip}:{port}/h264Preview_{ch:02d}_sub",
+    },
+    {
+        "name": "Uniview / Unv",
+        # Detection via /media/video{ch} (legacy firmware).
+        # Sub-stream uses the newer unicast path; may need manual verification.
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/media/video{ch}",
+        "sub":  "rtsp://{user}:{password}@{dvr_ip}:{port}/unicast/c{ch}/s1/live",
+    },
+    {
+        "name": "Axis",
+        # Axis sub-stream requires named stream profiles configured in the camera web UI.
+        # No universal path exists — must be set manually.
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/axis-media/media.amp?videocodec=h264&camera={ch}",
+        "sub":  None,
+    },
+    {
+        "name": "Hanwha / Samsung",
+        # Hanwha profile numbers are device-dependent (profile1=main, profile2=sub is common
+        # but not guaranteed). Verify in the device web UI before deploying.
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/profile{ch}/media.smp",
+        "sub":  None,
+    },
+    {
+        "name": "Generic variant — h264 path",
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/h264/ch{ch:02d}/main/av_stream",
+        "sub":  "rtsp://{user}:{password}@{dvr_ip}:{port}/h264/ch{ch:02d}/sub/av_stream",
+    },
+    {
+        "name": "Generic variant — live path",
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/live/ch{ch:02d}",
+        "sub":  "rtsp://{user}:{password}@{dvr_ip}:{port}/live/ch{ch:02d}_1",
+    },
+    {
+        "name": "Generic variant — stream path",
+        # No known sub-stream convention for this format.
+        "main": "rtsp://{user}:{password}@{dvr_ip}:{port}/stream{ch}",
+        "sub":  None,
+    },
 ]
 
 
@@ -269,6 +301,8 @@ def main():
     ap.add_argument("--dvr-ip",        default=None, help="Override DVR IP")
     ap.add_argument("--port",          type=int, default=None, help="Override DVR port (default: 554)")
     ap.add_argument("--update-config", action="store_true", help="Write detected values directly into config.yaml")
+    ap.add_argument("--stream-type",   choices=["main", "sub"], default="main",
+                    help="Stream type to configure: main (1920×1080, default) or sub (960×544, for 16+ cameras)")
     args = ap.parse_args()
 
     # Resolve client
@@ -289,23 +323,26 @@ def main():
     if args.port:
         dvr_port = args.port
 
-    print(f"\n  Client  : {client_name}")
-    print(f"  DVR     : {dvr_ip}:{dvr_port}")
+    stream_type = args.stream_type
+
+    print(f"\n  Client      : {client_name}")
+    print(f"  DVR         : {dvr_ip}:{dvr_port}")
+    print(f"  Stream type : {stream_type}")
     print(f"  Trying {len(PATTERNS)} known URL patterns on channel 1…\n")
 
-    working_pattern  = None
-    working_url      = None
-    auth_failed      = False
+    working_entry = None
+    working_url   = None
+    auth_failed   = False
 
-    for name, pattern in PATTERNS:
-        result, url = _probe_pattern(pattern, dvr_ip, dvr_port, user, password)
+    for entry in PATTERNS:
+        result, url = _probe_pattern(entry["main"], dvr_ip, dvr_port, user, password)
         masked = url.replace(password, "***") if password else url
 
         if result is True:
-            print(f"  ✓  {name}")
+            print(f"  ✓  {entry['name']}")
             print(f"     {masked}")
-            working_pattern = pattern
-            working_url     = url
+            working_entry = entry
+            working_url   = url
             break
         elif result is None:
             print(f"  ✗  Auth error on: {masked}")
@@ -313,21 +350,39 @@ def main():
             auth_failed = True
             break
         else:
-            print(f"  —  {name}")
+            print(f"  —  {entry['name']}")
 
-    if auth_failed or not working_pattern:
+    if auth_failed or not working_entry:
         if not auth_failed:
             print("\n[WARN] No known pattern worked.")
             print("       Check DVR brand/model and add its pattern manually to config.yaml.")
             print("       Or try with VLC: Media → Open Network Stream → test URLs above.")
         sys.exit(1)
 
-    # ── Detect resolution ─────────────────────────────────────────────────────
-    print("\n  Detecting stream resolution via gst-discoverer-1.0…")
-    resolution = _get_resolution(working_url)
+    # ── Select main or sub pattern ────────────────────────────────────────────
+    sub_unknown = False
+    if stream_type == "sub":
+        if working_entry["sub"] is not None:
+            chosen_pattern = working_entry["sub"]
+        else:
+            # Sub-stream path unknown for this brand — fall back to main with warning
+            chosen_pattern = working_entry["main"]
+            sub_unknown    = True
+    else:
+        chosen_pattern = working_entry["main"]
 
-    width, height = resolution if resolution else (1920, 1080)
-    res_note = "" if resolution else "  (gst-discoverer not available — defaulting to 1920x1080, verify manually)"
+    # ── Detect resolution from main stream ────────────────────────────────────
+    print("\n  Detecting stream resolution via gst-discoverer-1.0…")
+    resolution = _get_resolution(working_url)  # always connect to main for reliability
+
+    detected_width, detected_height = resolution if resolution else (1920, 1080)
+    res_note = "" if resolution else "  (gst-discoverer not available — defaulting to 1920x1080)"
+
+    # For sub-stream, use 960×544 regardless of what the main stream reports
+    if stream_type == "sub":
+        width, height = 960, 544
+    else:
+        width, height = detected_width, detected_height
 
     # ── Write or print result ─────────────────────────────────────────────────
     if args.update_config:
@@ -338,22 +393,37 @@ def main():
             with open(cfg_path) as f:
                 cfg = yaml.safe_load(f) or {}
         cfg["dvr_port"]         = dvr_port
-        cfg["rtsp_url_pattern"] = working_pattern
+        cfg["rtsp_url_pattern"] = chosen_pattern
+        cfg["stream_type"]      = stream_type
         cfg["stream_width"]     = width
         cfg["stream_height"]    = height
         with open(cfg_path, "w") as f:
             yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
         print(f"\n  ✓  config.yaml updated: {cfg_path}")
         if res_note:
-            print(f"  {res_note.strip()}")
+            print(f"     {res_note.strip()}")
+        print(f"     stream_type : {stream_type}  ({width}×{height})")
+        if sub_unknown:
+            print(f"\n  [WARN] Sub-stream path not known for {working_entry['name']}.")
+            print(f"         rtsp_url_pattern was set to the main stream URL.")
+            print(f"         Update it manually in {cfg_path}")
+            print(f"         Consult your DVR's web interface for the sub-stream RTSP path.")
     else:
+        masked_pattern = chosen_pattern.replace(password, "***") if password else chosen_pattern
         print(f"\n{'─'*55}")
         print(f"  DVR identified. Paste this into clients/{client_name}/config.yaml:")
         print(f"{'─'*55}\n")
         print(f"  dvr_port: {dvr_port}")
-        print(f"  rtsp_url_pattern: \"{working_pattern}\"")
+        print(f"  rtsp_url_pattern: \"{masked_pattern}\"")
+        print(f"  stream_type: {stream_type}")
         print(f"  stream_width: {width}")
-        print(f"  stream_height: {height}{res_note}")
+        print(f"  stream_height: {height}")
+        if res_note:
+            print(f"  {res_note.strip()}")
+        if sub_unknown:
+            print(f"\n  [WARN] Sub-stream path not known for {working_entry['name']}.")
+            print(f"         rtsp_url_pattern above is the main stream URL.")
+            print(f"         Update it manually after checking your DVR's web interface.")
         print(f"\n{'─'*55}")
 
     print("\n  Next: run probe_cameras.py --update-config to discover active channels.")
