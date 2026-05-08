@@ -35,6 +35,17 @@ TRACKER_CONFIGS = {
     "iou":   "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml",
 }
 
+# Stream type → default resolution fed to nvstreammux.
+# "main" — full-resolution main stream (1920×1080). OK for ≤6 cameras on Orin Nano.
+# "sub"  — DVR sub-stream (960×544). Required for 16-camera deployments; also update
+#           rtsp_url_pattern (subtype=1 for Dahua, Channels/{ch:02d}02 for Hikvision).
+#           PeopleNet natively targets 960×544 — zero accuracy loss on detection.
+#           SGIEs/workers see smaller crops; distant people may fall below min-size filters.
+STREAM_TYPES = {
+    "main": {"width": 1920, "height": 1080},
+    "sub":  {"width": 960,  "height": 544},
+}
+
 # All known pipeline capabilities. Each capability beyond people_counting maps to a SGIE.
 # Model files must exist before a capability can be activated (validated at startup).
 VALID_CAPABILITIES = {
@@ -60,8 +71,9 @@ class ClientConfig:
     pipeline: List[str]
     stream_width: int = 1920
     stream_height: int = 1080
-    tracker: str = "nvdcf"  # "nvdcf" (precise, ≤6 streams) | "iou" (stable, 16 streams)
-    sector: str = "comercio"  # "comercio" | "industrial" | "hogar"
+    tracker: str = "nvdcf"      # "nvdcf" (precise, ≤6 streams) | "iou" (stable, 16 streams)
+    stream_type: str = "main"  # "main" (1920×1080, ≤6 cams) | "sub" (960×544, ≤16 cams)
+    sector: str = "comercio"   # "comercio" | "industrial" | "hogar"
     entry_exit_channels: List[int] = field(default_factory=list)
 
     def tracker_config_path(self) -> str:
@@ -92,7 +104,7 @@ class ClientConfig:
         logger.info("DVR        : %s:%d", self.dvr_ip, self.dvr_port)
         logger.info("Channels   : %s", self.channels)
         logger.info("Pipeline(s): %s", self.pipeline)
-        logger.info("Resolution : %dx%d", self.stream_width, self.stream_height)
+        logger.info("Resolution : %dx%d (%s)", self.stream_width, self.stream_height, self.stream_type)
         logger.info("Tracker    : %s", self.tracker)
         for url in self.rtsp_urls():
             masked = url.replace(self.dvr_pass, "***") if self.dvr_pass else url
@@ -202,6 +214,13 @@ def load_config() -> ClientConfig:
     if isinstance(entry_exit_channels, str):
         entry_exit_channels = [int(x.strip()) for x in entry_exit_channels.split(",") if x.strip()]
 
+    stream_type = cfg.get("stream_type", "main")
+    if stream_type not in STREAM_TYPES:
+        raise RuntimeError(
+            f"Unknown stream_type '{stream_type}'. Valid options: {list(STREAM_TYPES)}"
+        )
+    _res = STREAM_TYPES[stream_type]
+
     config = ClientConfig(
         client_name=client_name,
         dvr_ip=dvr_ip,
@@ -214,9 +233,10 @@ def load_config() -> ClientConfig:
         ),
         channels=cfg.get("channels", [1]),
         pipeline=pipeline,
-        stream_width=int(cfg.get("stream_width", 1920)),
-        stream_height=int(cfg.get("stream_height", 1080)),
+        stream_width=int(cfg.get("stream_width", _res["width"])),
+        stream_height=int(cfg.get("stream_height", _res["height"])),
         tracker=cfg.get("tracker", "nvdcf"),
+        stream_type=stream_type,
         sector=sector,
         entry_exit_channels=entry_exit_channels,
     )
@@ -236,14 +256,15 @@ def _warn_decoder_load(cfg: "ClientConfig") -> None:
         logger.error(
             "NVDEC OVERLOAD: %d streams × %dx%d = %.1f× the Orin Nano decoder capacity. "
             "Expect cudaErrorIllegalAddress crashes. "
-            "Use sub-streams (subtype=1, 960×544) or distribute across multiple Jetsons.",
+            "Set stream_type: sub in config.yaml (960×544, also update rtsp_url_pattern) "
+            "or distribute across multiple Jetsons.",
             len(cfg.channels), cfg.stream_width, cfg.stream_height,
             total / _NVDEC_SAFE_MPIX,
         )
     elif total > _NVDEC_SAFE_MPIX:
         logger.warning(
             "NVDEC near capacity: %d streams × %dx%d = %.1f× the Orin Nano rated load. "
-            "Monitor for instability; use sub-streams (subtype=1) if crashes occur.",
+            "Set stream_type: sub in config.yaml if crashes occur.",
             len(cfg.channels), cfg.stream_width, cfg.stream_height,
             total / _NVDEC_SAFE_MPIX,
         )
