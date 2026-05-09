@@ -98,9 +98,9 @@ class FaceRecognizer:
             app = FaceAnalysis(
                 name="buffalo_l",
                 root=self._model_root,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+                providers=["CPUExecutionProvider"],
             )
-            app.prepare(ctx_id=0, det_size=(160, 160))
+            app.prepare(ctx_id=-1, det_size=(160, 160))
             logger.info("InsightFace buffalo_l loaded.")
             return app
         except Exception as e:
