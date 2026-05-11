@@ -9,7 +9,7 @@ labelfile-path=labels.txt
 
 # Dimensiones estándar para PeopleNet
 infer-dims=3;544;960
-batch-size=1
+batch-size=16
 process-mode=1
 model-color-format=0
 
