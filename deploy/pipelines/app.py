@@ -402,8 +402,12 @@ def main():
             logger.warning("GStreamer WARNING: %s — %s", err, dbg)
         elif t == Gst.MessageType.ERROR:
             err, dbg = message.parse_error()
-            logger.error("GStreamer ERROR: %s — %s", err, dbg)
-            loop.quit()
+            src_name = message.src.get_name() if message.src else ""
+            if src_name.startswith("source-"):
+                logger.warning("RTSP '%s' failed: %s — pipeline continues.", src_name, err)
+            else:
+                logger.error("GStreamer ERROR: %s — %s", err, dbg)
+                loop.quit()
 
     bus.connect("message", _on_bus_message)
 
