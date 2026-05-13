@@ -115,9 +115,6 @@ FACE_SAMPLE_INTERVAL: int  = 30   # frames between recognition attempts per trac
 # ── Analytics ─────────────────────────────────────────────────────────────────
 ANALYTICS_SEND_INTERVAL_SECS: float = 60.0
 
-# One-shot flag to log get_nvds_buf_surface failures only once (NV12 format at tiler src-pad)
-_buf_surface_warn_logged: bool = False
-
 # ── Crop capture ──────────────────────────────────────────────────────────────
 CROPS_DIR: str            = "crops"
 CROP_SAMPLE_INTERVAL: int = 15
@@ -1122,10 +1119,8 @@ def osd_sink_pad_buffer_probe(_pad, info):
             frame_np = np.array(n_frame, copy=True, order='C')
             frame_np = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGR)
         except Exception as e:
-            global _buf_surface_warn_logged
-            if not _buf_surface_warn_logged:
-                logger.warning("get_nvds_buf_surface no disponible (%s) — crops desactivados (face_recognition/appearance degradados)", e)
-                _buf_surface_warn_logged = True
+            if frame_num % 30 == 0:
+                logger.warning("get_nvds_buf_surface falló frame=%d: %s", frame_num, e)
 
         # ── First pass: collect persons and face detections ───────────────────
         persons_meta: List = []

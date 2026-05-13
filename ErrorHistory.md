@@ -72,7 +72,7 @@ cudaErrorIllegalAddress (700) in nvbufsurftransform
 
 **Causa raíz:** `nvdsosd` requiere que nvvideoconvert convierta el frame a RGBA en NVMM antes de dibujar bounding boxes. Con 16 streams simultáneos, la asignación de la superficie RGBA adicional para OSD agotaba los buffers NVMM restantes después de que nvinfer, nvtracker y el tiler ya estaban usando la mayor parte del pool.
 
-**Solución:** Eliminar completamente `nvdsosd`, `nvvidconv1` y `caps_rgba` del pipeline en `app.py`. El probe de analytics (que lee metadatos de DeepStream pero no necesita el OSD para funcionar) se movió al src-pad del tiler. El pipeline nuevo es: `tiler → nvvidconv2 → caps_nv12 → appsink`. Las bounding boxes no se dibujan en el video MJPEG de preview — el MJPEG muestra video limpio, y los metadatos se procesan igual vía el probe.
+**Solución:** Eliminar solo `nvdsosd` del pipeline en `app.py` — conservar `nvvidconv1` y `caps_rgba` para que el probe siga recibiendo buffers RGBA (necesario para extracción de crops). El probe se mueve del sink-pad de nvosd al src-pad de caps_rgba, que entrega el mismo formato RGBA. El pipeline nuevo es: `tiler → nvvidconv1(NV12→RGBA) → caps_rgba → nvvidconv2(RGBA→NV12) → caps_nv12 → appsink`. El video MJPEG muestra video limpio sin bounding boxes dibujados; los crops para appearance worker, face recognition y pose worker siguen funcionando.
 
 ---
 

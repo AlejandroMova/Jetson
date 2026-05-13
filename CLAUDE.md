@@ -57,7 +57,7 @@ NX_tech/
 DVR (RTSP) → rtspsrc → h264/h265parse → nvv4l2decoder
   → nvstreammux → nvinfer (PeopleNet PGIE, gie-id=1)
   → nvtracker → [SGIEs opcionales por paquete]
-  → nvmultistreamtiler → appsink (MJPEG HTTP :8080)
+  → nvmultistreamtiler → nvvideoconvert(RGBA) → appsink (MJPEG HTTP :8080)
 ```
 
 **Workers async (Python threads, no bloquean el pipeline):**
@@ -371,14 +371,14 @@ Cuando en una conversación surja una posible mejora — por ejemplo, "ahora usa
 
 ### `deploy/pipelines/` — Núcleo del pipeline
 
-**`app.py`** (~415 líneas)
-Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete, y expone un servidor MJPEG en `:8080` para visualización. Tiler de preview fijo a 1280×720 para reducir presión NVMM en Orin Nano. No usa `nvdsosd` — eliminado para liberar NVMM en deployments de 16 cámaras; el probe de analytics se conecta al src-pad del tiler. Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`.
+**`app.py`** (~420 líneas)
+Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete, y expone un servidor MJPEG en `:8080` para visualización. Tiler de preview fijo a 1280×720 para reducir presión NVMM en Orin Nano. No usa `nvdsosd` — eliminado para liberar NVMM en deployments de 16 cámaras; el probe de analytics se conecta al src-pad de caps_rgba (RGBA, post-nvvidconv1), lo que mantiene los crops de imagen funcionando. Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`.
 
 **`app_video_testing.py`** (~240 líneas)
 Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + qtdemux` en lugar de `rtspsrc`. Útil para desarrollo y QA sin DVR físico. Sale con RTSP output en lugar de MJPEG. Acepta `--capabilities` y `--client` por CLI.
 
 **`probes.py`** (~1300 líneas)
-El motor central de analytics. Se conecta al tiler src-pad del pipeline y se ejecuta en cada frame. Contiene:
+El motor central de analytics. Se conecta al caps_rgba src-pad del pipeline (RGBA, post-tiler) y se ejecuta en cada frame. Contiene:
 - `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea)
 - `_AgeGenderHandler`: acumula 10 votes del SGIE antes de confirmar clasificación
 - `_FallDetectionHandler`: despacha crops al `PoseWorker`, aplica 3 reglas geométricas
