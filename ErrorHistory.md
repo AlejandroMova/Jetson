@@ -57,6 +57,25 @@ RTSP 'source-N' failed: gst-resource-error-quark: Could not open resource for re
 
 ---
 
+## 2026-05-13 — nvdsosd crash por agotamiento NVMM con 16 cámaras
+
+**Contexto:** Pipeline de producción (`app.py`) con 16 cámaras sub-stream (960×544) después de reducir batch-size a 4. El pipeline arrancaba y corría ~1-3 minutos antes de crashear.
+
+**Error en consola:**
+```
+nvbufsurftransform_copy.cpp:438: Failed in mem copy
+nvbufsurftransform_copy.cpp:452: NvBufSurfTransformImpl: NvBufSurfTransform failed with error -1
+Error in NvBufSurfTransformAsync:3
+GST_RETURN_ON_ERR failed with error: -1
+cudaErrorIllegalAddress (700) in nvbufsurftransform
+```
+
+**Causa raíz:** `nvdsosd` requiere que nvvideoconvert convierta el frame a RGBA en NVMM antes de dibujar bounding boxes. Con 16 streams simultáneos, la asignación de la superficie RGBA adicional para OSD agotaba los buffers NVMM restantes después de que nvinfer, nvtracker y el tiler ya estaban usando la mayor parte del pool.
+
+**Solución:** Eliminar completamente `nvdsosd`, `nvvidconv1` y `caps_rgba` del pipeline en `app.py`. El probe de analytics (que lee metadatos de DeepStream pero no necesita el OSD para funcionar) se movió al src-pad del tiler. El pipeline nuevo es: `tiler → nvvidconv2 → caps_nv12 → appsink`. Las bounding boxes no se dibujan en el video MJPEG de preview — el MJPEG muestra video limpio, y los metadatos se procesan igual vía el probe.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Fecha] — Título breve del error

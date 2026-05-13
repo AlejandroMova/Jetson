@@ -464,8 +464,7 @@ DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
       └── class 2 (face)   → FaceRecognizer worker (if face_recognition active)
   → [SGIE: age_gender    gie-id=2]  ← one nvinfer per active SGIE capability
   → [SGIE: epp/fire/lpr  gie-id=3+] ← pending models
-  → nvmultistreamtiler → nvdsosd
-  → nvvideoconvert → appsink → HTTP MJPEG server (port 8080)
+  → nvmultistreamtiler → nvvideoconvert → appsink → HTTP MJPEG server (port 8080)
 
 Async paths (background threads, never block pipeline):
   people_counting → AppearanceWorker → OSNet ONNX → 512-dim vector → POST /api/events (person_appearance)

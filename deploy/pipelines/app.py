@@ -326,13 +326,6 @@ def main():
     tiler.set_property("width",   1280)
     tiler.set_property("height",  720)
 
-    # ── OSD ───────────────────────────────────────────────────────────────────
-    nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
-    caps_rgba  = Gst.ElementFactory.make("capsfilter",     "capsfilter-rgba")
-    caps_rgba.set_property("caps",
-        Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
-    nvosd      = Gst.ElementFactory.make("nvdsosd",        "onscreendisplay")
-
     # ── GPU→CPU download then appsink ─────────────────────────────────────────
     nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
     caps_nv12  = Gst.ElementFactory.make("capsfilter",     "capsfilter-nv12")
@@ -343,8 +336,7 @@ def main():
     appsink.set_property("max-buffers",  2)
     appsink.set_property("drop",         True)
 
-    fixed_elements = [pgie, tracker, tiler, nvvidconv1, caps_rgba, nvosd,
-                      nvvidconv2, caps_nv12, appsink]
+    fixed_elements = [pgie, tracker, tiler, nvvidconv2, caps_nv12, appsink]
     if not all(fixed_elements):
         logger.error("Failed to create one or more pipeline elements.")
         sys.exit(1)
@@ -363,16 +355,13 @@ def main():
         prev = sgie
     prev.link(tiler)
 
-    tiler.link(nvvidconv1)
-    nvvidconv1.link(caps_rgba)
-    caps_rgba.link(nvosd)
-    nvosd.link(nvvidconv2)
+    tiler.link(nvvidconv2)
     nvvidconv2.link(caps_nv12)
     caps_nv12.link(appsink)
 
     # ── Probe ─────────────────────────────────────────────────────────────────
-    osd_sink_pad = nvosd.get_static_pad("sink")
-    osd_sink_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
+    tiler_src_pad = tiler.get_static_pad("src")
+    tiler_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
 
     # ── MJPEG server ──────────────────────────────────────────────────────────
     mjpeg = _MjpegServer(port=8080)
