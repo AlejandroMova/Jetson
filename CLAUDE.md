@@ -372,7 +372,7 @@ Cuando en una conversación surja una posible mejora — por ejemplo, "ahora usa
 ### `deploy/pipelines/` — Núcleo del pipeline
 
 **`app.py`** (~430 líneas)
-Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete, y expone un servidor MJPEG en `:8080` para visualización. Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`.
+Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete, y expone un servidor MJPEG en `:8080` para visualización. Tiler de preview fijo a 1280×720 (no 1920×1080) para reducir presión NVMM en Orin Nano — la inferencia ocurre antes del tiler y no se ve afectada. Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`.
 
 **`app_video_testing.py`** (~240 líneas)
 Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + qtdemux` en lugar de `rtspsrc`. Útil para desarrollo y QA sin DVR físico. Sale con RTSP output en lugar de MJPEG. Acepta `--capabilities` y `--client` por CLI.

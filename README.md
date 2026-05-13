@@ -483,4 +483,4 @@ View the live feed:
 ```bash
 vlc --network-caching=300 http://<jetson-ip>:8080/stream
 ```
-With multiple streams the output is a tiled grid (e.g. 4×4 for 16 cameras) at 1920×1080.
+With multiple streams the output is a tiled grid (e.g. 4×4 for 16 cameras) at 1280×720. The tiled preview resolution is intentionally lower than the inference resolution to reduce NVMM pressure on the Orin Nano — detection quality is unaffected.

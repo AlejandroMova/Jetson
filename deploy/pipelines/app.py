@@ -323,8 +323,8 @@ def main():
     tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
     tiler.set_property("rows",    tiler_rows)
     tiler.set_property("columns", tiler_cols)
-    tiler.set_property("width",   1920)
-    tiler.set_property("height",  1080)
+    tiler.set_property("width",   1280)
+    tiler.set_property("height",  720)
 
     # ── OSD ───────────────────────────────────────────────────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
