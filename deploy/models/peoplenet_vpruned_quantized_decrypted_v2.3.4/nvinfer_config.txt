@@ -4,12 +4,12 @@ net-scale-factor=0.00392156862745098
 
 # Cambiamos el motor a ONNX para saltar el error de UFF
 onnx-file=resnet34_peoplenet_int8.onnx
-model-engine-file=resnet34_peoplenet_int8.onnx_b16_gpu0_int8.engine
+model-engine-file=resnet34_peoplenet_int8.onnx_b4_gpu0_int8.engine
 labelfile-path=labels.txt
 
 # Dimensiones estándar para PeopleNet
 infer-dims=3;544;960
-batch-size=16
+batch-size=4
 process-mode=1
 model-color-format=0
 
@@ -17,7 +17,7 @@ model-color-format=0
 int8-calib-file=resnet34_peoplenet_int8.txt
 network-mode=1
 num-detected-classes=3
-interval=2
+interval=4
 gie-unique-id=1
 
 # Capas de salida específicas de PeopleNet (ONNX conserva los nombres TF con :0)

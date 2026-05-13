@@ -282,6 +282,12 @@ def main():
     pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
     pgie.set_property("config-file-path",
                       "models/peoplenet_vpruned_quantized_decrypted_v2.3.4/nvinfer_config.txt")
+    if cfg.pgie_batch_size > 0:
+        pgie.set_property("batch-size", cfg.pgie_batch_size)
+        logger.info("PGIE batch-size overridden to %d from config.yaml", cfg.pgie_batch_size)
+    if cfg.pgie_interval >= 0:
+        pgie.set_property("interval", cfg.pgie_interval)
+        logger.info("PGIE interval overridden to %d from config.yaml", cfg.pgie_interval)
 
     # ── Tracker ───────────────────────────────────────────────────────────────
     tracker = Gst.ElementFactory.make("nvtracker", "tracker")

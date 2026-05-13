@@ -97,6 +97,8 @@ class ClientConfig:
     sector: str = "comercio"    # "comercio" | "industrial" | "hogar"
     package: str = "manual"     # contracted package; "manual" = custom/testing
     entry_exit_channels: List[int] = field(default_factory=list)
+    pgie_batch_size: int = 0   # >0 = override nvinfer_config.txt at runtime; 0 = use file value
+    pgie_interval: int = -1    # ≥0 = override nvinfer_config.txt at runtime; -1 = use file value
 
     def tracker_config_path(self) -> str:
         if self.tracker not in TRACKER_CONFIGS:
@@ -130,6 +132,8 @@ class ClientConfig:
         logger.info("Pipeline(s): %s", self.pipeline)
         logger.info("Resolution : %dx%d (%s)", self.stream_width, self.stream_height, self.stream_type)
         logger.info("Tracker    : %s", self.tracker)
+        logger.info("PGIE batch : %s", self.pgie_batch_size or "(from nvinfer_config.txt)")
+        logger.info("PGIE interval: %s", self.pgie_interval if self.pgie_interval >= 0 else "(from nvinfer_config.txt)")
         for url in self.rtsp_urls():
             masked = url.replace(self.dvr_pass, "***") if self.dvr_pass else url
             logger.info("RTSP URL   : %s", masked)
@@ -288,6 +292,8 @@ def load_config() -> ClientConfig:
         sector=sector,
         package=package,
         entry_exit_channels=entry_exit_channels,
+        pgie_batch_size=int(cfg.get("pgie_batch_size", 0)),
+        pgie_interval=int(cfg.get("pgie_interval", -1)),
     )
     _warn_decoder_load(config)
     return config

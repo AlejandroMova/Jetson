@@ -85,3 +85,25 @@ tracker: nvdcf
 # Usado para calcular tiempo en tienda y conteo de visitas.
 # Dejar vacío si ninguna cámara cubre directamente la puerta de entrada.
 entry_exit_channels: []
+
+# ── Ajuste de inferencia PeopleNet (opcional) ─────────────────────────────
+#
+# pgie_batch_size — frames procesados por llamada TRT.
+#   Menor = menos memoria GPU, más llamadas al engine.
+#   0 (default) = usa el valor de nvinfer_config.txt (actualmente 4).
+#   IMPORTANTE: si se sube por encima del batch compilado en el engine,
+#               TRT recompila (~5-8 min en el primer boot).
+#
+#   Guía por número de cámaras (Orin Nano, sub-stream 960×544):
+#     1–16 cámaras → pgie_batch_size: 4   (no subir a 16 — agota NVMM)
+#
+# pgie_interval — corre inferencia cada (interval+1) frames; el tracker cubre los intermedios.
+#   Mayor = menos carga GPU/memoria.
+#   -1 (default) = usa el valor de nvinfer_config.txt (actualmente 4).
+#
+#   Guía por número de cámaras:
+#     1–6  cámaras → pgie_interval: 2  (más fresco, más carga GPU)
+#     7–16 cámaras → pgie_interval: 4  (conservador, estable)
+#
+# pgie_batch_size: 0
+# pgie_interval: -1
