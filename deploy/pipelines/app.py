@@ -2,28 +2,21 @@
 app.py — NX Computing AI | Production Pipeline (Live DVR / RTSP)
 
 Source: RTSP stream(s) from DVR, configured per-client via config_loader.
-Sink  : MJPEG stream on port 8080 — view with VLC:
-          vlc http://<jetson-ip>:8080/stream
+Sink  : fakesink — no display output. Visualización disponible con la app QA (NX_MODE=testing).
 
 Pipeline (capabilities driven by config.yaml `pipeline` field or /etc/nx_pipeline):
   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
     → nvstreammux → nvinfer (PeopleNet PGIE) → nvtracker
-    → [nvinfer SGIE per active capability] → nvvideoconvert → capsfilter(RGBA)
-    → nvdsosd → nvvideoconvert → capsfilter(NV12/CPU)
-    → appsink → [HTTP MJPEG server]
+    → [nvinfer SGIE per active capability]
+    → nvmultistreamtiler(640×360) → nvvideoconvert → capsfilter(RGBA)
+    → [probe: crops para analytics] → fakesink
 """
 
-import http.server
 import logging
 import math
 import os
 import sys
-import threading
-import time
 from pathlib import Path
-
-import cv2
-import numpy as np
 
 import gi
 gi.require_version("Gst", "1.0")
@@ -90,86 +83,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-
-class _MjpegServer:
-    """HTTP MJPEG server — no encoder dependency, works on any Jetson."""
-
-    def __init__(self, port: int):
-        self._lock    = threading.Lock()
-        self._jpeg    = b""
-        self._running = True
-
-        handler = self._make_handler()
-        self._http = http.server.HTTPServer(("", port), handler)
-        threading.Thread(target=self._http.serve_forever, daemon=True).start()
-        logger.info("MJPEG server → http://<jetson-ip>:%d/stream", port)
-
-    def _make_handler(self):
-        srv = self
-
-        class _Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == "/stream":
-                    self.send_response(200)
-                    self.send_header(
-                        "Content-Type",
-                        "multipart/x-mixed-replace; boundary=frame",
-                    )
-                    self.end_headers()
-                    try:
-                        while srv._running:
-                            with srv._lock:
-                                frame = srv._jpeg
-                            if frame:
-                                self.wfile.write(
-                                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                                )
-                                self.wfile.write(frame)
-                                self.wfile.write(b"\r\n")
-                            time.sleep(1 / 30)
-                    except Exception:
-                        pass
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def log_message(self, *_):  # silence HTTP logs
-                pass
-
-        return _Handler
-
-    def push_sample(self, sample: Gst.Sample):
-        caps = sample.get_caps()
-        s    = caps.get_structure(0)
-        w    = s.get_value("width")
-        h    = s.get_value("height")
-        buf  = sample.get_buffer()
-        ok, info = buf.map(Gst.MapFlags.READ)
-        if not ok:
-            logger.error("appsink buf.map() failed — buffer may still be in NVMM")
-            return
-        try:
-            data     = np.frombuffer(info.data, dtype=np.uint8)
-            expected = w * h * 3 // 2
-            if data.size != expected:
-                logger.error("Buffer size mismatch: got %d bytes, expected %d", data.size, expected)
-                return
-            # NV12: Y plane (H*W bytes) + interleaved UV plane (H/2*W bytes)
-            yuv = data.reshape(h * 3 // 2, w)
-            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
-            _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            with self._lock:
-                first = len(self._jpeg) == 0
-                self._jpeg = enc.tobytes()
-            if first:
-                logger.info("First MJPEG frame encoded (%dx%d, %d bytes) — stream ready", w, h, len(self._jpeg))
-        finally:
-            buf.unmap(info)
-
-    def stop(self):
-        self._running = False
-        self._http.shutdown()
 
 
 def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
@@ -323,8 +236,8 @@ def main():
     tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
     tiler.set_property("rows",    tiler_rows)
     tiler.set_property("columns", tiler_cols)
-    tiler.set_property("width",   1280)
-    tiler.set_property("height",  720)
+    tiler.set_property("width",   640)
+    tiler.set_property("height",  360)
 
     # ── NV12→RGBA (probe needs RGBA for crop extraction) ─────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
@@ -332,18 +245,11 @@ def main():
     caps_rgba.set_property("caps",
         Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
 
-    # ── RGBA→NV12 then appsink ────────────────────────────────────────────────
-    nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "convertor2")
-    caps_nv12  = Gst.ElementFactory.make("capsfilter",     "capsfilter-nv12")
-    caps_nv12.set_property("caps", Gst.Caps.from_string("video/x-raw,format=NV12"))
-    appsink = Gst.ElementFactory.make("appsink", "mjpeg-sink")
-    appsink.set_property("emit-signals", True)
-    appsink.set_property("sync",         False)
-    appsink.set_property("max-buffers",  2)
-    appsink.set_property("drop",         True)
+    # ── fakesink — probe extracts all needed crops from RGBA before here ─────
+    fakesink = Gst.ElementFactory.make("fakesink", "fakesink")
+    fakesink.set_property("sync", False)
 
-    fixed_elements = [pgie, tracker, tiler, nvvidconv1, caps_rgba,
-                      nvvidconv2, caps_nv12, appsink]
+    fixed_elements = [pgie, tracker, tiler, nvvidconv1, caps_rgba, fakesink]
     if not all(fixed_elements):
         logger.error("Failed to create one or more pipeline elements.")
         sys.exit(1)
@@ -364,24 +270,11 @@ def main():
 
     tiler.link(nvvidconv1)
     nvvidconv1.link(caps_rgba)
-    caps_rgba.link(nvvidconv2)
-    nvvidconv2.link(caps_nv12)
-    caps_nv12.link(appsink)
+    caps_rgba.link(fakesink)
 
-    # ── Probe — caps_rgba src-pad sees RGBA (same as original nvosd sink-pad) ─
+    # ── Probe — caps_rgba src-pad sees RGBA (needed for crop extraction) ──────
     caps_rgba_src_pad = caps_rgba.get_static_pad("src")
     caps_rgba_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
-
-    # ── MJPEG server ──────────────────────────────────────────────────────────
-    mjpeg = _MjpegServer(port=8080)
-
-    def _on_new_sample(sink):
-        sample = sink.emit("pull-sample")
-        if sample:
-            mjpeg.push_sample(sample)
-        return Gst.FlowReturn.OK
-
-    appsink.connect("new-sample", _on_new_sample)
 
     # ── Run ───────────────────────────────────────────────────────────────────
     api_client.start()
@@ -419,7 +312,6 @@ def main():
         logger.info("Stopped by user.")
     finally:
         pipeline.set_state(Gst.State.NULL)
-        mjpeg.stop()
         api_client.stop()
         stop_workers()
 

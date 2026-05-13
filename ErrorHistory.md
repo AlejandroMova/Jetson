@@ -76,6 +76,24 @@ cudaErrorIllegalAddress (700) in nvbufsurftransform
 
 ---
 
+## 2026-05-13 — TRT scopedCudaResources crash a los ~9 min con 16 cámaras (NVMM agotado por tiler 1280×720)
+
+**Contexto:** Pipeline de producción (`app.py`) con 16 cámaras sub-stream (960×544), después de quitar `nvdsosd`. El pipeline corría ~9 minutos antes de crashear con exit code 0 y reiniciar.
+
+**Error en consola:**
+```
+[E] [TRT]  1: [scopedCudaResources.cpp::~ScopedCudaResources::...] Error Code 1: Cuda (an illegal memory access was encountered)
+[E] [TRT]  1: [scopedCudaResources.cpp::~ScopedCudaResources::...] Error Code 1: Cuda (an illegal memory access was encountered)
+... (decenas de líneas similares) ...
+GStreamer ERROR: ... — pipeline forzado a salir
+```
+
+**Causa raíz:** Aunque se quitó `nvdsosd`, el tiler seguía corriendo a 1280×720 y `nvvidconv1` seguía allocando una superficie RGBA de 1280×720×4 ≈ 3.5 MB en NVMM por batch. Con 16 streams activos, el pool NVMM se agotaba gradualmente hasta que TRT no podía alocar workspace durante inferencia, causando el crash en `scopedCudaResources.cpp` (cleanup de recursos CUDA al fallar). El pipeline salía con código 0 → Docker reiniciaba → loop infinito.
+
+**Solución:** Eliminar el servidor MJPEG completo (`_MjpegServer`, `appsink`, `nvvidconv2`, `caps_nv12`) y reducir el tiler a 640×360. El sink final pasa a ser `fakesink`. La superficie RGBA baja a 640×360×4 ≈ 0.9 MB (4× menos). Los crops siguen funcionando igual porque el probe sigue en el src-pad de `caps_rgba`. Archivos modificados: `app.py` (eliminar clase `_MjpegServer` y elementos de display), `CLAUDE.md` (actualizar diagrama del pipeline).
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Fecha] — Título breve del error

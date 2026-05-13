@@ -57,8 +57,11 @@ NX_tech/
 DVR (RTSP) → rtspsrc → h264/h265parse → nvv4l2decoder
   → nvstreammux → nvinfer (PeopleNet PGIE, gie-id=1)
   → nvtracker → [SGIEs opcionales por paquete]
-  → nvmultistreamtiler → nvvideoconvert(RGBA) → appsink (MJPEG HTTP :8080)
+  → nvmultistreamtiler(640×360) → nvvideoconvert(RGBA)
+  → [probe: crops para analytics] → fakesink
 ```
+
+> **Sin MJPEG en producción.** El tiler corre a 640×360 (0.9 MB RGBA) solo para que el probe pueda extraer crops. No hay servidor de video. La visualización se obtiene con la app QA Visual (`NX_MODE=testing`).
 
 **Workers async (Python threads, no bloquean el pipeline):**
 - `AppearanceWorker` — OSNet-x0.25 ONNX, re-ID entre cámaras
@@ -372,7 +375,7 @@ Cuando en una conversación surja una posible mejora — por ejemplo, "ahora usa
 ### `deploy/pipelines/` — Núcleo del pipeline
 
 **`app.py`** (~420 líneas)
-Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete, y expone un servidor MJPEG en `:8080` para visualización. Tiler de preview fijo a 1280×720 para reducir presión NVMM en Orin Nano. No usa `nvdsosd` — eliminado para liberar NVMM en deployments de 16 cámaras; el probe de analytics se conecta al src-pad de caps_rgba (RGBA, post-nvvidconv1), lo que mantiene los crops de imagen funcionando. Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`.
+Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **No tiene MJPEG ni display** — el tiler corre a 640×360 (0.9 MB RGBA vs 3.5 MB antes) únicamente para que el probe pueda extraer crops; el sink es un `fakesink`. Sin `nvdsosd`. El probe se conecta al src-pad de caps_rgba (RGBA). Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`.
 
 **`app_video_testing.py`** (~240 líneas)
 Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + qtdemux` en lugar de `rtspsrc`. Útil para desarrollo y QA sin DVR físico. Sale con RTSP output en lugar de MJPEG. Acepta `--capabilities` y `--client` por CLI.
