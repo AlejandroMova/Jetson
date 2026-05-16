@@ -83,6 +83,67 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## Detección de EPP (`epp_detection`)
+
+**Descripción:** Detectar cumplimiento de equipos de protección personal (cascos, chalecos reflectivos, guantes) en entornos industriales. Emitir alerta cuando una persona entra a una zona sin el EPP requerido.
+
+**Por qué sería mejor:** Actualmente no existe ningún modelo EPP en el pipeline. Es la capacidad industrial de mayor valor para fábricas y bodegas.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/probes.py`
+- Sección / función: stub `_EppHandler` (búscar `_EppHandler` en probes.py)
+- Descripción: actualmente el stub no hace nada; el SGIE tampoco existe
+
+**Tech stack propuesto:**
+- Modelo: SGIE custom (ONNX → TRT FP16) entrenado sobre personas con/sin EPP. Alternativa: adaptar YOLOv8-nano exportado a ONNX.
+- `gie-unique-id=4` (los IDs 1–3 ya están ocupados)
+- Agregar entrada en `SGIE_CONFIGS` en `app.py` y activar en paquetes `industrial_*`
+
+**Consideraciones:** Requiere dataset de entrenamiento con EPP industrial (cascos amarillo/blanco, chalecos naranja/amarillo). Tamaño esperado <50MB. Esfuerzo estimado: 3-5 días (dataset + entrenamiento + integración).
+
+---
+
+## Detección de Fuego y Humo (`fire_smoke`)
+
+**Descripción:** Clasificador a nivel de frame que detecta la presencia de fuego o humo en la escena. Emite alerta inmediata al backend.
+
+**Por qué sería mejor:** Actualmente el stub no hace nada. Es una capacidad de alto valor para sectores industrial y hogar.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/probes.py`
+- Sección / función: stub `_FireSmokeHandler`
+- Descripción: actualmente vacío; el SGIE no existe
+
+**Tech stack propuesto:**
+- Modelo: clasificador de imagen ONNX → TRT FP16 (entrada 224×224, salida: [no_fire, smoke, fire])
+- Frame-level (no requiere bbox de persona — opera sobre el frame completo del tiler)
+- Alternativa: FireNet o modelo Kaggle Fire Detection (Apache 2.0)
+- `gie-unique-id=5`
+
+**Consideraciones:** Falsos positivos con luz solar directa o reflejos. Requiere ajustar umbral de confianza por instalación. Esfuerzo estimado: 2-3 días.
+
+---
+
+## Lectura de Placas Vehiculares (`license_plate`)
+
+**Descripción:** Detectar vehículos y leer sus placas usando dos SGIEs en cadena: LPD (License Plate Detector) y LPR (License Plate Reader/OCR).
+
+**Por qué sería mejor:** Actualmente el stub no hace nada. Capacidad de alto valor para accesos vehiculares en industria y condominios.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/probes.py`
+- Sección / función: stub `_LicensePlateHandler`
+- Descripción: actualmente vacío; los SGIEs no existen
+
+**Tech stack propuesto:**
+- LPD: NVIDIA TAO LPD (ONNX → TRT FP16, `gie-unique-id=6`)
+- LPR: NVIDIA TAO LPR (ONNX → TRT FP16, `gie-unique-id=7`) — OCR carácter a carácter
+- Ambos disponibles en NVIDIA NGC con licencia NVIDIA Developer
+
+**Consideraciones:** LPR requiere resolución mínima de placa ~80×20px — subcámaras a 960×544 pueden ser insuficientes para placas lejanas. Esfuerzo estimado: 3-4 días (descargar modelos TAO, integrar SGIEs, parsear output de caracteres).
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]

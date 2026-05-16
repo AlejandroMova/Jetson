@@ -267,14 +267,15 @@ def main():
         # Publicar status del Jetson a Redis para que Streamlit lo muestre
         if _redis_qa:
             _redis_qa.set("nx:qa:status", json.dumps({
-                "client":      cfg.client_name,
-                "package":     cfg.package,
+                "client":       cfg.client_name,
+                "package":      cfg.package,
                 "capabilities": cfg.pipeline,
-                "channels":    cfg.channels,
-                "tracker":     cfg.tracker,
-                "sector":      cfg.sector,
-                "tiler_cols":  tiler_cols,
-                "tiler_rows":  tiler_rows,
+                "channels":     cfg.channels,
+                "tracker":      cfg.tracker,
+                "sector":       cfg.sector,
+                "tiler_cols":   tiler_cols,
+                "tiler_rows":   tiler_rows,
+                "jetson_id":    os.environ.get("JETSON_ID", ""),
             }))
 
     # ── NV12→RGBA (probe needs RGBA for crop extraction) ─────────────────────

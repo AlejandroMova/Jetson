@@ -39,8 +39,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Autorefresh cada 400ms
-st_autorefresh(interval=400, limit=None, key="qa_tick")
+# Autorefresh cada 150ms (~6 fps de video + UI en tiempo real)
+st_autorefresh(interval=150, limit=None, key="qa_tick")
 
 
 # ── MJPEG reader (Python-side) ────────────────────────────────────────────────
@@ -202,22 +202,34 @@ with st.sidebar:
     st.markdown("---")
 
     # Toggles de capacidades
-    st.markdown("**🔧 Capacidades**")
-    st.checkbox("people_counting", value=True, disabled=True,
-                help="Siempre activo — no se puede apagar")
+    ALL_CAPS = [
+        "people_counting", "age_gender", "fall_detection", "face_recognition",
+        "epp_detection", "fire_smoke", "license_plate",
+    ]
+    UNIMPLEMENTED = {"epp_detection", "fire_smoke", "license_plate"}
 
-    togglable = [c for c in active_caps if c != "people_counting"]
-    if _r and togglable:
-        for cap in togglable:
+    st.markdown("**🔧 Capacidades**")
+    for cap in ALL_CAPS:
+        if cap == "people_counting":
+            st.checkbox(cap, value=True, disabled=True,
+                        help="Siempre activo — no se puede apagar", key="cap_people_counting")
+            continue
+
+        in_pipeline = cap in active_caps
+        not_impl    = cap in UNIMPLEMENTED
+
+        if not in_pipeline:
+            label = f"{cap} ({'pendiente' if not_impl else 'no en este paquete'})"
+            st.checkbox(label, value=False, disabled=True, key=f"cap_{cap}_off")
+        elif _r:
             try:
                 current_val = _r.hget("nx:qa:capabilities", cap)
                 is_on = current_val is None or current_val == "1"
                 new_val = st.checkbox(cap, value=is_on, key=f"cap_{cap}")
                 _r.hset("nx:qa:capabilities", cap, "1" if new_val else "0")
             except Exception:
-                st.checkbox(cap, value=True, disabled=True, key=f"cap_{cap}_disabled")
-    elif togglable:
-        for cap in togglable:
+                st.checkbox(cap, value=True, disabled=True, key=f"cap_{cap}_err")
+        else:
             st.checkbox(cap, value=True, disabled=True, key=f"cap_{cap}_nr")
 
     st.markdown("---")
