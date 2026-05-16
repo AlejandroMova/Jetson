@@ -87,12 +87,16 @@ else
 fi
 echo ""
 
-# Trampa Ctrl+C: restaurar producción al salir
+# Trampa Ctrl+C: restaurar producción al salir (protegido contra re-entrada)
+_CLEANING=0
 _cleanup() {
+    [ "$_CLEANING" = "1" ] && return
+    _CLEANING=1
+    trap '' INT TERM   # ignorar señales adicionales durante el cleanup
     echo ""
     echo "  Deteniendo QA y restaurando producción..."
     docker compose -f docker-compose.yml -f docker-compose.qa.yml \
-        stop deepstream qa_app 2>/dev/null || true
+        kill deepstream qa_app 2>/dev/null || true
     docker compose -f docker-compose.yml -f docker-compose.qa.yml \
         rm -f qa_app 2>/dev/null || true
     docker compose up -d
