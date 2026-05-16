@@ -19,6 +19,8 @@ from gi.repository import Gst
 
 import pyds
 import dataclasses
+import json
+import math
 import queue
 import logging
 import threading
@@ -121,6 +123,114 @@ CROP_SAMPLE_INTERVAL: int = 15
 CROP_MAX_PER_PERSON: int  = 5
 CROP_MIN_WIDTH: int       = 64
 CROP_MIN_HEIGHT: int      = 128
+
+
+# ==============================================================================
+# QA VISUAL MODE — activo solo cuando NX_QA_ENABLED=true
+# Cero impacto en producción cuando la variable de entorno no está seteada.
+# ==============================================================================
+
+_IS_QA_ENABLED: bool = os.getenv("NX_QA_ENABLED", "false").lower() == "true"
+
+# Redis client para pub/sub efímero — solo si QA activo
+_redis_qa = None
+if _IS_QA_ENABLED:
+    try:
+        import redis as _redis_lib
+        _redis_qa = _redis_lib.Redis(
+            host=os.getenv("REDIS_HOST", "redis"),
+            port=6379,
+            db=0,
+            socket_connect_timeout=2,
+            socket_timeout=1,
+        )
+        _redis_qa.ping()
+        logger.info("[QA] Redis conectado — nx:qa:detections + nx:qa:apicalls activos")
+    except Exception as _qa_e:
+        logger.warning("[QA] Redis no disponible (%s) — metadata no se publicará", _qa_e)
+        _redis_qa = None
+
+# Queues para el MjpegServer (pobladas desde app.py via init_qa_cameras)
+tiled_frame_queue: queue.Queue = queue.Queue(maxsize=1)
+camera_frame_queues: dict = {}   # camera_id → Queue(maxsize=1)
+
+# Grid del tiler — set via init_qa_grid() desde app.py
+_qa_tiler_cols: int = 1
+_qa_tiler_rows: int = 1
+_qa_cell_w: int = 640
+_qa_cell_h: int = 360
+
+
+def init_qa_grid(tiler_cols: int, tiler_rows: int, cell_w: int, cell_h: int) -> None:
+    """Llamar desde app.py después de calcular el grid del tiler."""
+    global _qa_tiler_cols, _qa_tiler_rows, _qa_cell_w, _qa_cell_h
+    _qa_tiler_cols = tiler_cols
+    _qa_tiler_rows = tiler_rows
+    _qa_cell_w = cell_w
+    _qa_cell_h = cell_h
+    if _IS_QA_ENABLED:
+        logger.info("[QA] Grid: %dx%d tiles de %dx%d px", tiler_cols, tiler_rows, cell_w, cell_h)
+
+
+def init_qa_cameras(channels: list) -> None:
+    """Crea una Queue por cámara en camera_frame_queues. Llamar después de init_channel_map."""
+    global camera_frame_queues
+    camera_frame_queues = {
+        _camera_id_for(i): queue.Queue(maxsize=1)
+        for i in range(len(channels))
+    }
+    if _IS_QA_ENABLED:
+        logger.info("[QA] Queues de cámara: %s", list(camera_frame_queues.keys()))
+
+
+def _qa_publish(channel: str, data: dict) -> None:
+    """Fire-and-forget Redis pub/sub. Silencioso si Redis no disponible."""
+    if _redis_qa:
+        try:
+            _redis_qa.publish(channel, json.dumps(data, default=str))
+        except Exception:
+            pass
+
+
+def _is_capability_active(cap: str) -> bool:
+    """
+    En QA: lee el toggle del hash Redis nx:qa:capabilities.
+    En producción (QA desactivado): siempre retorna True.
+    Default cuando la key no existe: True (activo).
+    """
+    if not _IS_QA_ENABLED or not _redis_qa:
+        return True
+    try:
+        val = _redis_qa.hget("nx:qa:capabilities", cap)
+        return val is None or val.decode() == "1"
+    except Exception:
+        return True
+
+
+def _draw_qa_overlays(frame_bgr: np.ndarray, qa_tracks: list) -> None:
+    """
+    Dibuja bboxes y labels sobre frame_bgr in-place con OpenCV (CPU).
+    Las coordenadas bbox ya están en el espacio del frame tileado (640×360).
+    """
+    for t in qa_tracks:
+        left, top, w, h = t["bbox_tiled"]
+        x1 = max(0, int(left))
+        y1 = max(0, int(top))
+        x2 = min(frame_bgr.shape[1] - 1, int(left + w))
+        y2 = min(frame_bgr.shape[0] - 1, int(top + h))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        is_fall = t.get("fall", False)
+        color = (0, 0, 230) if is_fall else (0, 210, 0)
+        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 1)
+
+        label = t.get("label", f"#{t['track_id']}")
+        cv2.putText(
+            frame_bgr, label,
+            (x1, max(y1 - 4, 10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA,
+        )
 
 
 # ==============================================================================
@@ -227,6 +337,14 @@ class NxApiClient:
 
     def _send(self, method: str, endpoint: str, payload: Optional[dict]):
         url = f"{self._base_url}{endpoint}"
+        # QA: intercept payload antes de enviar al backend
+        if _IS_QA_ENABLED:
+            _qa_publish("nx:qa:apicalls", {
+                "endpoint": endpoint,
+                "method": method,
+                "payload": payload or {},
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
         try:
             resp = self._session.request(
                 method=method,
@@ -971,6 +1089,7 @@ def init_handlers(pipeline_capabilities: List[str]) -> None:
         cls = _HANDLER_REGISTRY.get(cap)
         if cls:
             handler = cls()
+            handler._cap_name = cap  # usado por _is_capability_active en QA mode
             _active_handlers.append(handler)
             if isinstance(handler, _FallDetectionHandler) and _pose_worker is not None:
                 handler.set_worker(_pose_worker)
@@ -1093,9 +1212,10 @@ def _cleanup_handler_cache(handler, track_id: int) -> None:
 
 def osd_sink_pad_buffer_probe(_pad, info):
     """
-    Probe conectado al sink-pad de nvdsosd.
+    Probe conectado al src-pad de caps_rgba (RGBA, post-tiler).
     Itera sobre objetos del frame: personas del PGIE y caras del FaceDetectIR SGIE.
     Despacha handlers activos y envía eventos / analytics a la API REST.
+    En QA mode (NX_QA_ENABLED=true): dibuja overlays y publica a Redis/MJPEG.
     """
     gst_buffer = info.get_buffer()
     if not gst_buffer:
@@ -1104,6 +1224,10 @@ def osd_sink_pad_buffer_probe(_pad, info):
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     if not batch_meta:
         return Gst.PadProbeReturn.OK
+
+    # QA: acumula datos de todas las cámaras en este buffer (reset por llamada)
+    _qa_frame_bgr: Optional[np.ndarray] = None   # frame tileado BGR, capturado 1 vez
+    _qa_all_tracks: List[dict] = []
 
     for frame_meta in _iter_pyds_list(
         batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
@@ -1122,6 +1246,10 @@ def osd_sink_pad_buffer_probe(_pad, info):
             if frame_num % 30 == 0:
                 logger.warning("get_nvds_buf_surface falló frame=%d: %s", frame_num, e)
 
+        # QA: guardar el primer frame válido como referencia del tiled frame
+        if _IS_QA_ENABLED and frame_np is not None and _qa_frame_bgr is None:
+            _qa_frame_bgr = frame_np.copy()
+
         # ── First pass: collect persons and face detections ───────────────────
         persons_meta: List = []
         face_metas: List   = []
@@ -1139,10 +1267,11 @@ def osd_sink_pad_buffer_probe(_pad, info):
 
         # ── Face recognition: process PeopleNet face detections (class 2) ────
         if _face_handler and face_metas and frame_np is not None:
-            for face_obj_meta in face_metas:
-                _face_handler.process_face(
-                    face_obj_meta, frame_num, frame_np, persons_meta, camera_id
-                )
+            if _is_capability_active("face_recognition"):
+                for face_obj_meta in face_metas:
+                    _face_handler.process_face(
+                        face_obj_meta, frame_num, frame_np, persons_meta, camera_id
+                    )
 
         # ── Second pass: process each person ─────────────────────────────────
         visible_ids: Set[int] = set()
@@ -1201,7 +1330,11 @@ def osd_sink_pad_buffer_probe(_pad, info):
             _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
 
             # ── Active handlers ───────────────────────────────────────────────
+            _qa_fall = False
             for handler in _active_handlers:
+                # QA capability toggle: skip handler si está apagado en la UI
+                if not _is_capability_active(getattr(handler, "_cap_name", "")):
+                    continue
                 result = handler.process(obj_meta, frame_num, frame_np=frame_np)
                 if result is None:
                     continue
@@ -1219,6 +1352,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     if "gender_key" in au:
                         an[au["gender_key"]] += 1
                 elif result.event_type == "fall_detected":
+                    _qa_fall = True
                     api_client.post_fall_detected(
                         camera_id, p_track_id, bbox,
                         result.det_extra.get("fall_score", 0),
@@ -1237,6 +1371,18 @@ def osd_sink_pad_buffer_probe(_pad, info):
                             f"{cur} | {name} {conf:.0%}",
                             border_color=(0.2, 1.0, 0.4, 1.0),
                         )
+
+            # ── QA: registrar track con label final (después de todos los handlers) ──
+            if _IS_QA_ENABLED:
+                _qa_all_tracks.append({
+                    "pad_index": pad_index,
+                    "channel_id": camera_id,
+                    "track_id": p_track_id,
+                    "confidence": round(float(obj_meta.confidence), 3),
+                    "bbox_tiled": (bbox["left"], bbox["top"], bbox["width"], bbox["height"]),
+                    "label": obj_meta.text_params.display_text or f"P#{p_track_id}",
+                    "fall": _qa_fall,
+                })
 
             # ── Crop capture for dataset (always active) ──────────────────────
             if frame_np is not None:
@@ -1293,5 +1439,49 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 "gender_female": 0, "age_gender_classes": {},
             }
             _analytics_last_sent[pad_index] = now
+
+    # ── QA: overlays + MJPEG frames + Redis detections ───────────────────────
+    if _IS_QA_ENABLED and _qa_frame_bgr is not None:
+        # Dibujar bboxes y labels sobre el frame tileado
+        _draw_qa_overlays(_qa_frame_bgr, _qa_all_tracks)
+
+        # Tiled frame completo → /stream/all
+        try:
+            tiled_frame_queue.put_nowait(_qa_frame_bgr.copy())
+        except queue.Full:
+            pass
+
+        # Crops por cámara → /stream/<camera_id> (todas, con o sin detecciones)
+        for pad_idx, _ch_num in _channel_map.items():
+            cam_id = _camera_id_for(pad_idx)
+            q = camera_frame_queues.get(cam_id)
+            if q is None:
+                continue
+            ox = (pad_idx % _qa_tiler_cols) * _qa_cell_w
+            oy = (pad_idx // _qa_tiler_cols) * _qa_cell_h
+            if (oy + _qa_cell_h <= _qa_frame_bgr.shape[0]
+                    and ox + _qa_cell_w <= _qa_frame_bgr.shape[1]):
+                crop = _qa_frame_bgr[oy:oy + _qa_cell_h, ox:ox + _qa_cell_w].copy()
+                try:
+                    q.put_nowait(crop)
+                except queue.Full:
+                    pass
+
+        # Publicar detecciones a Redis (agrupadas por cámara)
+        if _qa_all_tracks:
+            by_cam: Dict[str, List] = {}
+            for t in _qa_all_tracks:
+                by_cam.setdefault(t["channel_id"], []).append({
+                    "track_id": t["track_id"],
+                    "confidence": t["confidence"],
+                    "label": t["label"],
+                    "fall": t["fall"],
+                })
+            for cam_id, tracks in by_cam.items():
+                _qa_publish("nx:qa:detections", {
+                    "cam": cam_id,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "tracks": tracks,
+                })
 
     return Gst.PadProbeReturn.OK

@@ -2,7 +2,7 @@
 app.py — NX Computing AI | Production Pipeline (Live DVR / RTSP)
 
 Source: RTSP stream(s) from DVR, configured per-client via config_loader.
-Sink  : fakesink — no display output. Visualización disponible con la app QA (NX_MODE=testing).
+Sink  : fakesink — no display output.
 
 Pipeline (capabilities driven by config.yaml `pipeline` field or /etc/nx_pipeline):
   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
@@ -10,8 +10,14 @@ Pipeline (capabilities driven by config.yaml `pipeline` field or /etc/nx_pipelin
     → [nvinfer SGIE per active capability]
     → nvmultistreamtiler(640×360) → nvvideoconvert → capsfilter(RGBA)
     → [probe: crops para analytics] → fakesink
+
+QA Visual (NX_QA_ENABLED=true):
+  El probe dibuja bboxes/labels en el frame tileado y los sirve vía MjpegServer (:8080).
+  Metadata se publica a Redis pub/sub para el dashboard Streamlit (:8501).
+  Activar con: ./qa.sh  (desde deploy/)
 """
 
+import json
 import logging
 import math
 import os
@@ -28,6 +34,9 @@ from probes import (
     osd_sink_pad_buffer_probe, api_client,
     init_channel_map, init_sector, init_entry_exit_pads,
     init_handlers, init_workers, start_workers, stop_workers,
+    init_qa_grid, init_qa_cameras,
+    tiled_frame_queue, camera_frame_queues,
+    _IS_QA_ENABLED, _redis_qa,
 )
 
 # Maps each pipeline capability to its nvinfer config file (relative to deploy/).
@@ -159,6 +168,9 @@ def main():
     init_channel_map(cfg.channels)
     init_sector(cfg.sector)
     init_entry_exit_pads(cfg.entry_exit_pad_indices())
+    # QA: inicializar queues de cámara (se usan en el probe y en MjpegServer)
+    if _IS_QA_ENABLED:
+        init_qa_cameras(cfg.channels)
 
     client_dir = Path(__file__).resolve().parent.parent / "clients" / cfg.client_name
     face_db_path = str(client_dir / "known_faces.json")
@@ -238,6 +250,32 @@ def main():
     tiler.set_property("columns", tiler_cols)
     tiler.set_property("width",   640)
     tiler.set_property("height",  360)
+
+    # QA: informar grid al probe + arrancar MjpegServer
+    if _IS_QA_ENABLED:
+        cell_w = 640 // tiler_cols
+        cell_h = 360 // tiler_rows
+        init_qa_grid(tiler_cols, tiler_rows, cell_w, cell_h)
+        from mjpeg_server import MjpegServer
+        _mjpeg_srv = MjpegServer(
+            tiled_frame_queue=tiled_frame_queue,
+            camera_queues=camera_frame_queues,
+            port=8080,
+        )
+        _mjpeg_srv.start()
+        logger.info("[QA] MjpegServer en :8080  /stream/all + /stream/<camera_id>")
+        # Publicar status del Jetson a Redis para que Streamlit lo muestre
+        if _redis_qa:
+            _redis_qa.set("nx:qa:status", json.dumps({
+                "client":      cfg.client_name,
+                "package":     cfg.package,
+                "capabilities": cfg.pipeline,
+                "channels":    cfg.channels,
+                "tracker":     cfg.tracker,
+                "sector":      cfg.sector,
+                "tiler_cols":  tiler_cols,
+                "tiler_rows":  tiler_rows,
+            }))
 
     # ── NV12→RGBA (probe needs RGBA for crop extraction) ─────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")

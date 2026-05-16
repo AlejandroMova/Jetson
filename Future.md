@@ -24,7 +24,7 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
-## App de QA Visual — Streamlit con pipeline DeepStream en modo testing
+## ~~App de QA Visual — Streamlit con pipeline DeepStream en modo testing~~ ✅ IMPLEMENTADO (2026-05-16)
 
 **Descripción:** Herramienta de QA visual que corre el mismo pipeline de producción (`app.py` + `probes.py`) activado con `NX_MODE=testing`, exponiendo en una interfaz Streamlit:
 
@@ -61,6 +61,25 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 - El OSD activado en testing consume NVMM extra — no usar con 16 cámaras simultáneas en Orin Nano; limitar a 4-8 streams en modo testing
 - Los payloads al API en testing deben usar un `API_BASE_URL` de staging, no producción — documentar en `.env.example`
 - Esfuerzo estimado: 2-3 días de desarrollo
+
+---
+
+## Fuente MP4 dinámica en QA Visual App
+
+**Descripción:** La QA Visual app actual solo funciona con fuentes RTSP (pipeline de producción). Sería útil poder seleccionar un archivo MP4 desde el sidebar de Streamlit para reproducirlo en el pipeline y observar las detecciones en condiciones controladas (escenas de caídas, EPP, etc.) sin necesidad de que las cámaras del cliente tengan actividad en ese momento.
+
+**Por qué sería mejor:** Permite validar detecciones de forma reproducible — las mismas escenas producen exactamente las mismas detecciones, facilitando comparación antes/después de ajustar parámetros o modelos.
+
+**Reemplazaría:**
+- Archivo: `deploy/qa.sh` + `deploy/docker-compose.qa.yml`
+- Descripción: actualmente el pipeline arranca siempre contra las fuentes RTSP del cliente. Habría que soportar `TEST_VIDEO_PATH` como fuente alternativa, lo que requeriría reiniciar el pipeline deepstream con `app_video_testing.py` en lugar de `app.py`.
+
+**Tech stack propuesto:**
+- Selector de archivos en Streamlit (`st.selectbox` sobre la carpeta `test_videos/`) o `st.file_uploader`
+- Variable de entorno `TEST_VIDEO_PATH` ya soportada por `app_video_testing.py`
+- El cambio de fuente requiere un `docker restart deepstream` con la nueva variable — se puede hacer desde Streamlit via `docker SDK` o simplemente documentando el comando
+
+**Consideraciones:** Cambiar de RTSP a MP4 requiere reiniciar el container deepstream, lo que interrumpe el stream MJPEG ~10 segundos. Si se quiere hacer sin reinicio habría que soportar fuente dinámica dentro de GStreamer (más complejo). Esfuerzo estimado: 1 día.
 
 ---
 

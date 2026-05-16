@@ -1,0 +1,25 @@
+# docker-compose.qa.yml — Override para QA Visual
+# Usar SOLO con qa.sh  →  docker compose -f docker-compose.yml -f docker-compose.qa.yml up
+# En producción nunca se carga este archivo.
+
+services:
+
+  deepstream:
+    environment:
+      NX_QA_ENABLED: "true"
+      # Opcional: apuntar al staging para no contaminar el backend de producción
+      # API_BASE_URL: https://staging.api.nxcomputing.ai
+
+  qa_app:
+    build:
+      context: .
+      dockerfile: qa_app/Dockerfile.qa
+    restart: "no"
+    ports:
+      - "8501:8501"
+    environment:
+      REDIS_HOST: redis
+      MJPEG_PORT: "8080"
+    depends_on:
+      - redis
+      - deepstream

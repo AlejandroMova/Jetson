@@ -69,8 +69,8 @@ sudo bash setup.sh \
   --stream-type sub \
   --authkey <tailscale-key>
 
-# 5. Watch inference from your laptop
-vlc --network-caching=300 http://<jetson-tailscale-ip>:8080/stream
+# 5. Inspect the live pipeline from your laptop (QA Visual — see section below)
+./qa.sh
 ```
 
 > **First run**: TensorRT builds engines for active models (~5 min each).  
@@ -130,6 +130,59 @@ bash tools/update.sh --force-rebuild
 
 > The `.env` credential file on the Jetson is never touched by updates —
 > it lives outside the repo and survives `git pull` safely.
+
+---
+
+## QA Visual App
+
+The QA Visual app lets any NX team member inspect a deployed Jetson remotely over Tailscale —
+see the live camera feed with bounding-box overlays, monitor real-time detections, and watch
+API call payloads, all from a browser. It runs entirely on the Jetson and has **zero impact
+on production** when not active.
+
+### Quick start
+
+```bash
+# SSH into the Jetson, then:
+cd ~/NX-JETSON/deploy
+./qa.sh          # start QA (prints Tailscale URL — Ctrl+click to open in browser)
+./qa.sh stop     # stop QA from another terminal and restore production
+```
+
+`Ctrl+C` in the terminal where `qa.sh` is running also stops QA and restores the production pipeline.
+
+### What you see
+
+| Panel | Content |
+|-------|---------|
+| **Video** | MJPEG stream (25 fps) with coloured bounding boxes and labels for each active feature. |
+| **Camera selector** | Sidebar dropdown — view all cameras tiled or any individual camera. |
+| **Feature toggles** | Checkboxes per capability (`age_gender`, `fall_detection`, etc.) that take effect immediately without restarting the pipeline. `people_counting` is always on. |
+| **Detections log** | Scrollable real-time log of every tracked person — track ID, label, confidence, fall alert. |
+| **API calls log** | Collapsible JSON view of every POST the Jetson is sending to the backend. |
+
+### How it works (architecture)
+
+```
+deepstream container (NX_QA_ENABLED=true):
+  same GStreamer pipeline as production
+  ├── probe (caps_rgba) draws bboxes on the tiled 640×360 frame (OpenCV, CPU)
+  ├── extracts per-camera crops (numpy slice, ~0 ms)
+  ├── publishes metadata to Redis pub/sub (nx:qa:detections, nx:qa:apicalls)
+  └── MjpegServer thread serves annotated frames on :8080
+
+qa_app container (Streamlit, :8501):
+  subscribes to Redis pub/sub → updates UI panels at 400 ms
+  embeds MJPEG via <img src="http://<jetson-tailscale-ip>:8080/stream/...">
+  (browser fetches MJPEG directly from Jetson — works through Tailscale)
+```
+
+### Performance notes
+
+- CPU overhead: ~1-2 ms per frame for OpenCV drawing + JPEG encode (negligible on Orin Nano).
+- Recommended: ≤ 8 streams with QA active on Orin Nano 8 GB. 16 streams are fine for production (fakesink), but enabling QA on 16 streams simultaneously may cause NVMM pressure.
+- The Streamlit container is a lightweight `python:3.11-slim` image — no GPU access needed.
+- Redis pub/sub messages are ephemeral; nothing is persisted to disk.
 
 ---
 
@@ -464,7 +517,9 @@ DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
       └── class 2 (face)   → FaceRecognizer worker (if face_recognition active)
   → [SGIE: age_gender    gie-id=2]  ← one nvinfer per active SGIE capability
   → [SGIE: epp/fire/lpr  gie-id=3+] ← pending models
-  → nvmultistreamtiler → nvvideoconvert → appsink → HTTP MJPEG server (port 8080)
+  → nvmultistreamtiler(640×360) → nvvideoconvert → capsfilter(RGBA)
+  → [probe: crops + analytics] → fakesink
+  (QA mode: probe also draws overlays + feeds MjpegServer on :8080 + publishes Redis metadata)
 
 Async paths (background threads, never block pipeline):
   people_counting → AppearanceWorker → OSNet ONNX → 512-dim vector → POST /api/events (person_appearance)
@@ -478,8 +533,8 @@ The probe dispatcher reads PeopleNet class 0 (person) for tracking and class 2 (
 recognition — both come from the same PGIE pass at zero extra cost.
 `fall_detection` and `face_recognition` are pure Python worker threads (no extra SGIE element).
 
-View the live feed:
+The production pipeline has no video output (`fakesink`). To view the live feed with bounding-box
+overlays, use the QA Visual app:
 ```bash
-vlc --network-caching=300 http://<jetson-ip>:8080/stream
+./qa.sh    # opens Streamlit dashboard at http://<jetson-tailscale-ip>:8501
 ```
-With multiple streams the output is a tiled grid (e.g. 4×4 for 16 cameras) at 1280×720. The tiled preview resolution is intentionally lower than the inference resolution to reduce NVMM pressure on the Orin Nano — detection quality is unaffected.

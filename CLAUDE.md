@@ -23,9 +23,14 @@ NX_tech/
 │   ├── pipelines/              # Lógica del pipeline GStreamer + DeepStream
 │   │   ├── app.py              # Pipeline principal (RTSP en vivo)
 │   │   ├── app_video_testing.py  # Pipeline de testing con archivos MP4
-│   │   ├── probes.py           # Probe GStreamer + handlers + API client
+│   │   ├── probes.py           # Probe GStreamer + handlers + API client + QA overlays
+│   │   ├── mjpeg_server.py     # Servidor MJPEG HTTP (solo activo con NX_QA_ENABLED=true)
 │   │   ├── config_loader.py    # Carga y merge de configuración
 │   │   └── common/             # Utilidades (FPS, bus_call)
+│   ├── qa_app/                 # Dashboard QA Visual (Streamlit)
+│   │   ├── streamlit_app.py    # UI: video en vivo + detecciones + API calls + toggles
+│   │   ├── Dockerfile.qa       # Imagen python:3.11-slim para el container qa_app
+│   │   └── requirements.txt    # streamlit, redis, streamlit-autorefresh
 │   ├── models/                 # Modelos TensorRT (binarios por dispositivo)
 │   │   ├── peoplenet_vpruned_quantized_decrypted_v2.3.4/
 │   │   ├── resnet_age_gender_FB2/
@@ -38,7 +43,9 @@ NX_tech/
 │   │   └── update.sh           # Actualización inteligente (git pull + rebuild)
 │   ├── clients/                # Config por cliente (config.yaml + .env)
 │   ├── setup.sh                # Script de primera instalación en campo
+│   ├── qa.sh                   # Arrancar/detener modo QA (./qa.sh / ./qa.sh stop)
 │   ├── docker-compose.yml
+│   ├── docker-compose.qa.yml   # Override QA: NX_QA_ENABLED=true + servicio qa_app
 │   ├── Dockerfile.jetson
 │   └── docker-entrypoint.sh
 ├── dev/                        # Código de desarrollo / experimentos
@@ -374,20 +381,34 @@ Cuando en una conversación surja una posible mejora — por ejemplo, "ahora usa
 
 ### `deploy/pipelines/` — Núcleo del pipeline
 
-**`app.py`** (~420 líneas)
-Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **No tiene MJPEG ni display** — el tiler corre a 640×360 (0.9 MB RGBA vs 3.5 MB antes) únicamente para que el probe pueda extraer crops; el sink es un `fakesink`. Sin `nvdsosd`. El probe se conecta al src-pad de caps_rgba (RGBA). Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`.
+**`app.py`** (~360 líneas)
+Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **No tiene MJPEG ni display en producción** — el tiler corre a 640×360 únicamente para que el probe pueda extraer crops; el sink es un `fakesink`. Sin `nvdsosd`. El probe se conecta al src-pad de `caps_rgba` (RGBA). Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`. Cuando `NX_QA_ENABLED=true`: llama a `init_qa_cameras()` e `init_qa_grid()`, arranca `MjpegServer` en :8080, y publica `nx:qa:status` en Redis.
 
 **`app_video_testing.py`** (~240 líneas)
 Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + qtdemux` en lugar de `rtspsrc`. Útil para desarrollo y QA sin DVR físico. Sale con RTSP output en lugar de MJPEG. Acepta `--capabilities` y `--client` por CLI.
 
-**`probes.py`** (~1300 líneas)
+**`probes.py`** (~1400 líneas)
 El motor central de analytics. Se conecta al caps_rgba src-pad del pipeline (RGBA, post-tiler) y se ejecuta en cada frame. Contiene:
-- `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea)
+- `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea). Con `NX_QA_ENABLED`: además publica a `nx:qa:apicalls` antes del POST.
 - `_AgeGenderHandler`: acumula 10 votes del SGIE antes de confirmar clasificación
 - `_FallDetectionHandler`: despacha crops al `PoseWorker`, aplica 3 reglas geométricas
 - `_FaceRecognitionHandler`: cruza detecciones del SGIE FaceDetectIR con el `FaceRecognizer`
 - `osd_sink_pad_buffer_probe`: función principal que procesa cada batch de frames, gestiona el ciclo de vida de tracks (entry/exit), despacha handlers, acumula crops y analytics
 - Stubs `_EppHandler`, `_FireSmokeHandler`, `_LicensePlateHandler` (pendiente integración)
+- **QA Visual (solo si `NX_QA_ENABLED=true`)**:
+  - `init_qa_cameras(channels)`: inicializa `camera_frame_queues` por cámara
+  - `init_qa_grid(cols, rows, cell_w, cell_h)`: guarda dimensiones del tiler para el mapping de bboxes
+  - `_draw_qa_overlays(frame_bgr, qa_tracks)`: dibuja bboxes + labels con OpenCV (CPU, ~1 ms)
+  - `_is_capability_active(cap)`: lee Redis hash `nx:qa:capabilities` para toggles de features
+  - `_qa_publish(channel, data)`: fire-and-forget pub/sub a Redis
+  - Al final de cada frame: dibuja overlays, empuja frame tileado a `tiled_frame_queue`, extrae crops por cámara, publica `nx:qa:detections`
+
+**`mjpeg_server.py`** (~130 líneas)
+Servidor HTTP MJPEG daemon. Solo se instancia cuando `NX_QA_ENABLED=true` (desde `app.py`). Expone:
+- `/stream/all` — frame tileado completo (640×360) con todos los bboxes dibujados
+- `/stream/<camera_id>` — crop individual de esa cámara (e.g. `/stream/jetson-nx-001-ch01`)
+
+Arquitectura interna de dos threads: `_encode_loop` (consume queues de frames, encoda a JPEG en background) + hilo HTTP (`run()`, sirve multipart/x-mixed-replace a 25 fps con lock mínimo). Calidad JPEG configurable (default 72). Cero impacto en producción sin QA.
 
 **`config_loader.py`** (~326 líneas)
 Carga y fusiona configuración desde 5 fuentes (prioridad: env vars > `/etc/nx_*` > `config.yaml` > `.env` > defaults). Define los 15 paquetes predefinidos (`PACKAGE_DEFINITIONS`), capacidades válidas, límites de NVDEC, y genera URLs RTSP interpolando el patrón del DVR. Retorna un `ClientConfig` dataclass.
@@ -477,10 +498,29 @@ Credenciales del backend: `API_BASE_URL`, `API_KEY`, `WS_BASE_URL`. **Gitignorea
 
 ---
 
+### `deploy/qa_app/` — Dashboard QA Visual (Streamlit)
+
+**`streamlit_app.py`** (~265 líneas)
+Dashboard Streamlit accesible vía Tailscale desde cualquier dispositivo del equipo NX. Se autorefresea cada 400 ms. Sidebar: info del pipeline (cliente, paquete, sector, canales), selector de cámara, toggles de features (escribe en Redis hash `nx:qa:capabilities`), estado de conexión Redis. Panel principal: video MJPEG embebido vía JS con `window.location.hostname` (funciona con Tailscale), detecciones en tiempo real, API calls expandibles con JSON. Thread daemon en background suscribe a `nx:qa:detections` y `nx:qa:apicalls`.
+
+**`Dockerfile.qa`**
+Imagen `python:3.11-slim`. Instala solo `streamlit`, `redis` y `streamlit-autorefresh`. No necesita acceso a GPU. Healthcheck en `/_stcore/health`.
+
+**`requirements.txt`**
+`streamlit>=1.32`, `redis>=5.0`, `streamlit-autorefresh>=1.0.0`.
+
+---
+
 ### `deploy/` — Archivos de orquestación Docker
 
 **`docker-compose.yml`**
-Tres servicios: `deepstream` (pipeline principal, puerto 8080 MJPEG), `db` (TimescaleDB PostgreSQL 16, puerto 5432), `redis` (Redis 7, puerto 6379). Monta los directorios de pipelines, modelos, clientes y tools.
+Tres servicios: `deepstream` (pipeline principal, puerto 8080 expuesto — activo solo con QA), `db` (TimescaleDB PostgreSQL 16, puerto 5432), `redis` (Redis 7, puerto 6379). Monta los directorios de pipelines, modelos, clientes y tools.
+
+**`docker-compose.qa.yml`**
+Override file para modo QA. Solo se carga desde `qa.sh`. Agrega `NX_QA_ENABLED: "true"` al servicio `deepstream` y añade el servicio `qa_app` (Streamlit, puerto 8501). Nunca se usa en producción.
+
+**`qa.sh`**
+Script de activación del modo QA. Subcomandos: `start` (default) y `stop`. Al arrancar: detiene el pipeline de producción, inicia los containers con el override QA, espera a que Streamlit esté listo, imprime la URL Tailscale clickable. `Ctrl+C` o `stop` restauran la producción automáticamente vía `trap cleanup`.
 
 **`Dockerfile.jetson`**
 Imagen ARM64 basada en `nvcr.io/nvidia/deepstream:7.1-samples-multiarch`. Instala pyds 1.1.11, onnxruntime-gpu para aarch64, insightface ≥ 0.7.3.
