@@ -5,7 +5,7 @@ Dashboard de inspección remota para Jetsons desplegados.
 Accesible vía Tailscale en http://<jetson-tailscale-ip>:8501
 
 Panels:
-  - Video en vivo con bboxes (MJPEG desde el pipeline, puerto 8080)
+  - Video en vivo con bboxes (MJPEG leído por Python desde deepstream:8080)
   - Detecciones en tiempo real (Redis pub/sub nx:qa:detections)
   - API Calls log (Redis pub/sub nx:qa:apicalls)
   - Toggles de capacidades (Redis hash nx:qa:capabilities)
@@ -17,15 +17,18 @@ Arrancar con: ./qa.sh  (desde deploy/)
 import json
 import os
 import threading
+import time
 from collections import deque
 
 import redis
+import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 # ── Config ────────────────────────────────────────────────────────────────────
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-MJPEG_PORT = int(os.getenv("MJPEG_PORT", "8080"))
+REDIS_HOST  = os.getenv("REDIS_HOST", "redis")
+MJPEG_PORT  = int(os.getenv("MJPEG_PORT", "8080"))
+MJPEG_BASE  = f"http://deepstream:{MJPEG_PORT}"   # Docker-internal hostname
 MAX_DETECTIONS = 200
 MAX_APICALLS   = 50
 
@@ -36,14 +39,67 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Autorefresh cada 400ms (mantiene el UI actualizado sin bloquear el thread de fondo)
+# Autorefresh cada 400ms
 st_autorefresh(interval=400, limit=None, key="qa_tick")
+
+
+# ── MJPEG reader (Python-side) ────────────────────────────────────────────────
+class _MjpegReader:
+    """
+    Lee el stream MJPEG desde el container deepstream (red Docker interna).
+    Un thread por stream_key, guarda el último JPEG disponible.
+    st.image lo muestra en cada rerender de Streamlit (~2 fps con 400ms refresh).
+    """
+
+    def __init__(self):
+        self._frames: dict = {}     # stream_key → bytes (último JPEG)
+        self._lock = threading.Lock()
+        self._running: set = set()
+
+    def get_frame(self, key: str) -> bytes | None:
+        if key not in self._running:
+            self._start(key)
+        with self._lock:
+            return self._frames.get(key)
+
+    def _start(self, key: str):
+        self._running.add(key)
+        t = threading.Thread(target=self._loop, args=(key,), daemon=True,
+                             name=f"mjpeg-{key}")
+        t.start()
+
+    def _loop(self, key: str):
+        while True:
+            try:
+                r = requests.get(f"{MJPEG_BASE}/stream/{key}",
+                                 stream=True, timeout=15)
+                buf = b""
+                for chunk in r.iter_content(chunk_size=8192):
+                    buf += chunk
+                    # Extraer frames JPEG del stream multipart
+                    while True:
+                        s = buf.find(b"\xff\xd8")
+                        e = buf.find(b"\xff\xd9", s + 2) if s != -1 else -1
+                        if s != -1 and e != -1:
+                            with self._lock:
+                                self._frames[key] = buf[s : e + 2]
+                            buf = buf[e + 2 :]
+                        else:
+                            break
+                    if len(buf) > 200_000:
+                        buf = buf[-10_000:]
+            except Exception:
+                time.sleep(2)
+
+
+@st.cache_resource
+def _get_reader() -> _MjpegReader:
+    return _MjpegReader()
 
 
 # ── Redis helpers ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def _get_redis():
-    """Conexión Redis compartida para operaciones síncronas (GET/HGET/HSET)."""
     try:
         r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True,
                         socket_connect_timeout=2, socket_timeout=2)
@@ -66,7 +122,6 @@ def _redis_ok() -> bool:
 
 # ── Subscriber de fondo ───────────────────────────────────────────────────────
 def _start_subscriber():
-    """Inicia el thread de subscripción Redis una sola vez por sesión."""
     def _loop():
         try:
             r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
@@ -85,7 +140,7 @@ def _start_subscriber():
                 elif "apicalls" in ch:
                     st.session_state.apicalls.appendleft(data)
         except Exception:
-            pass    # silencioso: reconexión la maneja st_autorefresh + ping del sidebar
+            pass
 
     t = threading.Thread(target=_loop, daemon=True, name="qa-subscriber")
     t.start()
@@ -132,15 +187,9 @@ with st.sidebar:
 
     # Selector de cámara
     cam_label_map: dict = {"Todas las cámaras": "all"}
+    jetson_id = status.get("jetson_id", "")
     for ch in channels:
-        # camera_id format: "<JETSON_ID>-ch<NN>"  (viene del status o inferido)
-        # Usamos el mismo formato que usa _camera_id_for en probes.py
-        jetson_id = status.get("jetson_id", "")
-        if jetson_id:
-            cam_id = f"{jetson_id}-ch{ch:02d}"
-        else:
-            # fallback: construir igual que probes.py
-            cam_id = f"ch{ch:02d}"
+        cam_id = f"{jetson_id}-ch{ch:02d}" if jetson_id else f"ch{ch:02d}"
         cam_label_map[f"Cámara {ch}"] = cam_id
 
     selected_label = st.selectbox(
@@ -173,7 +222,6 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Estado de conexión
     if _redis_ok():
         st.success("● Redis conectado")
     else:
@@ -186,40 +234,14 @@ col_video, col_det = st.columns([55, 45])
 
 with col_video:
     st.markdown("### 📹 Video en vivo")
-    # La URL se resuelve en el browser del usuario usando window.location.hostname
-    # (el mismo IP que usa para acceder a Streamlit vía Tailscale = IP del Jetson)
-    st.components.v1.html(
-        f"""
-        <div style="background:#111; border-radius:8px; overflow:hidden; min-height:200px;">
-          <img id="nx-stream"
-               style="width:100%; display:block; image-rendering:pixelated;"
-               alt="Conectando al stream...">
-          <div id="nx-err" style="display:none; color:#f88; padding:16px; font-family:monospace;">
-            Sin stream. Verifica que el pipeline esté activo.
-          </div>
-        </div>
-        <script>
-          (function() {{
-            var host = window.location.hostname;
-            var key  = "{stream_key}";
-            var img  = document.getElementById('nx-stream');
-            var err  = document.getElementById('nx-err');
-            img.src = 'http://' + host + ':{MJPEG_PORT}/stream/' + key;
-            img.onerror = function() {{
-              img.style.display = 'none';
-              err.style.display = 'block';
-            }};
-            img.onload = function() {{
-              img.style.display = 'block';
-              err.style.display = 'none';
-            }};
-          }})();
-        </script>
-        """,
-        height=385,
-    )
+    reader = _get_reader()
+    frame  = reader.get_frame(stream_key)
+    if frame:
+        st.image(frame, use_container_width=True)
+    else:
+        st.info("Conectando al stream... (puede tardar unos segundos)")
     stream_label = "Todas las cámaras (tiled)" if stream_key == "all" else stream_key
-    st.caption(f"Stream: `{stream_label}` · 640×360 · 25 fps")
+    st.caption(f"Stream: `{stream_label}` · 640×360 · ~2 fps")
 
 with col_det:
     st.markdown("### 📊 Detecciones")
@@ -229,16 +251,16 @@ with col_det:
     else:
         with st.container(height=360):
             for d in det_items[:60]:
-                ts  = (d.get("ts") or "")[-12:-4]      # HH:MM:SS.mmm → HH:MM:SS
-                cam = d.get("cam", "")
+                ts     = (d.get("ts") or "")[-12:-4]
+                cam    = d.get("cam", "")
                 tracks = d.get("tracks", [])
                 if not tracks:
                     continue
                 cam_short = cam.split("-ch")[-1] if "-ch" in cam else cam
                 st.markdown(f"**{ts}** · `ch{cam_short}`")
                 for t in tracks:
-                    icon = "⚠️" if t.get("fall") else "👤"
-                    label = t.get("label", f"P#{t.get('track_id','?')}")
+                    icon  = "⚠️" if t.get("fall") else "👤"
+                    label = t.get("label", f"P#{t.get('track_id', '?')}")
                     conf  = t.get("confidence", 0)
                     st.markdown(
                         f"&nbsp;&nbsp;{icon} `{label}` &nbsp;conf={conf:.2f}",
