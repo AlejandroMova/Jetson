@@ -53,6 +53,31 @@ docker compose \
     -f docker-compose.qa.yml \
     up --build -d --remove-orphans deepstream qa_app redis
 
+# ── Cleanup: solo responde a señales explícitas (INT/TERM), nunca a EXIT.
+# Llamar exit 0 al final garantiza que el script termina exactamente una vez.
+_cleanup() {
+    trap '' INT TERM   # bloquear señales adicionales durante el cleanup
+    echo ""
+    echo "  Deteniendo QA y restaurando producción..."
+    docker compose -f docker-compose.yml -f docker-compose.qa.yml \
+        kill deepstream qa_app 2>/dev/null || true
+    docker compose -f docker-compose.yml -f docker-compose.qa.yml \
+        rm -f qa_app 2>/dev/null || true
+    docker compose up -d 2>/dev/null || true
+    echo "  Producción restaurada."
+    echo ""
+    exit 0
+}
+
+# Registrar SOLO INT y TERM — no EXIT.
+# Con EXIT también registrado, bash dispara el handler dos veces cuando Ctrl+C
+# mata docker compose logs (una por INT, otra porque set -e hace salir el script).
+trap _cleanup INT TERM
+
+# A partir de aquí los errores no deben abortar el script automáticamente:
+# docker compose logs -f termina con código != 0 cuando lo mata Ctrl+C.
+set +e
+
 # Esperar a que Streamlit esté listo (máx 3 min, ping cada 3 s)
 echo "  Esperando que Streamlit arranque..."
 READY=0
@@ -87,26 +112,11 @@ else
 fi
 echo ""
 
-# Trampa Ctrl+C: restaurar producción al salir (protegido contra re-entrada)
-_CLEANING=0
-_cleanup() {
-    [ "$_CLEANING" = "1" ] && return
-    _CLEANING=1
-    trap '' INT TERM   # ignorar señales adicionales durante el cleanup
-    echo ""
-    echo "  Deteniendo QA y restaurando producción..."
-    docker compose -f docker-compose.yml -f docker-compose.qa.yml \
-        kill deepstream qa_app 2>/dev/null || true
-    docker compose -f docker-compose.yml -f docker-compose.qa.yml \
-        rm -f qa_app 2>/dev/null || true
-    docker compose up -d
-    echo "  Producción restaurada."
-    echo ""
-}
-trap _cleanup EXIT INT TERM
-
 # Seguir los logs de ambos containers (se interrumpe con Ctrl+C)
 docker compose \
     -f docker-compose.yml \
     -f docker-compose.qa.yml \
     logs -f deepstream qa_app
+
+# Si los containers se pararon solos (sin Ctrl+C), limpiar igualmente
+_cleanup
