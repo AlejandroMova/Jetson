@@ -53,10 +53,10 @@ docker compose \
     -f docker-compose.qa.yml \
     up --build -d --remove-orphans deepstream qa_app redis
 
-# Esperar a que Streamlit esté listo (máx 90 s, ping cada 3 s)
+# Esperar a que Streamlit esté listo (máx 3 min, ping cada 3 s)
 echo "  Esperando que Streamlit arranque..."
 READY=0
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
     if curl -sf "http://localhost:8501/_stcore/health" > /dev/null 2>&1; then
         READY=1
         break

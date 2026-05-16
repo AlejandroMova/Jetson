@@ -22,4 +22,3 @@ services:
       MJPEG_PORT: "8080"
     depends_on:
       - redis
-      - deepstream
