@@ -51,7 +51,7 @@ docker compose stop deepstream 2>/dev/null || true
 docker compose \
     -f docker-compose.yml \
     -f docker-compose.qa.yml \
-    up --build -d deepstream qa_app redis
+    up --build -d --remove-orphans deepstream qa_app redis
 
 # Esperar a que Streamlit esté listo (máx 90 s, ping cada 3 s)
 echo "  Esperando que Streamlit arranque..."
