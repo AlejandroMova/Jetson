@@ -202,35 +202,35 @@ with st.sidebar:
     st.markdown("---")
 
     # Toggles de capacidades
-    ALL_CAPS = [
+    IMPLEMENTED = [
         "people_counting", "age_gender", "fall_detection", "face_recognition",
-        "epp_detection", "fire_smoke", "license_plate",
     ]
-    UNIMPLEMENTED = {"epp_detection", "fire_smoke", "license_plate"}
+    UNIMPLEMENTED = ["epp_detection", "fire_smoke", "license_plate"]
 
     st.markdown("**🔧 Capacidades**")
-    for cap in ALL_CAPS:
-        if cap == "people_counting":
-            st.checkbox(cap, value=True, disabled=True,
-                        help="Siempre activo — no se puede apagar", key="cap_people_counting")
-            continue
+    # people_counting siempre activo
+    st.checkbox("people_counting", value=True, disabled=True,
+                help="Siempre activo — no se puede apagar", key="cap_people_counting")
 
+    # Capacidades implementadas — todas toggleables (las no activas en pipeline
+    # aplican solo a workers Python que chequean Redis; SGIEs requieren reinicio)
+    for cap in IMPLEMENTED[1:]:
         in_pipeline = cap in active_caps
-        not_impl    = cap in UNIMPLEMENTED
-
-        if not in_pipeline:
-            label = f"{cap} ({'pendiente' if not_impl else 'no en este paquete'})"
-            st.checkbox(label, value=False, disabled=True, key=f"cap_{cap}_off")
-        elif _r:
+        help_text = None if in_pipeline else "No activo en este paquete — activar reinicia el pipeline"
+        if _r:
             try:
                 current_val = _r.hget("nx:qa:capabilities", cap)
-                is_on = current_val is None or current_val == "1"
-                new_val = st.checkbox(cap, value=is_on, key=f"cap_{cap}")
+                is_on = (current_val is None and in_pipeline) or current_val == "1"
+                new_val = st.checkbox(cap, value=is_on, key=f"cap_{cap}", help=help_text)
                 _r.hset("nx:qa:capabilities", cap, "1" if new_val else "0")
             except Exception:
-                st.checkbox(cap, value=True, disabled=True, key=f"cap_{cap}_err")
+                st.checkbox(cap, value=in_pipeline, disabled=True, key=f"cap_{cap}_err")
         else:
-            st.checkbox(cap, value=True, disabled=True, key=f"cap_{cap}_nr")
+            st.checkbox(cap, value=in_pipeline, disabled=True, key=f"cap_{cap}_nr")
+
+    # Capacidades pendientes de implementar
+    for cap in UNIMPLEMENTED:
+        st.checkbox(f"{cap} (pendiente)", value=False, disabled=True, key=f"cap_{cap}_pending")
 
     st.markdown("---")
 
@@ -253,7 +253,7 @@ with col_video:
     else:
         st.info("Conectando al stream... (puede tardar unos segundos)")
     stream_label = "Todas las cámaras (tiled)" if stream_key == "all" else stream_key
-    st.caption(f"Stream: `{stream_label}` · 640×360 · ~2 fps")
+    st.caption(f"Stream: `{stream_label}` · 640×360")
 
 with col_det:
     st.markdown("### 📊 Detecciones")

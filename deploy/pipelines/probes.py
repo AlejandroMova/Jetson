@@ -1380,7 +1380,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     "track_id": p_track_id,
                     "confidence": round(float(obj_meta.confidence), 3),
                     "bbox_tiled": (bbox["left"], bbox["top"], bbox["width"], bbox["height"]),
-                    "label": obj_meta.text_params.display_text or f"P#{p_track_id}",
+                    "label": str(obj_meta.text_params.display_text or f"P#{p_track_id}"),
                     "fall": _qa_fall,
                 })
 
@@ -1443,7 +1443,10 @@ def osd_sink_pad_buffer_probe(_pad, info):
     # ── QA: overlays + MJPEG frames + Redis detections ───────────────────────
     if _IS_QA_ENABLED and _qa_frame_bgr is not None:
         # Dibujar bboxes y labels sobre el frame tileado
-        _draw_qa_overlays(_qa_frame_bgr, _qa_all_tracks)
+        try:
+            _draw_qa_overlays(_qa_frame_bgr, _qa_all_tracks)
+        except Exception as _e:
+            logger.debug("[QA] overlay error: %s", _e)
 
         # Tiled frame completo → /stream/all
         try:
