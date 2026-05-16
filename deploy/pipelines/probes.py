@@ -174,11 +174,11 @@ def init_qa_grid(tiler_cols: int, tiler_rows: int, cell_w: int, cell_h: int) -> 
 
 def init_qa_cameras(channels: list) -> None:
     """Crea una Queue por cámara en camera_frame_queues. Llamar después de init_channel_map."""
-    global camera_frame_queues
-    camera_frame_queues = {
-        _camera_id_for(i): queue.Queue(maxsize=1)
-        for i in range(len(channels))
-    }
+    # Mutar el dict in-place para que los importadores del objeto original
+    # (app.py, MjpegServer) vean las queues correctas sin necesidad de reimportar.
+    camera_frame_queues.clear()
+    for i in range(len(channels)):
+        camera_frame_queues[_camera_id_for(i)] = queue.Queue(maxsize=1)
     if _IS_QA_ENABLED:
         logger.info("[QA] Queues de cámara: %s", list(camera_frame_queues.keys()))
 

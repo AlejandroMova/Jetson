@@ -249,7 +249,7 @@ with col_video:
     reader = _get_reader()
     frame  = reader.get_frame(stream_key)
     if frame:
-        st.image(frame, use_container_width=True)
+        st.image(frame, width="stretch")
     else:
         st.info("Conectando al stream... (puede tardar unos segundos)")
     stream_label = "Todas las cámaras (tiled)" if stream_key == "all" else stream_key
