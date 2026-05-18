@@ -183,8 +183,8 @@ ANALYTICS_SEND_INTERVAL_SECS: float = 60.0
 CROPS_DIR: str            = "crops"
 CROP_SAMPLE_INTERVAL: int = 15
 CROP_MAX_PER_PERSON: int  = 5
-CROP_MIN_WIDTH: int       = 64
-CROP_MIN_HEIGHT: int      = 128
+CROP_MIN_WIDTH: int       = 48
+CROP_MIN_HEIGHT: int      = 96
 # Frames to wait for an appearance embedding before emitting person_entry anyway.
 # At 30 fps: first enqueue on frame 0, result typically arrives by frame ~2.
 # 90 frames ≈ 3 seconds is a conservative deadline for slow or occluded crops.
@@ -1394,6 +1394,10 @@ def _handle_appearance_reid(
                     vec, camera_id
                 )
                 state.global_id = global_id
+                logger.info(
+                    "ReID track=%d cam=%s → %s gid=%s prev=%s",
+                    p_track_id, camera_id, event_type, global_id, prev_camera,
+                )
 
                 if not state.entry_emitted:
                     state.entry_emitted = True
@@ -1646,10 +1650,12 @@ def pre_tiler_analytics_probe(_pad, info):
                         qa_face_name = f"{name} {conf:.0%}"
 
             # Escribir labels para Probe B
+            _ts = _active_tracks.get(track_key)
             _track_labels[p_track_id] = {
                 "face_name":  qa_face_name,
                 "fall":       qa_fall,
                 "age_gender": qa_age_gender,
+                "global_id":  _ts.global_id if _ts else None,
             }
 
             # Crop capture
@@ -1790,9 +1796,11 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
                         age_gender_text = f"{gender_disp}|{age_disp}"
                     break
 
-            # Face name y fall desde _track_labels (escrito por Probe A)
+            # Face name, fall, global_id desde _track_labels (escrito por Probe A)
             labels = _track_labels.get(p_track_id, {})
-            label_parts = [f"P#{p_track_id}"]
+            gid = labels.get("global_id")
+            base_label = f"P#{p_track_id}" + (f"·{gid[:6]}" if gid else "")
+            label_parts = [base_label]
             if age_gender_text:
                 label_parts.append(age_gender_text)
             if labels.get("face_name"):

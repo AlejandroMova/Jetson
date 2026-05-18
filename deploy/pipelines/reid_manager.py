@@ -28,7 +28,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ── Tuneable constants ──────────────────────────────────────────────────────────
-SIMILARITY_THRESHOLD: float = 0.65   # cosine sim (= dot product on L2-normalised vecs)
+SIMILARITY_THRESHOLD: float = 0.55   # cosine sim (= dot product on L2-normalised vecs)
 PRESENCE_WINDOW_S:    float = 300.0  # 5 min — within this, camera switch = channel_change
 REID_TTL_S:           float = 3600.0 # 1 hour — global_id expires if unseen for this long
 SAVE_INTERVAL_S:      float = 30.0   # persist to disk at most every N seconds
