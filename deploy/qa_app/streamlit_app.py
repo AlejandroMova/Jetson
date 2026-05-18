@@ -26,7 +26,14 @@ from streamlit_autorefresh import st_autorefresh
 # ── Config ────────────────────────────────────────────────────────────────────
 REDIS_HOST  = os.getenv("REDIS_HOST", "redis")
 MJPEG_PORT  = int(os.getenv("MJPEG_PORT", "8080"))
-MJPEG_BASE  = f"http://deepstream:{MJPEG_PORT}"   # Docker-internal hostname
+
+# Hostname del Jetson tal como lo ve el browser (Tailscale IP o LAN IP).
+# st.context.headers["host"] = "100.67.192.58:8501" → extraemos solo la IP.
+try:
+    _host_hdr = st.context.headers.get("host", "")
+    MJPEG_HOST = _host_hdr.split(":")[0] if _host_hdr else "localhost"
+except Exception:
+    MJPEG_HOST = "localhost"
 MAX_DETECTIONS = 200
 MAX_APICALLS   = 50
 
@@ -190,35 +197,12 @@ col_video, col_det = st.columns([55, 45])
 
 with col_video:
     st.markdown("### 📹 Video en vivo")
-    # El browser abre el MJPEG directo al Jetson vía Tailscale.
-    # window.parent.location.hostname es la IP Tailscale con la que el usuario
-    # abrió el dashboard — la misma donde corre el MJPEG en :8080.
-    # El iframe no se destruye en cada rerender si el HTML no cambia → sin parpadeo.
     stream_label = "Todas las cámaras (tiled)" if stream_key == "all" else stream_key
-    st.components.v1.html(
-        f"""<!DOCTYPE html>
-<html><head>
-<style>
-  body {{ margin:0; padding:0; background:#111; overflow:hidden; }}
-  img  {{ width:100%; display:block; border-radius:4px; }}
-  p    {{ color:#888; font-family:sans-serif; font-size:13px;
-          margin:12px; text-align:center; }}
-</style>
-</head><body>
-  <img id="s" alt="">
-  <p id="msg">Conectando al stream...</p>
-  <script>
-    var img = document.getElementById('s');
-    var msg = document.getElementById('msg');
-    var host = window.parent.location.hostname;
-    img.src = 'http://' + host + ':{MJPEG_PORT}/stream/{stream_key}';
-    img.onload  = function() {{ msg.style.display = 'none'; }};
-    img.onerror = function() {{ msg.textContent = 'Sin señal — esperando pipeline...'; }};
-  </script>
-</body></html>""",
-        height=370,
-        scrolling=False,
-    )
+    # st.iframe preserva el iframe entre rerenders si el src no cambia
+    # → sin interrupciones del stream. El HTML lo sirve el propio MjpegServer
+    # desde /viewer/<key> con un <img src="/stream/<key>"> mismo-origen.
+    viewer_url = f"http://{MJPEG_HOST}:{MJPEG_PORT}/viewer/{stream_key}"
+    st.iframe(viewer_url, height=420, scrolling=False)
     st.caption(f"Stream: `{stream_label}` · 640×360 · MJPEG nativo")
 
 with col_det:

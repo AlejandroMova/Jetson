@@ -102,16 +102,34 @@ class MjpegServer(threading.Thread):
 
         class _Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                # Normalize path: /stream/all → key="all"
-                #                 /stream/jetson-nx-001-ch01 → key="jetson-nx-001-ch01"
-                path = self.path.strip("/")          # "stream/all" or "stream/<cam_id>"
+                path = self.path.strip("/")
                 parts = path.split("/", 1)
-                if len(parts) != 2 or parts[0] != "stream":
-                    self.send_response(404)
+                if len(parts) != 2:
+                    self.send_response(404); self.end_headers(); return
+
+                prefix, key = parts[0], parts[1]
+
+                # /viewer/<key> → HTML page con <img> que apunta al stream
+                # (mismo origen → sin CORS; el browser maneja MJPEG nativamente)
+                if prefix == "viewer":
+                    html = (
+                        "<!DOCTYPE html><html><head>"
+                        "<style>*{margin:0;padding:0;box-sizing:border-box}"
+                        "body{background:#111;overflow:hidden}"
+                        "img{width:100%;display:block}</style></head>"
+                        f"<body><img src='/stream/{key}'></body></html>"
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(html)))
                     self.end_headers()
+                    self.wfile.write(html)
                     return
 
-                key = parts[1]   # "all" or camera_id
+                if prefix != "stream":
+                    self.send_response(404); self.end_headers(); return
+
+                # /stream/<key> → MJPEG multipart
                 self.send_response(200)
                 self.send_header(
                     "Content-Type", "multipart/x-mixed-replace; boundary=nxframe"
