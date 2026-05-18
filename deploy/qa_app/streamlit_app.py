@@ -267,8 +267,9 @@ with st.sidebar:
     # ── FPS del Pipeline ──────────────────────────────────────────────────────
     st.markdown("**⚡ FPS del Pipeline**")
     if pipeline_stats:
-        fps_total = pipeline_stats.get("fps_total", 0.0)
-        st.metric("Total", f"{fps_total:.1f} fps", label_visibility="visible")
+        fps_per_cam = pipeline_stats.get("fps_per_camera", {})
+        fps_avg = (sum(fps_per_cam.values()) / len(fps_per_cam)) if fps_per_cam else 0.0
+        st.metric("Promedio por cámara", f"{fps_avg:.1f} fps")
         for cam_id, fps_val in pipeline_stats.get("fps_per_camera", {}).items():
             ch = cam_id.split("-ch")[-1] if "-ch" in cam_id else cam_id
             st.caption(f"`ch{ch}` → {fps_val:.1f} fps")
