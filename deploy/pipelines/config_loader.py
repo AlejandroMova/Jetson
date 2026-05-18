@@ -97,6 +97,9 @@ class ClientConfig:
     sector: str = "comercio"    # "comercio" | "industrial" | "hogar"
     package: str = "manual"     # contracted package; "manual" = custom/testing
     entry_exit_channels: List[int] = field(default_factory=list)
+    external_channels:   List[int] = field(default_factory=list)
+    count_internal:      bool      = True
+    count_external:      bool      = True
     pgie_batch_size: int = 0   # >0 = override nvinfer_config.txt at runtime; 0 = use file value
     pgie_interval: int = -1    # ≥0 = override nvinfer_config.txt at runtime; -1 = use file value
     sgie_interval: int = -1    # ≥0 = override all SGIE nvinfer configs at runtime; -1 = use file value
@@ -150,6 +153,10 @@ class ClientConfig:
             idx for idx, ch in enumerate(self.channels)
             if ch in self.entry_exit_channels
         }
+
+    def external_pad_indices(self) -> set:
+        """Return pad indices for channels marked as external (rest are internal by default)."""
+        return {idx for idx, ch in enumerate(self.channels) if ch in self.external_channels}
 
 
 def _read_etc_file(path: str, env_var: str, label: str) -> str:
@@ -268,6 +275,12 @@ def load_config() -> ClientConfig:
     if isinstance(entry_exit_channels, str):
         entry_exit_channels = [int(x.strip()) for x in entry_exit_channels.split(",") if x.strip()]
 
+    external_channels = cfg.get("external_channels", [])
+    if isinstance(external_channels, str):
+        external_channels = [int(x.strip()) for x in external_channels.split(",") if x.strip()]
+    count_internal = bool(cfg.get("count_internal", True))
+    count_external = bool(cfg.get("count_external", True))
+
     stream_type = cfg.get("stream_type", "main")
     if stream_type not in STREAM_TYPES:
         raise RuntimeError(
@@ -294,6 +307,9 @@ def load_config() -> ClientConfig:
         sector=sector,
         package=package,
         entry_exit_channels=entry_exit_channels,
+        external_channels=external_channels,
+        count_internal=count_internal,
+        count_external=count_external,
         pgie_batch_size=int(cfg.get("pgie_batch_size", 0)),
         pgie_interval=int(cfg.get("pgie_interval", -1)),
         sgie_interval=int(cfg.get("sgie_interval", -1)),

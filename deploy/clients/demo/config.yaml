@@ -86,6 +86,15 @@ tracker: nvdcf
 # Dejar vacío si ninguna cámara cubre directamente la puerta de entrada.
 entry_exit_channels: []
 
+# Tipo de cámara — las no listadas son internas por defecto.
+# Solo agregar canales que son externos (ej. fachada, estacionamiento).
+external_channels: []
+
+# Control de conteo por tipo de cámara.
+# false → esas cámaras no ejecutan analytics ni envían eventos al API.
+count_internal: true
+count_external: true
+
 # ── Ajuste de inferencia PeopleNet (opcional) ─────────────────────────────
 #
 # pgie_batch_size — frames procesados por llamada TRT.

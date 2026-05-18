@@ -61,6 +61,13 @@ _entry_exit_pads: set = set()
 _entry_exit_probe_count: int = 0
 _ENTRY_EXIT_REFRESH_EVERY: int = 30   # actualizar desde Redis cada N llamadas al probe
 
+# Tipo de cámara: pad indices externos y flags de conteo por tipo
+_external_pads:             set  = set()
+_count_internal:            bool = True
+_count_external:            bool = True
+_camera_type_probe_count:   int  = 0
+_CAMERA_TYPE_REFRESH_EVERY: int  = 30
+
 # QA: probe A escribe, probe B lee — track_id → {face_name, fall, age_gender}
 # Solo se popula cuando _IS_QA_ENABLED=True. GIL garantiza acceso seguro (hilo único GStreamer).
 _track_labels: Dict[int, dict] = {}
@@ -85,6 +92,17 @@ def init_entry_exit_pads(pad_indices: set) -> None:
     logger.info("Entry/exit pad indices: %s", pad_indices)
 
 
+def init_camera_types(external_pad_indices: set, count_internal: bool, count_external: bool) -> None:
+    global _external_pads, _count_internal, _count_external
+    _external_pads  = external_pad_indices
+    _count_internal = count_internal
+    _count_external = count_external
+    logger.info(
+        "Camera types — external pads: %s  count_internal=%s  count_external=%s",
+        external_pad_indices, count_internal, count_external,
+    )
+
+
 def _refresh_entry_exit_from_redis() -> None:
     """Lee nx:qa:entry_exit de Redis y actualiza _entry_exit_pads en caliente (QA mode)."""
     global _entry_exit_pads
@@ -97,6 +115,27 @@ def _refresh_entry_exit_from_redis() -> None:
         ee_channels = json.loads(raw)
         ch_to_pad = {ch: idx for idx, ch in _channel_map.items()}
         _entry_exit_pads = {ch_to_pad[ch] for ch in ee_channels if ch in ch_to_pad}
+    except Exception:
+        pass
+
+
+def _refresh_camera_types_from_redis() -> None:
+    """Lee external_channels y flags de conteo de Redis en caliente (QA mode)."""
+    global _external_pads, _count_internal, _count_external
+    if not _redis_qa:
+        return
+    try:
+        raw = _redis_qa.get("nx:qa:external_channels")
+        if raw is not None:
+            ext_channels = json.loads(raw)
+            ch_to_pad = {ch: idx for idx, ch in _channel_map.items()}
+            _external_pads = {ch_to_pad[ch] for ch in ext_channels if ch in ch_to_pad}
+        ci = _redis_qa.get("nx:qa:count_internal")
+        if ci is not None:
+            _count_internal = (ci if isinstance(ci, str) else ci.decode()) == "1"
+        ce = _redis_qa.get("nx:qa:count_external")
+        if ce is not None:
+            _count_external = (ce if isinstance(ce, str) else ce.decode()) == "1"
     except Exception:
         pass
 
@@ -1293,10 +1332,13 @@ def pre_tiler_analytics_probe(_pad, info):
     if not batch_meta:
         return Gst.PadProbeReturn.OK
 
-    global _entry_exit_probe_count
+    global _entry_exit_probe_count, _camera_type_probe_count
     _entry_exit_probe_count += 1
     if _entry_exit_probe_count % _ENTRY_EXIT_REFRESH_EVERY == 0:
         _refresh_entry_exit_from_redis()
+    _camera_type_probe_count += 1
+    if _camera_type_probe_count % _CAMERA_TYPE_REFRESH_EVERY == 0:
+        _refresh_camera_types_from_redis()
 
     for frame_meta in _iter_pyds_list(
         batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
@@ -1305,6 +1347,13 @@ def pre_tiler_analytics_probe(_pad, info):
         pad_index          = frame_meta.pad_index
         camera_id          = _camera_id_for(pad_index)
         is_entry_exit_cam  = pad_index in _entry_exit_pads
+
+        # Cortocircuitar si este tipo de cámara no debe contar
+        _is_external_cam = pad_index in _external_pads
+        if _is_external_cam and not _count_external:
+            continue
+        if not _is_external_cam and not _count_internal:
+            continue
 
         _update_fps_stats(pad_index)
 
@@ -1656,10 +1705,13 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
     """Probe unico en produccion (NX_QA_ENABLED=false).
     Recibe frames RGBA full-res por camara (sin tiler en el pipeline).
     Lazy frame read: solo copia GPU->CPU cuando hay detecciones y workers de pixel."""
-    global _entry_exit_probe_count
+    global _entry_exit_probe_count, _camera_type_probe_count
     _entry_exit_probe_count += 1
     if _entry_exit_probe_count % _ENTRY_EXIT_REFRESH_EVERY == 0:
         _refresh_entry_exit_from_redis()
+    _camera_type_probe_count += 1
+    if _camera_type_probe_count % _CAMERA_TYPE_REFRESH_EVERY == 0:
+        _refresh_camera_types_from_redis()
 
     for frame_meta in _iter_pyds_list(
         batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
@@ -1668,6 +1720,13 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
         pad_index         = frame_meta.pad_index
         camera_id         = _camera_id_for(pad_index)
         is_entry_exit_cam = pad_index in _entry_exit_pads
+
+        # Cortocircuitar si este tipo de cámara no debe contar
+        _is_external_cam = pad_index in _external_pads
+        if _is_external_cam and not _count_external:
+            continue
+        if not _is_external_cam and not _count_internal:
+            continue
 
         # Lazy frame read: solo cuando hay objetos Y algun worker necesita pixel data
         frame_np = None

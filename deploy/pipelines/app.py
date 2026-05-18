@@ -32,7 +32,7 @@ import pyds
 from config_loader import load_config
 from probes import (
     osd_sink_pad_buffer_probe, pre_tiler_analytics_probe, api_client,
-    init_channel_map, init_sector, init_entry_exit_pads,
+    init_channel_map, init_sector, init_entry_exit_pads, init_camera_types,
     init_handlers, init_workers, start_workers, stop_workers,
     init_qa_grid, init_qa_cameras, init_pipeline_stats,
     tiled_frame_queue, camera_frame_queues,
@@ -168,6 +168,7 @@ def main():
     init_channel_map(cfg.channels)
     init_sector(cfg.sector)
     init_entry_exit_pads(cfg.entry_exit_pad_indices())
+    init_camera_types(cfg.external_pad_indices(), cfg.count_internal, cfg.count_external)
     # QA: inicializar queues de cámara (se usan en el probe y en MjpegServer)
     if _IS_QA_ENABLED:
         init_qa_cameras(cfg.channels)
@@ -282,6 +283,9 @@ def main():
                 "tiler_rows":          tiler_rows,
                 "jetson_id":           os.environ.get("JETSON_ID", ""),
                 "entry_exit_channels": cfg.entry_exit_channels,
+                "external_channels":   cfg.external_channels,
+                "count_internal":      cfg.count_internal,
+                "count_external":      cfg.count_external,
                 "stream_width":        cfg.stream_width,
                 "stream_height":       cfg.stream_height,
                 "stream_type":         cfg.stream_type,
@@ -300,6 +304,12 @@ def main():
             if not _redis_qa.exists("nx:qa:entry_exit"):
                 import json as _json
                 _redis_qa.set("nx:qa:entry_exit", _json.dumps(cfg.entry_exit_channels))
+            # external_channels: igual que entry_exit, no sobreescribir si ya existe
+            if not _redis_qa.exists("nx:qa:external_channels"):
+                _redis_qa.set("nx:qa:external_channels", json.dumps(cfg.external_channels))
+            # count_internal/count_external: siempre desde config.yaml al arrancar
+            _redis_qa.set("nx:qa:count_internal", "1" if cfg.count_internal else "0")
+            _redis_qa.set("nx:qa:count_external", "1" if cfg.count_external else "0")
             init_pipeline_stats(cfg.channels)
 
     # ── NV12→RGBA (probe needs RGBA for crop extraction) ─────────────────────

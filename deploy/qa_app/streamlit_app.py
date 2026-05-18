@@ -209,6 +209,59 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # ── Tipo de cámara ────────────────────────────────────────────────────────
+    if channels:
+        st.markdown("**🏠 Tipo de Cámara**")
+        st.caption("Sin marcar = interna (default). Marcar = externa")
+
+        ext_channels: set = set()
+        if _r:
+            try:
+                raw_ext = _r.get("nx:qa:external_channels")
+                if raw_ext is not None:
+                    ext_channels = set(json.loads(raw_ext))
+                else:
+                    ext_channels = set(status.get("external_channels", []))
+                    _r.set("nx:qa:external_channels", json.dumps(sorted(ext_channels)))
+            except Exception:
+                ext_channels = set(status.get("external_channels", []))
+        else:
+            ext_channels = set(status.get("external_channels", []))
+
+        new_ext_channels: set = set()
+        for ch in channels:
+            is_ext = ch in ext_channels
+            label = f"Cám {ch:02d}  {'🏢 externa' if is_ext else '🏠 interna'}"
+            new_val = st.checkbox(label, value=is_ext, key=f"ext_ch_{ch}",
+                                  disabled=(_r is None))
+            if new_val:
+                new_ext_channels.add(ch)
+
+        if _r and new_ext_channels != ext_channels:
+            try:
+                _r.set("nx:qa:external_channels", json.dumps(sorted(new_ext_channels)))
+            except Exception:
+                pass
+
+        count_int_val = (_r.get("nx:qa:count_internal") or "1") == "1" if _r else True
+        count_ext_val = (_r.get("nx:qa:count_external") or "1") == "1" if _r else True
+
+        new_count_int = st.checkbox("Internas cuentan", value=count_int_val,
+                                    key="count_internal", disabled=(_r is None))
+        new_count_ext = st.checkbox("Externas cuentan", value=count_ext_val,
+                                    key="count_external", disabled=(_r is None))
+
+        if _r:
+            try:
+                if new_count_int != count_int_val:
+                    _r.set("nx:qa:count_internal", "1" if new_count_int else "0")
+                if new_count_ext != count_ext_val:
+                    _r.set("nx:qa:count_external", "1" if new_count_ext else "0")
+            except Exception:
+                pass
+
+    st.markdown("---")
+
     # Toggles de capacidades
     IMPLEMENTED = [
         "people_counting", "age_gender", "fall_detection", "face_recognition",
