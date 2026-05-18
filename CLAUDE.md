@@ -265,6 +265,7 @@ Checklist para este cambio:
 - [ ] Regla 9: ¿Necesita actualizar CLAUDE.md? → [sí/no, qué sección]
 - [ ] Regla 10: ¿Hay errores que registrar en ErrorHistory.md? → [sí/no]
 - [ ] Regla 11: ¿Hay mejoras futuras que registrar en Future.md? → [sí/no]
+- [ ] Regla 12: ¿Cambia algún payload, endpoint o evento de API? → [sí/no — actualizar APIBackend.md]
 ```
 
 No es necesario incluir reglas que claramente no aplican. El objetivo es que el usuario pueda ver el plan de trabajo antes de que se ejecute.
@@ -436,6 +437,77 @@ Cuando en una conversación surja una posible mejora — por ejemplo, "ahora usa
 ```
 
 `Future.md` no es un backlog de tareas — es un registro de ideas técnicas con suficiente contexto para poder evaluarlas e implementarlas después sin tener que redescubrir la conversación original.
+
+### 12. Mantener `APIBackend.md` actualizado cuando cambia la API
+
+`APIBackend.md` (en la raíz del repo) es el contrato entre el Jetson y el backend. Cada vez que se modifique algo relacionado con la comunicación Jetson ↔ Backend, actualizar este archivo también.
+
+**Qué cuenta como cambio de API:**
+- Agregar, renombrar o eliminar un campo en cualquier payload de `NxApiClient` (en `probes.py`)
+- Agregar o modificar un tipo de evento (`type` field)
+- Cambiar un endpoint (`/api/events`, `/api/analytics`, `/api/crops`, etc.)
+- Cambiar la frecuencia de envío (e.g. `ANALYTICS_SEND_INTERVAL_SECS`)
+- Agregar un nuevo feature que genere eventos (nuevo handler)
+- Cambiar la semántica de un campo existente (e.g. cambiar unidades, rango de valores)
+
+**Qué actualizar en `APIBackend.md`:**
+- §3 si cambia un endpoint o sus campos comunes
+- §4 si cambia el payload de un tipo de evento (mostrar el JSON actualizado)
+- §5 si cambia telemetría continua (`analytics_snapshot`, posiciones, reference-frame)
+- §7 si cambia cómo se calcula una métrica de negocio en el backend
+- Agrega una nueva sección §4.x para cada nuevo feature con su payload completo
+
+### 13. Escribir `Continue.md` cuando el usuario lo pide
+
+Cuando el usuario diga "escribe un Continue.md" (o variantes como "crea el Continue.md", "genera el Continue.md"), crear o sobreescribir el archivo `Continue.md` en la raíz del repo con el siguiente contenido y formato exacto:
+
+```markdown
+# Continue.md — [fecha YYYY-MM-DD]
+
+## Qué estábamos haciendo exactamente
+[Descripción concreta de la tarea en curso: feature, bug, experimento. Una oración por punto.]
+
+## Estado actual
+**Qué funciona:**
+- [ítem]
+
+**Qué no funciona / está roto:**
+- [ítem]
+
+## Decisiones tomadas y por qué
+- **[decisión]:** [razón concreta]
+
+## Qué intentamos que NO funcionó
+- **[enfoque]:** [por qué falló o fue descartado]
+
+## Próximos pasos concretos
+1. [paso concreto — archivo + qué cambiar]
+2. ...
+
+## Parámetros y valores concretos en juego
+- [variable / config / threshold]: [valor actual y por qué importa]
+
+## Error / síntoma actual (si aplica)
+```
+[traceback exacto, output de log, o descripción del comportamiento inesperado en este momento]
+```
+
+## Archivos modificados sin commitear
+- `[archivo]` — [qué se cambió y si está funcional o a medias]
+
+## Archivos y secciones que estábamos modificando
+| Archivo | Función / sección | Qué se estaba cambiando |
+|---------|-------------------|-------------------------|
+| `deploy/pipelines/probes.py` | `_XxxHandler` | [descripción] |
+```
+
+**Reglas al escribir el Continue.md:**
+- Ser específico: nombres de funciones, líneas aproximadas, valores concretos — no frases genéricas
+- La sección "Qué intentamos que NO funcionó" es obligatoria aunque sea breve; es la más valiosa para no repetir errores
+- La sección "Error / síntoma actual" es obligatoria si hay un error activo — pegar el traceback o log exacto, no parafrasearlo
+- "Archivos modificados sin commitear" es obligatoria — si no hay ninguno, escribir "Ninguno"
+- Los próximos pasos deben ser accionables desde cero: suficiente contexto para que Claude retome sin leer toda la conversación
+- No incluir código extenso — solo referencias a archivos y funciones
 
 ---
 
