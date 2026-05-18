@@ -94,6 +94,88 @@ GStreamer ERROR: ... — pipeline forzado a salir
 
 ---
 
+## 2026-05-17 — MjpegServer: cero bytes en el stream (single-threaded blocking)
+
+**Contexto:** `deploy/pipelines/mjpeg_server.py`, `MjpegServer.run()`. La app Streamlit intentaba leer el stream MJPEG vía un thread Python (`_MjpegReader` con `requests`) y no recibía ningún frame.
+
+**Error en consola:**
+```
+# Sin error explícito — el stream simplemente no entregaba frames.
+# Los logs del servidor no mostraban conexiones entrantes adicionales.
+```
+
+**Causa raíz:** `HTTPServer` de Python es single-threaded. La primera conexión de `_MjpegReader` ocupaba el único slot de atención; ninguna otra conexión (ni el browser del usuario) podía conectarse. `_MjpegReader` recibía el primer boundary vacío porque el `_encode_loop` aún no había procesado frames, y luego se bloqueaba.
+
+**Solución:** Convertir a `_ThreadingHTTPServer(ThreadingMixIn, HTTPServer)` con `daemon_threads = True`. Cada conexión de cliente corre en su propio thread. También se eliminó `_MjpegReader` completamente — el browser sirve el stream directamente vía `<img src="/stream/key">` en una página HTML que el propio MjpegServer sirve desde `/viewer/<key>`.
+
+---
+
+## 2026-05-17 — st.components.v1.html recrea el iframe en cada rerender (flickering)
+
+**Contexto:** `deploy/qa_app/streamlit_app.py`, panel de video. El stream MJPEG parpadeaba cada 150-500 ms.
+
+**Error en consola:**
+```
+DeprecationWarning: st.components.v1.html is deprecated and will be removed on 2026-06-01.
+Use st.html instead.
+```
+
+**Causa raíz:** `st.components.v1.html` (y `st.html`) trata el bloque como contenido dinámico reemplazable en cada rerender. El autorefresh de 500 ms forzaba un rerender que destruía y recreaba el iframe, interrumpiendo la conexión MJPEG del browser.
+
+**Solución:** Usar `st.iframe(viewer_url, height=560)` — Streamlit preserva el nodo iframe en React cuando el `src` no cambia entre rerenders. El autorefresh ya no interrumpe el stream. La URL del viewer es `http://<host>:<port>/viewer/<key>` y el HTML que sirve MjpegServer usa `<img src="/stream/<key>">` (mismo origen → sin CORS).
+
+---
+
+## 2026-05-17 — st.iframe() rechaza el argumento `scrolling`
+
+**Contexto:** `deploy/qa_app/streamlit_app.py`, llamada a `st.iframe()`.
+
+**Error en consola:**
+```
+TypeError: IframeMixin.iframe() got an unexpected keyword argument 'scrolling'
+```
+
+**Causa raíz:** `st.iframe()` (nuevo en Streamlit 1.44+) no acepta el parámetro `scrolling` que sí aceptaba `st.components.v1.iframe()`.
+
+**Solución:** Eliminar el argumento `scrolling=False` de la llamada. El scroll en el iframe se controla desde el HTML interno (el viewer de MjpegServer no tiene scroll porque `<img>` ocupa el 100% del ancho con `display:block` y no hay overflow).
+
+---
+
+## 2026-05-17 — Detecciones y API calls no aparecen en Streamlit (ScriptRunContext ausente)
+
+**Contexto:** `deploy/qa_app/streamlit_app.py`, subscriber daemon de Redis. Los paneles de detecciones y API calls siempre mostraban "Sin detecciones aún" / "Sin API calls aún" aunque el pipeline estaba publicando a Redis.
+
+**Error en consola:**
+```
+Exception in thread qa-subscriber:
+...
+missing ScriptRunContext! This warning can be ignored when running in bare mode.
+```
+
+**Causa raíz:** El thread daemon del subscriber escribía en `st.session_state` desde fuera del ScriptRunContext de Streamlit. En Streamlit moderno (≥ 1.32), estas escrituras son silenciosamente descartadas cuando no hay ScriptRunContext activo — el warning aparece pero los datos nunca llegan a la UI.
+
+**Solución:** Reemplazar `st.session_state.detections/apicalls` con deques a nivel de proceso usando `@st.cache_resource`. El subscriber daemon escribe en los deques directamente (sin necesitar ScriptRunContext); cada rerender los lee mediante `_bufs = _get_buffers()`. También se agregó auto-reconexión al subscriber (`while True: ... except Exception: time.sleep(2)`).
+
+---
+
+## 2026-05-17 — Ctrl+C no detiene qa.sh (doble trap por EXIT + comportamiento de `wait`)
+
+**Contexto:** `deploy/qa.sh`. Al presionar Ctrl+C, el script no ejecutaba el cleanup o lo ejecutaba dos veces.
+
+**Error en consola:**
+```
+# Primera iteración: trap en EXIT + INT → cleanup se ejecutaba dos veces
+# Segunda iteración: `wait $LOGS_PID` bloqueaba el trap en algunas versiones de bash
+```
+
+**Causa raíz (primera iteración):** `trap _cleanup EXIT INT TERM` hacía que bash disparara el handler dos veces: una por INT y otra al salir vía `set -e` (el exit code no-cero de `docker compose logs` terminado por Ctrl+C disparaba EXIT).
+
+**Causa raíz (segunda iteración):** `wait $LOGS_PID` puede bloquearse indefinidamente en algunas versiones de bash/Compose, impidiendo que el trap INT sea atendido antes de que el process group completo sea eliminado.
+
+**Solución:** (1) Registrar solo `trap _cleanup INT TERM` — sin EXIT. (2) Correr `docker compose logs -f` en background y sustituir `wait` por un loop `while kill -0 "$LOGS_PID"; do sleep 1; done`. El comando `sleep` siempre sale inmediatamente ante SIGINT, lo que garantiza que el trap sea disparado con la siguiente iteración del loop.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Fecha] — Título breve del error
