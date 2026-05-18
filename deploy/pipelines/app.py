@@ -236,6 +236,8 @@ def main():
             logger.error("Could not create nvinfer element for capability '%s'", cap)
             sys.exit(1)
         sgie.set_property("config-file-path", cfg_path)
+        if cfg.sgie_interval >= 0:
+            sgie.set_property("interval", cfg.sgie_interval)
         sgie_elements.append(sgie)
         logger.info("SGIE loaded: %s → %s", cap, cfg_path)
 
