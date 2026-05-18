@@ -6,6 +6,26 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## EMA adaptativo con pesos por calidad de crop en ReIdManager
+
+**Descripción:** El embedding de referencia en `ReIdManager` se actualiza con EMA fija (alpha=0.7). Una mejora sería ponderar el update según la calidad del crop: crops grandes y bien iluminados deberían tener más peso que crops pequeños u ocluidos.
+
+**Por qué sería mejor:** El EMA fijo mezcla embeddings buenos y malos por igual. Con pesos por calidad (basado en tamaño del bbox y confianza del PGIE), el embedding de referencia converge más rápido hacia representaciones estables y los matches cross-cámara mejorarían, especialmente en sub-streams con personas lejanas.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/reid_manager.py`
+- Sección / función: `match_or_create()` líneas ~107-110
+- Descripción: EMA fija `0.7 * old + 0.3 * new`
+
+**Tech stack propuesto:**
+- Solo numpy — sin deps nuevas
+- Métricas de calidad: `bbox_area / frame_area` y `pgie_confidence` ya disponibles en el probe
+- Requeriría pasar `quality_score: float` a `match_or_create()` y ajustar la firma
+
+**Consideraciones:** Cambio de API en `reid_manager.match_or_create()` — hay 2 call sites en `probes.py`. Esfuerzo estimado: 1-2 horas.
+
+---
+
 ## Resolución del tiler MJPEG configurable por cliente
 
 **Descripción:** La resolución del preview MJPEG (nvmultistreamtiler) está hardcodeada a 1280×720. Sería útil exponerla en `config.yaml` como `tiler_width` / `tiler_height` para que instalaciones con menos cámaras puedan usar 1920×1080 y deployments con más restricciones de memoria puedan bajar más.

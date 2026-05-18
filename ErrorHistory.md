@@ -6,6 +6,23 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-05-18 — ReID cross-cámara no matcheaba: clave de AppearanceWorker sin pad_index
+
+**Contexto:** `deploy/pipelines/appearance_worker.py` + `deploy/pipelines/probes.py` — subsistema de Re-ID cross-cámara.
+
+**Síntoma:** El ReID nunca reconocía que una persona vista en cámara A era la misma en cámara B. Cada aparición en cualquier cámara siempre producía `EVENT_NEW_PERSON` aunque el threshold ya estaba en 0.55.
+
+**Causa raíz:** `AppearanceWorker._results` usaba solo `track_id` como clave (`Dict[int, np.ndarray]`), pero en DeepStream el tracker asigna track IDs **localmente por stream**. Dos cámaras pueden tener el mismo `track_id` simultáneamente. El embedding de la segunda cámara sobreescribía el de la primera en `_results[track_id]`, causando que `match_or_create()` recibiera el embedding incorrecto.
+
+**Solución:**
+- `appearance_worker.py`: cambiar clave a `(pad_index, track_id)` en `_results`, actualizar firmas de `enqueue()`, `get_result()`, agregar `clear_result()`.
+- `probes.py` → `_handle_appearance_reid()`: pasar `pad_index` a `get_result()` y `enqueue()`.
+- `probes.py` → `_expire_lost_tracks()`: llamar `_appearance_worker.clear_result(track_id, pad_index)` al expirar un track.
+- `reid_manager.py`: bajar `SIMILARITY_THRESHOLD` de 0.55 → 0.45; cambiar reemplazo de embedding por EMA (alpha=0.7) para mayor estabilidad de la referencia.
+- `config.yaml` (demo): activar `pgie_interval: 2` (era -1=4) para reducir el delay de primer bbox.
+
+---
+
 ## 2026-05-12 — cudaErrorIllegalAddress (700) en nvbufsurftransform con 16 cámaras
 
 **Contexto:** Pipeline de producción (`app.py`) con 16 cámaras sub-stream (960×544). Crash a los 20-80 segundos de inicio.

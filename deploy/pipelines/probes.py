@@ -1341,6 +1341,8 @@ def _expire_lost_tracks(pad_index: int, frame_num: int,
             _face_handler.on_track_lost(track_id, dwell)
         _crop_counts.pop(track_id, None)
         _crop_last_frame.pop(track_id, None)
+        if _appearance_worker is not None:
+            _appearance_worker.clear_result(track_id, pad_index)
         for handler in _active_handlers:
             _cleanup_handler_cache(handler, track_id)
         logger.debug("Track lost: pad=%d track=%d dwell=%.1fs global=%s",
@@ -1385,7 +1387,7 @@ def _handle_appearance_reid(
 
     # ── Try to consume a ready embedding ─────────────────────────────────────
     if not state.appearance_sent:
-        vec = _appearance_worker.get_result(p_track_id)
+        vec = _appearance_worker.get_result(p_track_id, pad_index)
         if vec is not None:
             state.appearance_sent = True
 
@@ -1429,7 +1431,7 @@ def _handle_appearance_reid(
                     bbox["left"]:bbox["left"]  + bbox["width"],
                 ]
                 if crop.size > 0:
-                    _appearance_worker.enqueue(crop, p_track_id, frame_num)
+                    _appearance_worker.enqueue(crop, p_track_id, pad_index, frame_num)
 
     # ── Deadline fallback: emit entry if embedding never arrived ─────────────
     if (_reid_manager is not None

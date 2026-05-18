@@ -21,7 +21,7 @@ import logging
 import queue
 import threading
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -45,7 +45,9 @@ class AppearanceWorker:
     def __init__(self, model_path: str, queue_size: int = 64):
         self._model_path = model_path
         self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
-        self._results: Dict[int, np.ndarray] = {}
+        # Key is (pad_index, track_id) — track IDs are local per camera in DeepStream,
+        # so two cameras can have the same track_id simultaneously.
+        self._results: Dict[Tuple[int, int], np.ndarray] = {}
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -67,15 +69,19 @@ class AppearanceWorker:
             self._thread.join(timeout=5)
         logger.info("AppearanceWorker stopped.")
 
-    def enqueue(self, crop_bgr: np.ndarray, track_id: int, frame_num: int) -> None:
+    def enqueue(self, crop_bgr: np.ndarray, track_id: int, pad_index: int, frame_num: int) -> None:
         try:
-            self._queue.put_nowait((crop_bgr.copy(), track_id, frame_num))
+            self._queue.put_nowait((crop_bgr.copy(), track_id, pad_index, frame_num))
         except queue.Full:
             pass
 
-    def get_result(self, track_id: int) -> Optional[np.ndarray]:
+    def get_result(self, track_id: int, pad_index: int) -> Optional[np.ndarray]:
         with self._lock:
-            return self._results.get(track_id)
+            return self._results.get((pad_index, track_id))
+
+    def clear_result(self, track_id: int, pad_index: int) -> None:
+        with self._lock:
+            self._results.pop((pad_index, track_id), None)
 
     # ── Worker ────────────────────────────────────────────────────────────────
 
@@ -91,13 +97,14 @@ class AppearanceWorker:
                 continue
             if item is None:
                 break
-            crop_bgr, track_id, frame_num = item
+            crop_bgr, track_id, pad_index, frame_num = item
             try:
                 vec = self._infer(crop_bgr)
                 if vec is not None:
                     with self._lock:
-                        self._results[track_id] = vec
-                    logger.debug("Appearance vector computed track=%d frame=%d", track_id, frame_num)
+                        self._results[(pad_index, track_id)] = vec
+                    logger.debug("Appearance vector computed pad=%d track=%d frame=%d",
+                                 pad_index, track_id, frame_num)
             except Exception as e:
                 logger.warning("AppearanceWorker error track=%d: %s", track_id, e)
             self._queue.task_done()

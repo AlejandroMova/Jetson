@@ -115,4 +115,7 @@ count_external: true
 #     7–16 cámaras → pgie_interval: 4  (conservador, estable)
 #
 # pgie_batch_size: 0
-# pgie_interval: -1
+# pgie_interval guide:
+#   1-6  cameras → 2  (detects every 3rd frame — faster first bbox, more GPU load)
+#   7-16 cameras → 4  (detects every 5th frame — conservative, stable)
+pgie_interval: 2

@@ -28,7 +28,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ── Tuneable constants ──────────────────────────────────────────────────────────
-SIMILARITY_THRESHOLD: float = 0.55   # cosine sim (= dot product on L2-normalised vecs)
+SIMILARITY_THRESHOLD: float = 0.45   # cosine sim (= dot product on L2-normalised vecs)
 PRESENCE_WINDOW_S:    float = 300.0  # 5 min — within this, camera switch = channel_change
 REID_TTL_S:           float = 3600.0 # 1 hour — global_id expires if unseen for this long
 SAVE_INTERVAL_S:      float = 30.0   # persist to disk at most every N seconds
@@ -103,8 +103,12 @@ class ReIdManager:
             time_absent = now - entry.last_seen_ts
             prev_camera  = entry.camera_id
 
-            # Refine stored embedding with latest sample and update seen info
-            entry.embedding    = embedding.copy()
+            # EMA update: weight old embedding 0.7 to keep a stable reference even if
+            # the latest crop comes from a bad angle or partial occlusion.
+            _alpha = 0.7
+            blended = _alpha * entry.embedding + (1.0 - _alpha) * embedding
+            _norm = np.linalg.norm(blended)
+            entry.embedding    = blended / _norm if _norm > 1e-6 else embedding.copy()
             entry.last_seen_ts = now
             entry.camera_id    = camera_id
 
