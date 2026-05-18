@@ -139,6 +139,44 @@ Detecta vehículos y lee sus placas (LPD + LPR en dos etapas).
 
 ---
 
+## QA Visual App
+
+Herramienta de inspección remota para el equipo NX. Permite que cualquier miembro del equipo vea en tiempo real lo que está detectando un Jetson desplegado en casa de un cliente, sin necesidad de estar físicamente en el lugar y sin afectar el pipeline de producción.
+
+**Propósito:** En producción el pipeline corre con `fakesink` — no hay ningún output visual. El equipo no puede ver qué están detectando las cámaras, qué payloads se están enviando al backend, ni si los modelos están funcionando correctamente para ese cliente. El QA Visual App resuelve eso: activa el pipeline con overlays visuales y expone toda la metadata en un dashboard accesible vía Tailscale.
+
+**Activación:** Solo cuando el técnico ejecuta `./qa.sh` en el Jetson. Usa un docker-compose override (`docker-compose.qa.yml`) que setea `NX_QA_ENABLED=true` en el container deepstream y agrega el container `qa_app`. Al salir (Ctrl+C o `./qa.sh stop`), el pipeline de producción se restaura automáticamente. **Cero impacto cuando no está activo.**
+
+**Lo que muestra el dashboard:**
+- Video en vivo con bounding boxes y labels por cada feature activa (verde = persona, rojo = caída)
+- Selector de cámara: vista tileada (todas) o cámara individual
+- Toggles por capacidad: apagar/prender `age_gender`, `fall_detection`, `face_recognition` sin reiniciar el pipeline
+- Log de detecciones en tiempo real: track_id, label, confianza, alert de caída
+- Log de API calls: JSON expandible de cada POST que el Jetson envía al backend
+
+**Cómo funciona internamente:**
+1. `probes.py` (con `NX_QA_ENABLED=true`) dibuja bboxes en el frame tileado 640×360 con OpenCV (CPU, ~1-2ms), extrae crops por cámara (numpy slice), publica metadata a Redis pub/sub (`nx:qa:detections`, `nx:qa:apicalls`), y encola frames en queues Python.
+2. `MjpegServer` (thread daemon en el container deepstream) consume esas queues, encoda a JPEG en background, y sirve HTTP multipart/x-mixed-replace en `:8080` bajo `/stream/all` y `/stream/<camera_id>`. También sirve `/viewer/<key>` — una página HTML mínima con `<img src="/stream/<key>">` mismo origen.
+3. `qa_app` (container Streamlit en `:8501`) embebe el viewer con `st.iframe(viewer_url)` — React preserva el iframe entre rerenders cuando el src no cambia, por lo que el stream MJPEG no se interrumpe con el autorefresh de 500ms. Un thread daemon suscribe a Redis y escribe en deques `@st.cache_resource` (accesibles desde cualquier rerender sin ScriptRunContext).
+
+**Tech stack:**
+| Componente | Tecnología |
+|-----------|-----------|
+| UI del dashboard | Streamlit ≥1.32 (MIT), `streamlit-autorefresh` |
+| Video streaming | HTTP MJPEG multipart/x-mixed-replace, `HTTPServer` + `ThreadingMixIn` |
+| Video overlay | OpenCV (CPU, sobre frame RGBA del probe) |
+| Metadata en tiempo real | Redis pub/sub (efímero, sin persistencia) — canales `nx:qa:detections`, `nx:qa:apicalls` |
+| Estado del pipeline | Redis key `nx:qa:status` (JSON con client, channels, capabilities) |
+| Feature toggles | Redis hash `nx:qa:capabilities` (leído por el probe antes de cada handler) |
+| Acceso remoto | Tailscale — la IP se extrae de `st.context.headers["host"]` en Streamlit |
+| Container QA app | `python:3.11-slim` ARM64, sin GPU |
+
+**Puertos:**
+- `:8080` — MjpegServer (deepstream container, expuesto solo con QA activo)
+- `:8501` — Streamlit dashboard (qa_app container, solo existe en `docker-compose.qa.yml`)
+
+---
+
 ## Stack Tecnológico
 
 ### Infraestructura de video
