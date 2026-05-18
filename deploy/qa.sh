@@ -63,7 +63,7 @@ _cleanup() {
         kill deepstream qa_app 2>/dev/null || true
     docker compose -f docker-compose.yml -f docker-compose.qa.yml \
         rm -f qa_app 2>/dev/null || true
-    docker compose up -d 2>/dev/null || true
+    docker compose up -d || true
     echo "  Producción restaurada."
     echo ""
     exit 0
@@ -112,15 +112,18 @@ else
 fi
 echo ""
 
-# Seguir los logs en background + wait: así bash recibe INT inmediatamente
-# (con foreground, bash difiere el trap hasta que docker compose logs salga,
-# y en algunas versiones de Compose ese proceso ignora SIGINT y cuelga).
+# Logs en background. El loop con sleep 1 garantiza que Ctrl+C siempre
+# dispara el trap: sleep sale instantáneamente ante SIGINT, a diferencia
+# de `wait` que puede quedarse bloqueado según la versión de bash/Compose.
 docker compose \
     -f docker-compose.yml \
     -f docker-compose.qa.yml \
     logs -f deepstream qa_app &
 LOGS_PID=$!
-wait $LOGS_PID
 
-# Si los containers se pararon solos (sin Ctrl+C), limpiar igualmente
+while kill -0 "$LOGS_PID" 2>/dev/null; do
+    sleep 1
+done
+
+# Containers se pararon solos (sin Ctrl+C)
 _cleanup
