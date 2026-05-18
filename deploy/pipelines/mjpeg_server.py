@@ -115,7 +115,7 @@ class MjpegServer(threading.Thread):
                     html = (
                         "<!DOCTYPE html><html><head>"
                         "<style>*{margin:0;padding:0;box-sizing:border-box}"
-                        "body{background:#111;overflow:hidden}"
+                        "body{background:#111}"
                         "img{width:100%;display:block}</style></head>"
                         f"<body><img src='/stream/{key}'></body></html>"
                     ).encode()
