@@ -202,7 +202,7 @@ with col_video:
     # → sin interrupciones del stream. El HTML lo sirve el propio MjpegServer
     # desde /viewer/<key> con un <img src="/stream/<key>"> mismo-origen.
     viewer_url = f"http://{MJPEG_HOST}:{MJPEG_PORT}/viewer/{stream_key}"
-    st.iframe(viewer_url, height=420, scrolling=False)
+    st.iframe(viewer_url, height=420)
     st.caption(f"Stream: `{stream_label}` · 640×360 · MJPEG nativo")
 
 with col_det:
