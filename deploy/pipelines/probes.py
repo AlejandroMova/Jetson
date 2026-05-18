@@ -185,6 +185,10 @@ CROP_SAMPLE_INTERVAL: int = 15
 CROP_MAX_PER_PERSON: int  = 5
 CROP_MIN_WIDTH: int       = 64
 CROP_MIN_HEIGHT: int      = 128
+# Frames to wait for an appearance embedding before emitting person_entry anyway.
+# At 30 fps: first enqueue on frame 0, result typically arrives by frame ~2.
+# 90 frames ≈ 3 seconds is a conservative deadline for slow or occluded crops.
+ENTRY_EMIT_DEADLINE_FRAMES: int = 90
 
 
 # ==============================================================================
@@ -322,10 +326,16 @@ def _draw_qa_overlays(frame_bgr: np.ndarray, qa_tracks: list) -> None:
 class _TrackState:
     first_frame:       int
     last_frame:        int
-    first_ts:          float   # time.monotonic() when first seen
+    first_ts:          float        # time.monotonic() when first seen
     camera_id:         str
-    is_entry_exit_cam: bool = False
-    appearance_sent:   bool = False
+    is_entry_exit_cam: bool         = False
+    appearance_sent:   bool         = False
+    # ReID fields — only populated when _reid_manager is active
+    entry_emitted:     bool         = False   # True once person_entry/channel_change was sent
+    entry_deadline:    int          = 0       # emit fallback entry if frame_num reaches this
+    global_id:         Optional[str] = None   # assigned after ReID match
+    pending_bbox:      Optional[dict] = None  # bbox saved at first detection for deferred emit
+    pending_conf:      float         = 0.0    # confidence saved at first detection
 
 
 # ==============================================================================
@@ -462,24 +472,48 @@ class NxApiClient:
     # ------------------------------------------------------------------
 
     def post_person_entry(self, camera_id: str, track_id: int, bbox: dict,
-                          confidence: float, is_entry_exit_cam: bool) -> None:
+                          confidence: float, is_entry_exit_cam: bool,
+                          global_id: Optional[str] = None,
+                          is_return: bool = False) -> None:
         payload = self._base_event("person_entry", camera_id)
         payload.update({
-            "track_id": track_id,
-            "bbox": bbox,
-            "confidence": round(confidence, 3),
+            "track_id":            track_id,
+            "bbox":                bbox,
+            "confidence":          round(confidence, 3),
+            "is_entry_exit_camera": is_entry_exit_cam,
+            "entry_type":          "return" if is_return else "new",
+        })
+        if global_id:
+            payload["global_id"] = global_id
+        self.enqueue("POST", "/api/events", payload)
+
+    def post_person_channel_change(self, camera_id: str, track_id: int, bbox: dict,
+                                   confidence: float, global_id: str,
+                                   prev_camera_id: Optional[str],
+                                   is_entry_exit_cam: bool) -> None:
+        payload = self._base_event("person_channel_change", camera_id)
+        payload.update({
+            "track_id":            track_id,
+            "bbox":                bbox,
+            "confidence":          round(confidence, 3),
+            "global_id":           global_id,
             "is_entry_exit_camera": is_entry_exit_cam,
         })
+        if prev_camera_id:
+            payload["prev_camera_id"] = prev_camera_id
         self.enqueue("POST", "/api/events", payload)
 
     def post_person_exit(self, camera_id: str, track_id: int,
-                         dwell_seconds: float, is_entry_exit_cam: bool) -> None:
+                         dwell_seconds: float, is_entry_exit_cam: bool,
+                         global_id: Optional[str] = None) -> None:
         payload = self._base_event("person_exit", camera_id)
         payload.update({
-            "track_id": track_id,
-            "dwell_seconds": round(dwell_seconds, 1),
+            "track_id":            track_id,
+            "dwell_seconds":       round(dwell_seconds, 1),
             "is_entry_exit_camera": is_entry_exit_cam,
         })
+        if global_id:
+            payload["global_id"] = global_id
         self.enqueue("POST", "/api/events", payload)
 
     def post_person_classified(self, camera_id: str, track_id: int,
@@ -1068,10 +1102,11 @@ class _FaceRecognitionHandler:
 # 5. WORKER GLOBALS + LIFECYCLE
 # ==============================================================================
 
-_pose_worker      = None   # PoseWorker (fall_detection)
-_face_recognizer  = None   # FaceRecognizer (face_recognition)
-_appearance_worker = None  # AppearanceWorker (cross-camera re-ID, always active)
-_ws_client        = None   # WsPositionClient (WebSocket position telemetry)
+_pose_worker       = None  # PoseWorker (fall_detection)
+_face_recognizer   = None  # FaceRecognizer (face_recognition)
+_appearance_worker = None  # AppearanceWorker — generates 512-dim embeddings per person
+_reid_manager      = None  # ReIdManager — local cross-camera identity DB (active when OSNet exists)
+_ws_client         = None  # WsPositionClient (WebSocket position telemetry)
 
 # Position buffer: pad_index → list of {track_id, x_norm, y_norm}
 _position_buffer: Dict[int, List[dict]] = {}
@@ -1086,15 +1121,22 @@ def init_workers(
     ws_base_url: str = "",
     api_key: str = "",
 ) -> None:
-    global _pose_worker, _face_recognizer, _appearance_worker, _ws_client
+    global _pose_worker, _face_recognizer, _appearance_worker, _reid_manager, _ws_client
 
-    # AppearanceWorker — always active (cross-camera re-ID, tied to people_counting)
+    # AppearanceWorker + ReIdManager — always active when OSNet model is present.
+    # ReIdManager uses the embeddings to maintain a persistent local identity DB,
+    # enabling cross-camera deduplication and two event types: person_entry vs
+    # person_channel_change.
     osnet_path = str(Path(model_dir) / "osnet" / "osnet_x0_25_market1501.onnx")
     if Path(osnet_path).exists():
         from appearance_worker import AppearanceWorker
+        from reid_manager import ReIdManager
         _appearance_worker = AppearanceWorker(osnet_path)
+        reid_db_path = str(Path(model_dir).parent / "reid_db.json")
+        _reid_manager = ReIdManager(db_path=reid_db_path)
+        logger.info("ReIdManager active — DB: %s", reid_db_path)
     else:
-        logger.warning("OSNet model not found at %s — appearance vectors disabled. "
+        logger.warning("OSNet model not found at %s — appearance vectors and local ReID disabled. "
                        "Run: python3 tools/download_models.py --reid", osnet_path)
 
     if "fall_detection" in pipeline_capabilities:
@@ -1136,6 +1178,8 @@ def start_workers() -> None:
 def stop_workers() -> None:
     if _appearance_worker is not None:
         _appearance_worker.stop()
+    if _reid_manager is not None:
+        _reid_manager.flush()
     if _pose_worker is not None:
         _pose_worker.stop()
     if _face_recognizer is not None:
@@ -1275,17 +1319,32 @@ def _expire_lost_tracks(pad_index: int, frame_num: int,
         state = _active_tracks.pop(key)
         track_id = key[1]
         dwell = time.monotonic() - state.first_ts
+
+        # If the entry event was deferred (ReID path) but never emitted, emit now.
+        # This happens when a person disappears before their embedding was ready.
+        if not state.entry_emitted:
+            api_client.post_person_entry(
+                state.camera_id, track_id,
+                state.pending_bbox or {},
+                state.pending_conf,
+                state.is_entry_exit_cam,
+                global_id=state.global_id,
+                is_return=False,
+            )
+            _get_analytics(pad_index)["person_count"] += 1
+
         api_client.post_person_exit(
-            state.camera_id, track_id, dwell, state.is_entry_exit_cam
+            state.camera_id, track_id, dwell, state.is_entry_exit_cam,
+            global_id=state.global_id,
         )
         if _face_handler:
             _face_handler.on_track_lost(track_id, dwell)
-        # clean per-track caches
         _crop_counts.pop(track_id, None)
         _crop_last_frame.pop(track_id, None)
         for handler in _active_handlers:
             _cleanup_handler_cache(handler, track_id)
-        logger.debug("Track lost: pad=%d track=%d dwell=%.1fs", pad_index, track_id, dwell)
+        logger.debug("Track lost: pad=%d track=%d dwell=%.1fs global=%s",
+                     pad_index, track_id, dwell, state.global_id)
 
 
 def _cleanup_handler_cache(handler, track_id: int) -> None:
@@ -1294,6 +1353,96 @@ def _cleanup_handler_cache(handler, track_id: int) -> None:
         d = getattr(handler, attr, None)
         if isinstance(d, dict):
             d.pop(track_id, None)
+
+
+def _handle_appearance_reid(
+    track_key: Tuple[int, int],
+    p_track_id: int,
+    camera_id: str,
+    bbox: dict,
+    confidence: float,
+    is_entry_exit_cam: bool,
+    frame_num: int,
+    frame_np,
+    pad_index: int,
+) -> None:
+    """
+    Handle AppearanceWorker + ReIdManager for one visible track.
+
+    With ReID enabled (_reid_manager is not None):
+      - Defers person_entry until embedding is available.
+      - On match: emits person_entry (new/return) or person_channel_change.
+      - Deadline fallback: if embedding not ready within ENTRY_EMIT_DEADLINE_FRAMES,
+        emits person_entry with global_id=None so the track is never silently lost.
+
+    Without ReID (legacy path, _reid_manager is None):
+      - Sends appearance_vector to the backend for server-side matching.
+    """
+    if _appearance_worker is None:
+        return
+
+    state = _active_tracks[track_key]
+
+    # ── Try to consume a ready embedding ─────────────────────────────────────
+    if not state.appearance_sent:
+        vec = _appearance_worker.get_result(p_track_id)
+        if vec is not None:
+            state.appearance_sent = True
+
+            if _reid_manager is not None:
+                global_id, event_type, prev_camera = _reid_manager.match_or_create(
+                    vec, camera_id
+                )
+                state.global_id = global_id
+
+                if not state.entry_emitted:
+                    state.entry_emitted = True
+                    if event_type == "channel_change":
+                        api_client.post_person_channel_change(
+                            camera_id, p_track_id, bbox, confidence,
+                            global_id, prev_camera, is_entry_exit_cam,
+                        )
+                    else:
+                        api_client.post_person_entry(
+                            camera_id, p_track_id, bbox, confidence,
+                            is_entry_exit_cam,
+                            global_id=global_id,
+                            is_return=(event_type == "person_return"),
+                        )
+                        _get_analytics(pad_index)["person_count"] += 1
+            else:
+                # Legacy path: send vector to backend for server-side re-ID
+                api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
+
+        # ── Enqueue crop: immediately on first frame, then every 15 frames ──
+        if (frame_np is not None
+                and not state.appearance_sent
+                and bbox["width"]  >= CROP_MIN_WIDTH
+                and bbox["height"] >= CROP_MIN_HEIGHT):
+            if frame_num == state.first_frame or frame_num % 15 == 0:
+                crop = frame_np[
+                    bbox["top"]:bbox["top"]    + bbox["height"],
+                    bbox["left"]:bbox["left"]  + bbox["width"],
+                ]
+                if crop.size > 0:
+                    _appearance_worker.enqueue(crop, p_track_id, frame_num)
+
+    # ── Deadline fallback: emit entry if embedding never arrived ─────────────
+    if (_reid_manager is not None
+            and not state.entry_emitted
+            and frame_num >= state.entry_deadline):
+        state.entry_emitted = True
+        api_client.post_person_entry(
+            camera_id, p_track_id,
+            state.pending_bbox or bbox,
+            state.pending_conf or confidence,
+            is_entry_exit_cam,
+            global_id=None,
+            is_return=False,
+        )
+        _get_analytics(pad_index)["person_count"] += 1
+        logger.debug("ReID deadline reached track=%d cam=%s — entry emitted without global_id",
+                     p_track_id, camera_id)
 
 
 def _update_fps_stats(pad_index: int) -> None:
@@ -1426,34 +1575,26 @@ def pre_tiler_analytics_probe(_pad, info):
                     first_ts=now,
                     camera_id=camera_id,
                     is_entry_exit_cam=is_entry_exit_cam,
+                    entry_deadline=frame_num + ENTRY_EMIT_DEADLINE_FRAMES,
+                    pending_bbox=bbox,
+                    pending_conf=float(obj_meta.confidence),
                 )
-                api_client.post_person_entry(
-                    camera_id, p_track_id, bbox,
-                    float(obj_meta.confidence), is_entry_exit_cam,
-                )
-                _get_analytics(pad_index)["person_count"] += 1
+                if _reid_manager is None:
+                    # No ReID: emit immediately (original behaviour)
+                    api_client.post_person_entry(
+                        camera_id, p_track_id, bbox,
+                        float(obj_meta.confidence), is_entry_exit_cam,
+                    )
+                    _get_analytics(pad_index)["person_count"] += 1
+                    _active_tracks[track_key].entry_emitted = True
             else:
                 _active_tracks[track_key].last_frame = frame_num
 
-            # AppearanceWorker
-            if _appearance_worker is not None:
-                state = _active_tracks[track_key]
-                if not state.appearance_sent:
-                    vec = _appearance_worker.get_result(p_track_id)
-                    if vec is not None:
-                        api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
-                        state.appearance_sent = True
-                if (frame_np is not None
-                        and frame_num % 15 == 0
-                        and not state.appearance_sent
-                        and bbox["width"] >= CROP_MIN_WIDTH
-                        and bbox["height"] >= CROP_MIN_HEIGHT):
-                    crop = frame_np[
-                        bbox["top"]:bbox["top"] + bbox["height"],
-                        bbox["left"]:bbox["left"] + bbox["width"],
-                    ]
-                    if crop.size > 0:
-                        _appearance_worker.enqueue(crop, p_track_id, frame_num)
+            _handle_appearance_reid(
+                track_key, p_track_id, camera_id, bbox,
+                float(obj_meta.confidence), is_entry_exit_cam,
+                frame_num, frame_np, pad_index,
+            )
 
             _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
 
@@ -1801,33 +1942,26 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
                     first_ts=now,
                     camera_id=camera_id,
                     is_entry_exit_cam=is_entry_exit_cam,
+                    entry_deadline=frame_num + ENTRY_EMIT_DEADLINE_FRAMES,
+                    pending_bbox=bbox,
+                    pending_conf=float(obj_meta.confidence),
                 )
-                api_client.post_person_entry(
-                    camera_id, p_track_id, bbox,
-                    float(obj_meta.confidence), is_entry_exit_cam,
-                )
-                _get_analytics(pad_index)["person_count"] += 1
+                if _reid_manager is None:
+                    # No ReID: emit immediately (original behaviour)
+                    api_client.post_person_entry(
+                        camera_id, p_track_id, bbox,
+                        float(obj_meta.confidence), is_entry_exit_cam,
+                    )
+                    _get_analytics(pad_index)["person_count"] += 1
+                    _active_tracks[track_key].entry_emitted = True
             else:
                 _active_tracks[track_key].last_frame = frame_num
 
-            if _appearance_worker is not None:
-                state = _active_tracks[track_key]
-                if not state.appearance_sent:
-                    vec = _appearance_worker.get_result(p_track_id)
-                    if vec is not None:
-                        api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
-                        state.appearance_sent = True
-                if (frame_np is not None
-                        and frame_num % 15 == 0
-                        and not state.appearance_sent
-                        and bbox["width"] >= CROP_MIN_WIDTH
-                        and bbox["height"] >= CROP_MIN_HEIGHT):
-                    crop = frame_np[
-                        bbox["top"]:bbox["top"] + bbox["height"],
-                        bbox["left"]:bbox["left"] + bbox["width"],
-                    ]
-                    if crop.size > 0:
-                        _appearance_worker.enqueue(crop, p_track_id, frame_num)
+            _handle_appearance_reid(
+                track_key, p_track_id, camera_id, bbox,
+                float(obj_meta.confidence), is_entry_exit_cam,
+                frame_num, frame_np, pad_index,
+            )
 
             _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
 

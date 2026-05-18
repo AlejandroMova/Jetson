@@ -109,9 +109,17 @@ Detecta y trackea personas en cada cámara. Emite eventos `person_entry` y `pers
 - **Siempre activo** en todos los paquetes
 
 ### Re-ID entre Cámaras (`appearance`) — ✅ Activo
-Genera un vector de apariencia por persona para que el backend pueda reconocerla cuando reaparece en otra cámara, evitando contar la misma persona dos veces en un espacio con múltiples cámaras.
-- **Modelo:** OSNet-x0.25 ONNX — genera embeddings 512-dim L2-normalizados
-- **Worker:** `AppearanceWorker` (Python thread, no bloquea el pipeline)
+Identifica cuando la misma persona aparece en cámaras distintas usando embeddings de apariencia. El matching ocurre **localmente en el Jetson** gracias al `ReIdManager`. Emite tres variantes de evento según el contexto:
+- `person_entry` (`entry_type: "new"`) — persona nunca vista antes
+- `person_entry` (`entry_type: "return"`) — misma persona, reapareció tras > 5 min de ausencia
+- `person_channel_change` — misma persona, cambió de cámara dentro de la ventana de presencia (≤5 min)
+
+La emisión de `person_entry` se **difiere** hasta que el embedding esté listo (deadline 90 frames / ~3 s). Si el embedding no llega, se emite con `global_id: null`.
+
+- **Embedding:** OSNet-x0.25 ONNX — vectores 512-dim L2-normalizados. `AppearanceWorker` (Python thread)
+- **Matching:** similitud coseno (dot product) ≥ 0.65. `ReIdManager` — O(N µs) para N embeddings en DB
+- **Persistencia:** `deploy/reid_db.json` — sobrevive reinicios; TTL 1 hora sin actividad
+- **Ventana de presencia:** 5 min (configurable en `reid_manager.py` como `PRESENCE_WINDOW_S`)
 - Se activa automáticamente si el modelo existe en `models/osnet/`
 
 ### Edad y Género (`age_gender`) — ✅ Activo
@@ -484,7 +492,10 @@ Worker thread para reconocimiento facial. Carga `known_faces.json` (nombre → l
 Worker thread para detección de caídas. Ejecuta MoveNet Lightning ONNX (entrada 192×192). Aplica 3 reglas: ángulo del torso > 45°, bbox más ancho que alto, caderas cerca de los tobillos. Caída si ≥ 2/3 reglas. Cooldown de 4 segundos por `track_id`.
 
 **`appearance_worker.py`** (~139 líneas)
-Worker thread para re-ID entre cámaras. Ejecuta OSNet-x0.25 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Se encola cada 15 frames hasta tener resultado. El backend usa similitud coseno ≥ 0.65 para cruzar personas entre cámaras.
+Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x0.25 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Encola el primer crop inmediatamente y luego cada 15 frames hasta tener resultado. El resultado es consumido por `_handle_appearance_reid()` en `probes.py`.
+
+**`reid_manager.py`** (~170 líneas)
+Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con embedding, timestamps y cámara actual. `match_or_create(embedding, camera_id)` hace un dot product vectorizado contra todos los embeddings almacenados y retorna `(global_id, event_type, prev_camera_id)`. Persiste la DB en `deploy/reid_db.json` cada 30 s y al apagar el pipeline (`flush()`). Carga al inicio descartando entradas con TTL vencido. Constantes configurables: `SIMILARITY_THRESHOLD=0.65`, `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
 
 **`ws_client.py`** (~136 líneas)
 WebSocket persistente hacia el backend. Envía snapshots de posiciones normalizadas (x, y, track_id) cada 10 segundos por cámara. Reconexión automática con backoff exponencial (1s → 30s). Silencioso si no hay conexión.
