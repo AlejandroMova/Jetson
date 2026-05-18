@@ -112,11 +112,15 @@ else
 fi
 echo ""
 
-# Seguir los logs de ambos containers (se interrumpe con Ctrl+C)
+# Seguir los logs en background + wait: así bash recibe INT inmediatamente
+# (con foreground, bash difiere el trap hasta que docker compose logs salga,
+# y en algunas versiones de Compose ese proceso ignora SIGINT y cuelga).
 docker compose \
     -f docker-compose.yml \
     -f docker-compose.qa.yml \
-    logs -f deepstream qa_app
+    logs -f deepstream qa_app &
+LOGS_PID=$!
+wait $LOGS_PID
 
 # Si los containers se pararon solos (sin Ctrl+C), limpiar igualmente
 _cleanup
