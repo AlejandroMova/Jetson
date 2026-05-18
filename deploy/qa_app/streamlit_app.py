@@ -373,7 +373,7 @@ with col_det:
                     label = t.get("label", f"P#{t.get('track_id', '?')}")
                     conf  = t.get("confidence", 0)
                     st.markdown(
-                        f"&nbsp;&nbsp;{icon} `{label}` &nbsp;conf={conf:.2f}",
+                        f"&nbsp;&nbsp;{icon} `{label}` &nbsp;·&nbsp;`ch{cam_short}` &nbsp;conf={conf:.2f}",
                         unsafe_allow_html=True,
                     )
 

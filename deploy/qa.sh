@@ -112,13 +112,14 @@ else
 fi
 echo ""
 
-# Logs en background. El loop con sleep 1 garantiza que Ctrl+C siempre
-# dispara el trap: sleep sale instantáneamente ante SIGINT, a diferencia
-# de `wait` que puede quedarse bloqueado según la versión de bash/Compose.
+# Solo seguimos los logs de qa_app (Streamlit) — deepstream se puede ver aparte:
+#   docker compose -f docker-compose.yml -f docker-compose.qa.yml logs -f deepstream
+echo "  (deepstream logs → otra terminal: docker compose -f docker-compose.yml -f docker-compose.qa.yml logs -f deepstream)"
+echo ""
 docker compose \
     -f docker-compose.yml \
     -f docker-compose.qa.yml \
-    logs -f deepstream qa_app &
+    logs -f qa_app &
 LOGS_PID=$!
 
 while kill -0 "$LOGS_PID" 2>/dev/null; do
