@@ -267,16 +267,21 @@ def main():
         # Publicar status del Jetson a Redis para que Streamlit lo muestre
         if _redis_qa:
             _redis_qa.set("nx:qa:status", json.dumps({
-                "client":       cfg.client_name,
-                "package":      cfg.package,
-                "capabilities": cfg.pipeline,
-                "channels":     cfg.channels,
-                "tracker":      cfg.tracker,
-                "sector":       cfg.sector,
-                "tiler_cols":   tiler_cols,
-                "tiler_rows":   tiler_rows,
-                "jetson_id":    os.environ.get("JETSON_ID", ""),
+                "client":              cfg.client_name,
+                "package":             cfg.package,
+                "capabilities":        cfg.pipeline,
+                "channels":            cfg.channels,
+                "tracker":             cfg.tracker,
+                "sector":              cfg.sector,
+                "tiler_cols":          tiler_cols,
+                "tiler_rows":          tiler_rows,
+                "jetson_id":           os.environ.get("JETSON_ID", ""),
+                "entry_exit_channels": cfg.entry_exit_channels,
             }))
+            # Inicializar nx:qa:entry_exit solo si no existe (preserva cambios QA en vivo)
+            if not _redis_qa.exists("nx:qa:entry_exit"):
+                import json as _json
+                _redis_qa.set("nx:qa:entry_exit", _json.dumps(cfg.entry_exit_channels))
 
     # ── NV12→RGBA (probe needs RGBA for crop extraction) ─────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")

@@ -163,6 +163,43 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # ── Toggles entrada / salida ──────────────────────────────────────────────
+    if channels:
+        st.markdown("**📍 Entrada / Salida**")
+        st.caption("Cámaras que cubren la puerta de entrada")
+
+        # Leer lista actual desde Redis; fallback a lo que publicó el pipeline
+        ee_channels: set = set()
+        if _r:
+            try:
+                raw_ee = _r.get("nx:qa:entry_exit")
+                if raw_ee is not None:
+                    ee_channels = set(json.loads(raw_ee))
+                else:
+                    ee_channels = set(status.get("entry_exit_channels", []))
+                    _r.set("nx:qa:entry_exit", json.dumps(sorted(ee_channels)))
+            except Exception:
+                ee_channels = set(status.get("entry_exit_channels", []))
+        else:
+            ee_channels = set(status.get("entry_exit_channels", []))
+
+        new_ee_channels: set = set()
+        for ch in channels:
+            is_ee = ch in ee_channels
+            label = f"Cám {ch:02d}  {'🚪' if is_ee else ''}"
+            new_val = st.checkbox(label, value=is_ee, key=f"ee_ch_{ch}",
+                                  disabled=(_r is None))
+            if new_val:
+                new_ee_channels.add(ch)
+
+        if _r and new_ee_channels != ee_channels:
+            try:
+                _r.set("nx:qa:entry_exit", json.dumps(sorted(new_ee_channels)))
+            except Exception:
+                pass
+
+    st.markdown("---")
+
     # Toggles de capacidades
     IMPLEMENTED = [
         "people_counting", "age_gender", "fall_detection", "face_recognition",

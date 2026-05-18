@@ -58,6 +58,8 @@ _JETSON_SECTOR: str = "comercio"
 
 # Pad indices que corresponden a cámaras de entrada/salida
 _entry_exit_pads: set = set()
+_entry_exit_probe_count: int = 0
+_ENTRY_EXIT_REFRESH_EVERY: int = 30   # actualizar desde Redis cada N llamadas al probe
 
 
 def init_channel_map(channels: list):
@@ -77,6 +79,23 @@ def init_entry_exit_pads(pad_indices: set) -> None:
     global _entry_exit_pads
     _entry_exit_pads = pad_indices
     logger.info("Entry/exit pad indices: %s", pad_indices)
+
+
+def _refresh_entry_exit_from_redis() -> None:
+    """Lee nx:qa:entry_exit de Redis y actualiza _entry_exit_pads en caliente (QA mode)."""
+    global _entry_exit_pads
+    if not _redis_qa:
+        return
+    try:
+        raw = _redis_qa.get("nx:qa:entry_exit")
+        if raw is None:
+            return
+        ee_channels = json.loads(raw)
+        ch_to_pad = {ch: idx for idx, ch in _channel_map.items()}
+        _entry_exit_pads = {ch_to_pad[ch] for ch in ee_channels if ch in ch_to_pad}
+    except Exception:
+        pass
+
 
 def _camera_id_for(pad_index: int) -> str:
     """Devuelve un camera_id con el canal real, ej. 'jetson-nx-001-ch03'."""
@@ -1224,6 +1243,12 @@ def osd_sink_pad_buffer_probe(_pad, info):
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     if not batch_meta:
         return Gst.PadProbeReturn.OK
+
+    # QA: refrescar entry_exit_pads desde Redis en caliente
+    global _entry_exit_probe_count
+    _entry_exit_probe_count += 1
+    if _IS_QA_ENABLED and _entry_exit_probe_count % _ENTRY_EXIT_REFRESH_EVERY == 0:
+        _refresh_entry_exit_from_redis()
 
     # QA: acumula datos de todas las cámaras en este buffer (reset por llamada)
     _qa_frame_bgr: Optional[np.ndarray] = None   # frame tileado BGR, capturado 1 vez
