@@ -301,13 +301,16 @@ def _draw_qa_overlays(frame_bgr: np.ndarray, qa_tracks: list) -> None:
 
         is_fall = t.get("fall", False)
         color = (0, 0, 230) if is_fall else (0, 210, 0)
-        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 1)
+        cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
 
         label = t.get("label", f"#{t['track_id']}")
+        txt_y = max(y1 - 3, 10)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+        cv2.rectangle(frame_bgr, (x1, txt_y - th - 2), (x1 + tw, txt_y + 1), color, -1)
         cv2.putText(
             frame_bgr, label,
-            (x1, max(y1 - 4, 10)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA,
+            (x1, txt_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1, cv2.LINE_AA,
         )
 
 
@@ -1625,6 +1628,16 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
             p_track_id = int(obj_meta.object_id)
             r = obj_meta.rect_params
 
+            # Camera attribution: el tiler produce un frame compuesto único cuyo
+            # frame_meta.pad_index es siempre 0. Calcular la cámara real desde la
+            # posición del bbox en el grid tileado.
+            cx = max(0, int(r.left)) + max(1, int(r.width)) // 2
+            cy = max(0, int(r.top)) + max(1, int(r.height)) // 2
+            tiled_col = min(cx // _qa_cell_w, _qa_tiler_cols - 1) if _qa_cell_w else 0
+            tiled_row = min(cy // _qa_cell_h, _qa_tiler_rows - 1) if _qa_cell_h else 0
+            obj_pad_idx = tiled_row * _qa_tiler_cols + tiled_col
+            obj_camera_id = _camera_id_for(obj_pad_idx)
+
             # Age/gender directo del SGIE classifier_meta (sin pixel data)
             age_gender_text = ""
             for cls_meta in _iter_pyds_list(
@@ -1645,13 +1658,13 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
                 label_parts.append(labels["face_name"])
 
             qa_all_tracks.append({
-                "pad_index":  pad_index,
-                "channel_id": camera_id,
+                "pad_index":  obj_pad_idx,
+                "channel_id": obj_camera_id,
                 "track_id":   p_track_id,
                 "confidence": round(float(obj_meta.confidence), 3),
                 "bbox_tiled": (
                     max(0, int(r.left)), max(0, int(r.top)),
-                    int(r.width), int(r.height),
+                    max(1, int(r.width)), max(1, int(r.height)),
                 ),
                 "label": " | ".join(label_parts),
                 "fall":  labels.get("fall", False),
