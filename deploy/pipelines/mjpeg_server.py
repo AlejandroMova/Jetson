@@ -14,6 +14,7 @@ import time
 import cv2
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from queue import Queue, Empty
 
 
@@ -67,9 +68,12 @@ class MjpegServer(threading.Thread):
             # Tiled frame → "all"
             try:
                 frame = self._tiled_queue.get(timeout=0.04)
-                jpeg = self._to_jpeg(frame)
-                with self._lock:
-                    self._jpegs["all"] = jpeg
+                try:
+                    jpeg = self._to_jpeg(frame)
+                    with self._lock:
+                        self._jpegs["all"] = jpeg
+                except Exception:
+                    pass
             except Empty:
                 pass
 
@@ -77,15 +81,20 @@ class MjpegServer(threading.Thread):
             for cam_id, q in list(self._cam_queues.items()):
                 try:
                     frame = q.get_nowait()
-                    jpeg = self._to_jpeg(frame)
-                    with self._lock:
-                        self._jpegs[cam_id] = jpeg
+                    try:
+                        jpeg = self._to_jpeg(frame)
+                        with self._lock:
+                            self._jpegs[cam_id] = jpeg
+                    except Exception:
+                        pass
                 except Empty:
                     pass
 
     # ------------------------------------------------------------------
     def run(self):
-        server = HTTPServer(("0.0.0.0", self._port), self._make_handler())
+        class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True  # no esperar threads de cliente al shutdown
+        server = _ThreadingHTTPServer(("0.0.0.0", self._port), self._make_handler())
         server.serve_forever()
 
     def _make_handler(self):
@@ -122,8 +131,9 @@ class MjpegServer(threading.Thread):
                                 + jpeg
                                 + b"\r\n"
                             )
+                            self.wfile.flush()
                         time.sleep(1 / 25)    # cap at ~25 fps
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
 
             def log_message(self, *_):
