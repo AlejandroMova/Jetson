@@ -17,11 +17,9 @@ Arrancar con: ./qa.sh  (desde deploy/)
 import json
 import os
 import threading
-import time
 from collections import deque
 
 import redis
-import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
@@ -39,62 +37,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Autorefresh cada 150ms (~6 fps de video + UI en tiempo real)
-st_autorefresh(interval=150, limit=None, key="qa_tick")
-
-
-# ── MJPEG reader (Python-side) ────────────────────────────────────────────────
-class _MjpegReader:
-    """
-    Lee el stream MJPEG desde el container deepstream (red Docker interna).
-    Un thread por stream_key, guarda el último JPEG disponible.
-    st.image lo muestra en cada rerender de Streamlit (~2 fps con 400ms refresh).
-    """
-
-    def __init__(self):
-        self._frames: dict = {}     # stream_key → bytes (último JPEG)
-        self._lock = threading.Lock()
-        self._running: set = set()
-
-    def get_frame(self, key: str) -> bytes | None:
-        if key not in self._running:
-            self._start(key)
-        with self._lock:
-            return self._frames.get(key)
-
-    def _start(self, key: str):
-        self._running.add(key)
-        t = threading.Thread(target=self._loop, args=(key,), daemon=True,
-                             name=f"mjpeg-{key}")
-        t.start()
-
-    def _loop(self, key: str):
-        while True:
-            try:
-                r = requests.get(f"{MJPEG_BASE}/stream/{key}",
-                                 stream=True, timeout=15)
-                buf = b""
-                for chunk in r.iter_content(chunk_size=8192):
-                    buf += chunk
-                    # Extraer frames JPEG del stream multipart
-                    while True:
-                        s = buf.find(b"\xff\xd8")
-                        e = buf.find(b"\xff\xd9", s + 2) if s != -1 else -1
-                        if s != -1 and e != -1:
-                            with self._lock:
-                                self._frames[key] = buf[s : e + 2]
-                            buf = buf[e + 2 :]
-                        else:
-                            break
-                    if len(buf) > 200_000:
-                        buf = buf[-10_000:]
-            except Exception:
-                time.sleep(2)
-
-
-@st.cache_resource
-def _get_reader() -> _MjpegReader:
-    return _MjpegReader()
+# Autorefresh solo para detecciones y API calls — el video lo maneja el browser
+st_autorefresh(interval=500, limit=None, key="qa_tick")
 
 
 # ── Redis helpers ─────────────────────────────────────────────────────────────
@@ -246,14 +190,36 @@ col_video, col_det = st.columns([55, 45])
 
 with col_video:
     st.markdown("### 📹 Video en vivo")
-    reader = _get_reader()
-    frame  = reader.get_frame(stream_key)
-    if frame:
-        st.image(frame, width="stretch")
-    else:
-        st.info("Conectando al stream... (puede tardar unos segundos)")
+    # El browser abre el MJPEG directo al Jetson vía Tailscale.
+    # window.parent.location.hostname es la IP Tailscale con la que el usuario
+    # abrió el dashboard — la misma donde corre el MJPEG en :8080.
+    # El iframe no se destruye en cada rerender si el HTML no cambia → sin parpadeo.
     stream_label = "Todas las cámaras (tiled)" if stream_key == "all" else stream_key
-    st.caption(f"Stream: `{stream_label}` · 640×360")
+    st.components.v1.html(
+        f"""<!DOCTYPE html>
+<html><head>
+<style>
+  body {{ margin:0; padding:0; background:#111; overflow:hidden; }}
+  img  {{ width:100%; display:block; border-radius:4px; }}
+  p    {{ color:#888; font-family:sans-serif; font-size:13px;
+          margin:12px; text-align:center; }}
+</style>
+</head><body>
+  <img id="s" alt="">
+  <p id="msg">Conectando al stream...</p>
+  <script>
+    var img = document.getElementById('s');
+    var msg = document.getElementById('msg');
+    var host = window.parent.location.hostname;
+    img.src = 'http://' + host + ':{MJPEG_PORT}/stream/{stream_key}';
+    img.onload  = function() {{ msg.style.display = 'none'; }};
+    img.onerror = function() {{ msg.textContent = 'Sin señal — esperando pipeline...'; }};
+  </script>
+</body></html>""",
+        height=370,
+        scrolling=False,
+    )
+    st.caption(f"Stream: `{stream_label}` · 640×360 · MJPEG nativo")
 
 with col_det:
     st.markdown("### 📊 Detecciones")
