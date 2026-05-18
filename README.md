@@ -172,9 +172,9 @@ deepstream container (NX_QA_ENABLED=true):
   └── MjpegServer thread serves annotated frames on :8080
 
 qa_app container (Streamlit, :8501):
-  subscribes to Redis pub/sub → updates UI panels at 400 ms
-  embeds MJPEG via <img src="http://<jetson-tailscale-ip>:8080/stream/...">
-  (browser fetches MJPEG directly from Jetson — works through Tailscale)
+  subscribes to Redis pub/sub → updates UI panels at 500 ms
+  embeds st.iframe → /viewer/<key> on MjpegServer (same-origin HTML)
+  (browser fetches MJPEG directly from Jetson — no CORS, stream stable across rerenders)
 ```
 
 ### Performance notes
