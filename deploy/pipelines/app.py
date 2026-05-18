@@ -307,9 +307,11 @@ def main():
             # external_channels: igual que entry_exit, no sobreescribir si ya existe
             if not _redis_qa.exists("nx:qa:external_channels"):
                 _redis_qa.set("nx:qa:external_channels", json.dumps(cfg.external_channels))
-            # count_internal/count_external: siempre desde config.yaml al arrancar
-            _redis_qa.set("nx:qa:count_internal", "1" if cfg.count_internal else "0")
-            _redis_qa.set("nx:qa:count_external", "1" if cfg.count_external else "0")
+            # count_internal/count_external: igual que entry_exit, no sobreescribir si ya existe
+            if not _redis_qa.exists("nx:qa:count_internal"):
+                _redis_qa.set("nx:qa:count_internal", "1" if cfg.count_internal else "0")
+            if not _redis_qa.exists("nx:qa:count_external"):
+                _redis_qa.set("nx:qa:count_external", "1" if cfg.count_external else "0")
             init_pipeline_stats(cfg.channels)
 
     # ── NV12→RGBA (probe needs RGBA for crop extraction) ─────────────────────
