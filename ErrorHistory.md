@@ -18,8 +18,9 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 - `appearance_worker.py`: cambiar clave a `(pad_index, track_id)` en `_results`, actualizar firmas de `enqueue()`, `get_result()`, agregar `clear_result()`.
 - `probes.py` → `_handle_appearance_reid()`: pasar `pad_index` a `get_result()` y `enqueue()`.
 - `probes.py` → `_expire_lost_tracks()`: llamar `_appearance_worker.clear_result(track_id, pad_index)` al expirar un track.
-- `reid_manager.py`: bajar `SIMILARITY_THRESHOLD` de 0.55 → 0.45; cambiar reemplazo de embedding por EMA (alpha=0.7) para mayor estabilidad de la referencia.
+- `reid_manager.py`: `SIMILARITY_THRESHOLD` fijado en 0.60 con guía comentada (0.45 causa falsos positivos, 0.65 no matchea); cambiar reemplazo de embedding por EMA (alpha=0.7).
 - `config.yaml` (demo): activar `pgie_interval: 2` (era -1=4) para reducir el delay de primer bbox.
+- `probes.py` → `_needs_pixel`: condicional inteligente para ambos probes — solo copia GPU→CPU cuando hay tracks nuevos o con embedding pendiente; evita bloquear GStreamer en frames donde todos los tracks ya están asentados.
 
 ---
 

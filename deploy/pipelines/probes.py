@@ -1515,14 +1515,22 @@ def pre_tiler_analytics_probe(_pad, info):
 
         _update_fps_stats(pad_index)
 
-        # Lazy frame read: solo cuando hay detecciones Y algún worker necesita pixel data
+        # Lazy frame read: GPU→CPU copy only when a worker genuinely needs pixel data.
+        # For pose/face: always copy when detections exist.
+        # For appearance/ReID: only copy when there are new tracks or tracks still awaiting
+        # their first embedding — once all settled, skip the copy to avoid blocking GStreamer.
         frame_np = None
-        _needs_pixel = (
-            frame_meta.num_obj_meta > 0
-            and (_pose_worker is not None
-                 or _face_recognizer is not None
-                 or _appearance_worker is not None)
-        )
+        _needs_pixel = False
+        if frame_meta.num_obj_meta > 0:
+            if _pose_worker is not None or _face_recognizer is not None:
+                _needs_pixel = True
+            if not _needs_pixel and _appearance_worker is not None:
+                n_known = sum(1 for k in _active_tracks if k[0] == pad_index)
+                _needs_pixel = (
+                    frame_meta.num_obj_meta > n_known
+                    or any(not s.appearance_sent
+                           for k, s in _active_tracks.items() if k[0] == pad_index)
+                )
         if _needs_pixel:
             try:
                 n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -1892,14 +1900,22 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
         if not _is_external_cam and not _count_internal:
             continue
 
-        # Lazy frame read: solo cuando hay objetos Y algun worker necesita pixel data
+        # Lazy frame read: GPU→CPU copy only when a worker genuinely needs pixel data.
+        # For pose/face: always copy when detections exist.
+        # For appearance/ReID: only copy when there are new tracks or tracks still awaiting
+        # their first embedding — once all settled, skip the copy to avoid blocking GStreamer.
         frame_np = None
-        _needs_pixel = (
-            frame_meta.num_obj_meta > 0
-            and (_pose_worker is not None
-                 or _face_recognizer is not None
-                 or _appearance_worker is not None)
-        )
+        _needs_pixel = False
+        if frame_meta.num_obj_meta > 0:
+            if _pose_worker is not None or _face_recognizer is not None:
+                _needs_pixel = True
+            if not _needs_pixel and _appearance_worker is not None:
+                n_known = sum(1 for k in _active_tracks if k[0] == pad_index)
+                _needs_pixel = (
+                    frame_meta.num_obj_meta > n_known
+                    or any(not s.appearance_sent
+                           for k, s in _active_tracks.items() if k[0] == pad_index)
+                )
         if _needs_pixel:
             try:
                 n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
