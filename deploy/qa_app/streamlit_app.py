@@ -17,6 +17,7 @@ Arrancar con: ./qa.sh  (desde deploy/)
 import json
 import os
 import threading
+import time
 from collections import deque
 
 import redis
@@ -71,38 +72,48 @@ def _redis_ok() -> bool:
         return False
 
 
-# ── Subscriber de fondo ───────────────────────────────────────────────────────
-def _start_subscriber():
+# ── Buffers de proceso — compartidos entre rerenders, sin ScriptRunContext ────
+# cache_resource crea un singleton a nivel de proceso: el subscriber escribe
+# aquí y el script lo lee en cada rerender sin problemas de thread safety.
+@st.cache_resource
+def _get_buffers():
+    return {
+        "detections": deque(maxlen=MAX_DETECTIONS),
+        "apicalls":   deque(maxlen=MAX_APICALLS),
+    }
+
+@st.cache_resource
+def _ensure_subscriber(_host=REDIS_HOST):
+    """Arranca el subscriber UNA VEZ por proceso. Auto-reconecta si Redis cae."""
+    bufs = _get_buffers()
+
     def _loop():
-        try:
-            r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
-            p = r.pubsub()
-            p.subscribe("nx:qa:detections", "nx:qa:apicalls")
-            for msg in p.listen():
-                if msg["type"] != "message":
-                    continue
-                try:
-                    data = json.loads(msg["data"])
-                except Exception:
-                    continue
-                ch = msg["channel"]
-                if "detections" in ch:
-                    st.session_state.detections.appendleft(data)
-                elif "apicalls" in ch:
-                    st.session_state.apicalls.appendleft(data)
-        except Exception:
-            pass
+        while True:
+            try:
+                r = redis.Redis(host=_host, port=6379, decode_responses=True)
+                p = r.pubsub()
+                p.subscribe("nx:qa:detections", "nx:qa:apicalls")
+                for msg in p.listen():
+                    if msg["type"] != "message":
+                        continue
+                    try:
+                        data = json.loads(msg["data"])
+                    except Exception:
+                        continue
+                    ch = msg["channel"]
+                    if "detections" in ch:
+                        bufs["detections"].appendleft(data)
+                    elif "apicalls" in ch:
+                        bufs["apicalls"].appendleft(data)
+            except Exception:
+                time.sleep(2)   # reconectar tras error
 
-    t = threading.Thread(target=_loop, daemon=True, name="qa-subscriber")
-    t.start()
+    threading.Thread(target=_loop, daemon=True, name="qa-subscriber").start()
+    return True
 
 
-# ── Session state init ────────────────────────────────────────────────────────
-if "initialized" not in st.session_state:
-    st.session_state.detections = deque(maxlen=MAX_DETECTIONS)
-    st.session_state.apicalls   = deque(maxlen=MAX_APICALLS)
-    st.session_state.initialized = True
-    _start_subscriber()
+_ensure_subscriber()
+_bufs = _get_buffers()
 
 
 # ── Leer status del pipeline desde Redis ──────────────────────────────────────
@@ -207,7 +218,7 @@ with col_video:
 
 with col_det:
     st.markdown("### 📊 Detecciones")
-    det_items = list(st.session_state.detections)
+    det_items = list(_bufs["detections"])
     if not det_items:
         st.info("Sin detecciones aún. El pipeline debe estar activo.")
     else:
@@ -234,7 +245,7 @@ with col_det:
 st.markdown("---")
 st.markdown("### 📨 API Calls")
 
-api_items = list(st.session_state.apicalls)
+api_items = list(_bufs["apicalls"])
 if not api_items:
     st.info("Sin API calls aún.")
 else:
