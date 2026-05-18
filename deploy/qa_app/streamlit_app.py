@@ -130,6 +130,15 @@ if _r:
 active_caps: list = status.get("capabilities", [])
 channels: list    = status.get("channels", [])
 
+pipeline_stats: dict = {}
+if _r:
+    try:
+        raw_stats = _r.get("nx:qa:pipeline_stats")
+        if raw_stats:
+            pipeline_stats = json.loads(raw_stats)
+    except Exception:
+        pass
+
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -230,6 +239,43 @@ with st.sidebar:
     # Capacidades pendientes de implementar
     for cap in UNIMPLEMENTED:
         st.checkbox(f"{cap} (pendiente)", value=False, disabled=True, key=f"cap_{cap}_pending")
+
+    st.markdown("---")
+
+    # ── Resoluciones del Pipeline ─────────────────────────────────────────────
+    st.markdown("**🔬 Resoluciones**")
+    comp = status.get("component_resolutions", {})
+    if comp:
+        res_rows = [
+            ("Fuente DVR",         comp.get("source")),
+            ("Probe analytics",    comp.get("probe_a_frame")),
+            ("PGIE PeopleNet",     comp.get("pgie_input", "960x544")),
+            ("SGIE Edad/Género",   comp.get("age_gender_input", "224x224")),
+            ("SGIE FaceDetectIR",  comp.get("facedetect_input", "240x136")),
+            ("MoveNet caídas",     comp.get("movenet_input", "192x192")),
+            ("OSNet re-ID",        comp.get("osnet_input", "128x256")),
+            ("Tiler QA display",   comp.get("probe_b_frame", "640x360")),
+        ]
+        for label, res in res_rows:
+            if res:
+                st.caption(f"`{res}` · {label}")
+    else:
+        st.caption("Disponible cuando el pipeline está activo.")
+
+    st.markdown("---")
+
+    # ── FPS del Pipeline ──────────────────────────────────────────────────────
+    st.markdown("**⚡ FPS del Pipeline**")
+    if pipeline_stats:
+        fps_total = pipeline_stats.get("fps_total", 0.0)
+        st.metric("Total", f"{fps_total:.1f} fps", label_visibility="visible")
+        for cam_id, fps_val in pipeline_stats.get("fps_per_camera", {}).items():
+            ch = cam_id.split("-ch")[-1] if "-ch" in cam_id else cam_id
+            st.caption(f"`ch{ch}` → {fps_val:.1f} fps")
+        if ts := pipeline_stats.get("ts", "")[-12:-4]:
+            st.caption(f"Act: {ts}")
+    else:
+        st.caption("Pipeline inactivo.")
 
     st.markdown("---")
 

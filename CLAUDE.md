@@ -60,15 +60,27 @@ NX_tech/
 
 ## Arquitectura del Pipeline
 
+**Producción (sin tiler):**
 ```
 DVR (RTSP) → rtspsrc → h264/h265parse → nvv4l2decoder
   → nvstreammux → nvinfer (PeopleNet PGIE, gie-id=1)
   → nvtracker → [SGIEs opcionales por paquete]
-  → nvmultistreamtiler(640×360) → nvvideoconvert(RGBA)
-  → [probe: crops para analytics] → fakesink
+  → nvvideoconvert(RGBA) → capsfilter(RGBA)
+  → [probe: analytics en full-res] → fakesink
 ```
 
-> **Sin MJPEG en producción.** El tiler corre a 640×360 (0.9 MB RGBA) solo para que el probe pueda extraer crops. No hay servidor de video. La visualización se obtiene con la app QA Visual (`NX_MODE=testing`).
+**QA mode (`NX_QA_ENABLED=true`) — dual probe:**
+```
+DVR (RTSP) → rtspsrc → h264/h265parse → nvv4l2decoder
+  → nvstreammux → nvinfer (PeopleNet PGIE, gie-id=1)
+  → nvtracker → [SGIEs opcionales por paquete]
+  → nvvideoconvert(RGBA) → capsfilter(RGBA)
+  → [Probe A: analytics full-res por cámara]
+  → nvmultistreamtiler(640×360)
+  → [Probe B: overlays + MJPEG tileado] → fakesink
+```
+
+> **Sin tiler en producción.** El tiler fue eliminado del path de producción — era un remanente del display que reducía la resolución disponible para face recognition, fall detection y re-ID a ~12-20px por cara. Todos los analytics corren ahora sobre frames full-res (ej. 1920×1080). En QA mode el tiler persiste únicamente para la visualización MJPEG: **Probe A** corre antes del tiler (full-res, escribe `_track_labels`) y **Probe B** corre después (frame tileado, solo overlays + MJPEG).
 
 **Workers async (Python threads, no bloquean el pipeline):**
 - `AppearanceWorker` — OSNet-x0.25 ONNX, re-ID entre cámaras
@@ -153,11 +165,14 @@ Herramienta de inspección remota para el equipo NX. Permite que cualquier miemb
 - Toggles por capacidad: apagar/prender `age_gender`, `fall_detection`, `face_recognition` sin reiniciar el pipeline
 - Log de detecciones en tiempo real: track_id, label, confianza, alert de caída
 - Log de API calls: JSON expandible de cada POST que el Jetson envía al backend
+- Panel de resoluciones: tabla de resolución por componente (fuente DVR, PGIE, SGIEs, workers, tiler)
+- Panel de FPS: fps total y fps por cámara, actualizado cada 5 segundos desde Redis
 
 **Cómo funciona internamente:**
-1. `probes.py` (con `NX_QA_ENABLED=true`) dibuja bboxes en el frame tileado 640×360 con OpenCV (CPU, ~1-2ms), extrae crops por cámara (numpy slice), publica metadata a Redis pub/sub (`nx:qa:detections`, `nx:qa:apicalls`), y encola frames en queues Python.
-2. `MjpegServer` (thread daemon en el container deepstream) consume esas queues, encoda a JPEG en background, y sirve HTTP multipart/x-mixed-replace en `:8080` bajo `/stream/all` y `/stream/<camera_id>`. También sirve `/viewer/<key>` — una página HTML mínima con `<img src="/stream/<key>">` mismo origen.
-3. `qa_app` (container Streamlit en `:8501`) embebe el viewer con `st.iframe(viewer_url)` — React preserva el iframe entre rerenders cuando el src no cambia, por lo que el stream MJPEG no se interrumpe con el autorefresh de 500ms. Un thread daemon suscribe a Redis y escribe en deques `@st.cache_resource` (accesibles desde cualquier rerender sin ScriptRunContext).
+1. **Probe A** (`pre_tiler_analytics_probe`, en `caps_rgba src-pad`): corre sobre frames RGBA full-res por cámara. Ejecuta todos los analytics (face recognition, fall detection, age/gender, re-ID, track lifecycle, API events). Llama `_update_fps_stats()` por frame. Escribe `_track_labels[track_id]` (face_name, fall, age_gender) para que Probe B pueda leerlos.
+2. **Probe B** (`osd_sink_pad_buffer_probe` → `_qa_overlay_probe`, en `tiler src-pad`): corre sobre el frame tileado 640×360. Solo dibuja bboxes de personas + labels (leídos de `_track_labels`). Encola el frame tileado en `tiled_frame_queue` y crops por cámara en `camera_frame_queues`. Publica `nx:qa:detections` a Redis.
+3. `MjpegServer` (thread daemon en el container deepstream) consume esas queues, encoda a JPEG en background, y sirve HTTP multipart/x-mixed-replace en `:8080` bajo `/stream/all` y `/stream/<camera_id>`. También sirve `/viewer/<key>` — una página HTML mínima con `<img src="/stream/<key>">` mismo origen.
+4. `qa_app` (container Streamlit en `:8501`) embebe el viewer con `st.iframe(viewer_url)` — React preserva el iframe entre rerenders cuando el src no cambia, por lo que el stream MJPEG no se interrumpe con el autorefresh de 500ms. Un thread daemon suscribe a Redis y escribe en deques `@st.cache_resource` (accesibles desde cualquier rerender sin ScriptRunContext).
 
 **Tech stack:**
 | Componente | Tecnología |
@@ -166,7 +181,8 @@ Herramienta de inspección remota para el equipo NX. Permite que cualquier miemb
 | Video streaming | HTTP MJPEG multipart/x-mixed-replace, `HTTPServer` + `ThreadingMixIn` |
 | Video overlay | OpenCV (CPU, sobre frame RGBA del probe) |
 | Metadata en tiempo real | Redis pub/sub (efímero, sin persistencia) — canales `nx:qa:detections`, `nx:qa:apicalls` |
-| Estado del pipeline | Redis key `nx:qa:status` (JSON con client, channels, capabilities) |
+| Estado del pipeline | Redis key `nx:qa:status` (JSON con client, channels, capabilities, component_resolutions) |
+| FPS del pipeline | Redis key `nx:qa:pipeline_stats` (JSON: fps_per_camera, fps_total, ts — actualizado cada 5s por Probe A) |
 | Feature toggles | Redis hash `nx:qa:capabilities` (leído por el probe antes de cada handler) |
 | Acceso remoto | Tailscale — la IP se extrae de `st.context.headers["host"]` en Streamlit |
 | Container QA app | `python:3.11-slim` ARM64, sin GPU |
@@ -420,26 +436,30 @@ Cuando en una conversación surja una posible mejora — por ejemplo, "ahora usa
 ### `deploy/pipelines/` — Núcleo del pipeline
 
 **`app.py`** (~360 líneas)
-Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **No tiene MJPEG ni display en producción** — el tiler corre a 640×360 únicamente para que el probe pueda extraer crops; el sink es un `fakesink`. Sin `nvdsosd`. El probe se conecta al src-pad de `caps_rgba` (RGBA). Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`. Cuando `NX_QA_ENABLED=true`: llama a `init_qa_cameras()` e `init_qa_grid()`, arranca `MjpegServer` en :8080, y publica `nx:qa:status` en Redis.
+Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **Sin tiler en producción** — el path es `caps_rgba → probe → fakesink`; el probe recibe frames RGBA full-res por cámara. Sin `nvdsosd`. Maneja el ciclo de vida de workers async (start/stop). Lee configuración a través de `config_loader.py`. Cuando `NX_QA_ENABLED=true`: crea el tiler (`nvmultistreamtiler` 640×360) después de `caps_rgba`, conecta **Probe A** (`pre_tiler_analytics_probe`) al src-pad de `caps_rgba` y **Probe B** (`osd_sink_pad_buffer_probe`) al src-pad del tiler, llama a `init_qa_cameras()`, `init_qa_grid()` e `init_pipeline_stats()`, arranca `MjpegServer` en :8080, y publica `nx:qa:status` (con `component_resolutions`) en Redis.
 
 **`app_video_testing.py`** (~240 líneas)
 Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + qtdemux` en lugar de `rtspsrc`. Útil para desarrollo y QA sin DVR físico. Sale con RTSP output en lugar de MJPEG. Acepta `--capabilities` y `--client` por CLI.
 
-**`probes.py`** (~1400 líneas)
-El motor central de analytics. Se conecta al caps_rgba src-pad del pipeline (RGBA, post-tiler) y se ejecuta en cada frame. Contiene:
+**`probes.py`** (~1800 líneas)
+El motor central de analytics. Contiene tres probes y sus helpers:
 - `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea). Con `NX_QA_ENABLED`: además publica a `nx:qa:apicalls` antes del POST.
 - `_AgeGenderHandler`: acumula 10 votes del SGIE antes de confirmar clasificación
 - `_FallDetectionHandler`: despacha crops al `PoseWorker`, aplica 3 reglas geométricas
 - `_FaceRecognitionHandler`: cruza detecciones del SGIE FaceDetectIR con el `FaceRecognizer`
-- `osd_sink_pad_buffer_probe`: función principal que procesa cada batch de frames, gestiona el ciclo de vida de tracks (entry/exit), despacha handlers, acumula crops y analytics
+- `pre_tiler_analytics_probe`: **Probe A** (QA mode). Se conecta al src-pad de `caps_rgba` (RGBA full-res, batched). Gestiona todo el ciclo de vida de tracks, despacha handlers, llama `_update_fps_stats()`, escribe `_track_labels[track_id]` para Probe B. Lectura lazy del frame (solo cuando hay detecciones Y pixel workers activos).
+- `osd_sink_pad_buffer_probe`: dispatcher. En QA mode delega a `_qa_overlay_probe`; en producción delega a `_production_analytics_probe`.
+- `_qa_overlay_probe`: **Probe B** (QA mode, post-tiler). Lee frame tileado 640×360, dibuja bboxes de personas con labels de `_track_labels`, empuja frames a queues MJPEG, publica `nx:qa:detections`.
+- `_production_analytics_probe`: analytics completos en frames full-res con lectura lazy; sin código QA.
 - Stubs `_EppHandler`, `_FireSmokeHandler`, `_LicensePlateHandler` (pendiente integración)
-- **QA Visual (solo si `NX_QA_ENABLED=true`)**:
+- **QA helpers**:
   - `init_qa_cameras(channels)`: inicializa `camera_frame_queues` por cámara
-  - `init_qa_grid(cols, rows, cell_w, cell_h)`: guarda dimensiones del tiler para el mapping de bboxes
+  - `init_qa_grid(cols, rows, cell_w, cell_h)`: guarda dimensiones del tiler para crops por cámara
+  - `init_pipeline_stats(channels)`: escribe `nx:qa:pipeline_stats` inicial en Redis (FPS en 0)
+  - `_update_fps_stats(pad_index)`: cuenta frames, publica FPS a Redis cada 5 s
   - `_draw_qa_overlays(frame_bgr, qa_tracks)`: dibuja bboxes + labels con OpenCV (CPU, ~1 ms)
   - `_is_capability_active(cap)`: lee Redis hash `nx:qa:capabilities` para toggles de features
   - `_qa_publish(channel, data)`: fire-and-forget pub/sub a Redis
-  - Al final de cada frame: dibuja overlays, empuja frame tileado a `tiled_frame_queue`, extrae crops por cámara, publica `nx:qa:detections`
 
 **`mjpeg_server.py`** (~130 líneas)
 Servidor HTTP MJPEG daemon. Solo se instancia cuando `NX_QA_ENABLED=true` (desde `app.py`). Expone:

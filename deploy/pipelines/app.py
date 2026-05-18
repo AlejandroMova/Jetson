@@ -31,10 +31,10 @@ from gi.repository import GLib, Gst
 import pyds
 from config_loader import load_config
 from probes import (
-    osd_sink_pad_buffer_probe, api_client,
+    osd_sink_pad_buffer_probe, pre_tiler_analytics_probe, api_client,
     init_channel_map, init_sector, init_entry_exit_pads,
     init_handlers, init_workers, start_workers, stop_workers,
-    init_qa_grid, init_qa_cameras,
+    init_qa_grid, init_qa_cameras, init_pipeline_stats,
     tiled_frame_queue, camera_frame_queues,
     _IS_QA_ENABLED, _redis_qa,
 )
@@ -242,14 +242,17 @@ def main():
     if not sgie_elements:
         logger.info("No SGIEs loaded — running people_counting only")
 
-    # ── Tiler — combines N streams into one tiled frame ───────────────────────
+    # ── Tiler — solo en QA mode para compositar el video preview ─────────────
+    # En producción el probe recibe frames full-res por cámara directamente.
     tiler_cols = math.ceil(math.sqrt(n_streams))
     tiler_rows = math.ceil(n_streams / tiler_cols)
-    tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
-    tiler.set_property("rows",    tiler_rows)
-    tiler.set_property("columns", tiler_cols)
-    tiler.set_property("width",   640)
-    tiler.set_property("height",  360)
+    tiler = None
+    if _IS_QA_ENABLED:
+        tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
+        tiler.set_property("rows",    tiler_rows)
+        tiler.set_property("columns", tiler_cols)
+        tiler.set_property("width",   640)
+        tiler.set_property("height",  360)
 
     # QA: informar grid al probe + arrancar MjpegServer
     if _IS_QA_ENABLED:
@@ -277,11 +280,25 @@ def main():
                 "tiler_rows":          tiler_rows,
                 "jetson_id":           os.environ.get("JETSON_ID", ""),
                 "entry_exit_channels": cfg.entry_exit_channels,
+                "stream_width":        cfg.stream_width,
+                "stream_height":       cfg.stream_height,
+                "stream_type":         cfg.stream_type,
+                "component_resolutions": {
+                    "source":           f"{cfg.stream_width}x{cfg.stream_height}",
+                    "probe_a_frame":    f"{cfg.stream_width}x{cfg.stream_height}",
+                    "probe_b_frame":    "640x360",
+                    "pgie_input":       "960x544",
+                    "age_gender_input": "224x224",
+                    "facedetect_input": "240x136",
+                    "movenet_input":    "192x192",
+                    "osnet_input":      "128x256",
+                },
             }))
             # Inicializar nx:qa:entry_exit solo si no existe (preserva cambios QA en vivo)
             if not _redis_qa.exists("nx:qa:entry_exit"):
                 import json as _json
                 _redis_qa.set("nx:qa:entry_exit", _json.dumps(cfg.entry_exit_channels))
+            init_pipeline_stats(cfg.channels)
 
     # ── NV12→RGBA (probe needs RGBA for crop extraction) ─────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
@@ -293,32 +310,53 @@ def main():
     fakesink = Gst.ElementFactory.make("fakesink", "fakesink")
     fakesink.set_property("sync", False)
 
-    fixed_elements = [pgie, tracker, tiler, nvvidconv1, caps_rgba, fakesink]
+    fixed_elements = [pgie, tracker, nvvidconv1, caps_rgba, fakesink]
     if not all(fixed_elements):
         logger.error("Failed to create one or more pipeline elements.")
+        sys.exit(1)
+    if _IS_QA_ENABLED and not tiler:
+        logger.error("Failed to create nvmultistreamtiler in QA mode.")
         sys.exit(1)
 
     for el in fixed_elements + sgie_elements:
         pipeline.add(el)
+    if tiler is not None:
+        pipeline.add(tiler)
 
     # ── Linking ───────────────────────────────────────────────────────────────
     streammux.link(pgie)
     pgie.link(tracker)
 
-    # Chain SGIEs in sequence after tracker, then continue to tiler
     prev = tracker
     for sgie in sgie_elements:
         prev.link(sgie)
         prev = sgie
-    prev.link(tiler)
 
-    tiler.link(nvvidconv1)
+    # nvvidconv1 siempre va despues de los SGIEs (produccion y QA)
+    prev.link(nvvidconv1)
     nvvidconv1.link(caps_rgba)
-    caps_rgba.link(fakesink)
 
-    # ── Probe — caps_rgba src-pad sees RGBA (needed for crop extraction) ──────
+    if _IS_QA_ENABLED:
+        # QA: caps_rgba -> tiler (compuesto 640x360) -> fakesink
+        caps_rgba.link(tiler)
+        tiler.link(fakesink)
+    else:
+        # Produccion: caps_rgba -> fakesink (sin tiler)
+        caps_rgba.link(fakesink)
+
+    # ── Probe attachment ──────────────────────────────────────────────────────
     caps_rgba_src_pad = caps_rgba.get_static_pad("src")
-    caps_rgba_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
+    if _IS_QA_ENABLED:
+        # Probe A: analytics en frames full-res RGBA (pre-tiler)
+        caps_rgba_src_pad.add_probe(Gst.PadProbeType.BUFFER, pre_tiler_analytics_probe)
+        # Probe B: overlays en frame tileado RGBA (post-tiler)
+        tiler_src_pad = tiler.get_static_pad("src")
+        tiler_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
+        logger.info("[QA] Probe A (analytics) en caps_rgba; Probe B (overlays) en tiler src")
+    else:
+        # Produccion: probe unico con frames full-res
+        caps_rgba_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
+        logger.info("Probe unico (produccion) en caps_rgba src-pad")
 
     # ── Run ───────────────────────────────────────────────────────────────────
     api_client.start()

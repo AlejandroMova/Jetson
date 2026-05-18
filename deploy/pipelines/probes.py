@@ -61,6 +61,10 @@ _entry_exit_pads: set = set()
 _entry_exit_probe_count: int = 0
 _ENTRY_EXIT_REFRESH_EVERY: int = 30   # actualizar desde Redis cada N llamadas al probe
 
+# QA: probe A escribe, probe B lee — track_id → {face_name, fall, age_gender}
+# Solo se popula cuando _IS_QA_ENABLED=True. GIL garantiza acceso seguro (hilo único GStreamer).
+_track_labels: Dict[int, dict] = {}
+
 
 def init_channel_map(channels: list):
     """Llamar desde app.py después de load_config(), antes de arrancar el pipeline."""
@@ -200,6 +204,22 @@ def init_qa_cameras(channels: list) -> None:
         camera_frame_queues[_camera_id_for(i)] = queue.Queue(maxsize=1)
     if _IS_QA_ENABLED:
         logger.info("[QA] Queues de cámara: %s", list(camera_frame_queues.keys()))
+
+
+def init_pipeline_stats(channels: list) -> None:
+    """Inicializa nx:qa:pipeline_stats en Redis con FPS en 0. Llamar desde app.py."""
+    if not _IS_QA_ENABLED or not _redis_qa:
+        return
+    stats = {
+        "fps_per_camera": {_camera_id_for(i): 0.0 for i in range(len(channels))},
+        "fps_total": 0.0,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _redis_qa.set("nx:qa:pipeline_stats", json.dumps(stats))
+        logger.info("[QA] nx:qa:pipeline_stats inicializado")
+    except Exception:
+        pass
 
 
 def _qa_publish(channel: str, data: dict) -> None:
@@ -1142,6 +1162,11 @@ _reference_frame_sent: Dict[int, bool] = {}
 _analytics: Dict[int, Dict] = {}
 _analytics_last_sent: Dict[int, float] = {}
 
+# FPS tracking para nx:qa:pipeline_stats (solo QA mode)
+_fps_frame_counts: Dict[int, int] = {}
+_fps_last_publish: float = 0.0
+_FPS_PUBLISH_INTERVAL: float = 5.0
+
 
 def _get_analytics(pad_index: int) -> Dict:
     if pad_index not in _analytics:
@@ -1229,30 +1254,599 @@ def _cleanup_handler_cache(handler, track_id: int) -> None:
             d.pop(track_id, None)
 
 
-def osd_sink_pad_buffer_probe(_pad, info):
+def _update_fps_stats(pad_index: int) -> None:
+    """Incrementa contador por cámara y publica FPS a Redis cada _FPS_PUBLISH_INTERVAL s."""
+    global _fps_last_publish
+    _fps_frame_counts[pad_index] = _fps_frame_counts.get(pad_index, 0) + 1
+    now = time.monotonic()
+    if now - _fps_last_publish >= _FPS_PUBLISH_INTERVAL:
+        elapsed = now - _fps_last_publish if _fps_last_publish > 0 else _FPS_PUBLISH_INTERVAL
+        fps_per_cam = {
+            _camera_id_for(idx): round(count / elapsed, 1)
+            for idx, count in _fps_frame_counts.items()
+        }
+        if _redis_qa:
+            try:
+                _redis_qa.set("nx:qa:pipeline_stats", json.dumps({
+                    "fps_per_camera": fps_per_cam,
+                    "fps_total": round(sum(fps_per_cam.values()), 1),
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }))
+            except Exception:
+                pass
+        _fps_frame_counts.clear()
+        _fps_last_publish = now
+
+
+def pre_tiler_analytics_probe(_pad, info):
     """
-    Probe conectado al src-pad de caps_rgba (RGBA, post-tiler).
-    Itera sobre objetos del frame: personas del PGIE y caras del FaceDetectIR SGIE.
-    Despacha handlers activos y envía eventos / analytics a la API REST.
-    En QA mode (NX_QA_ENABLED=true): dibuja overlays y publica a Redis/MJPEG.
+    Probe A (QA mode) — conectado al src-pad de caps_rgba, ANTES del tiler.
+    Recibe frames RGBA a resolución original por cámara (ej. 1920×1080).
+    Ejecuta todos los analytics: handlers, workers, lifecycle de tracks, API events.
+    Escribe _track_labels[track_id] para que _qa_overlay_probe (Probe B) dibuje labels.
+    Trackea FPS por cámara y publica a nx:qa:pipeline_stats cada 5 s.
     """
     gst_buffer = info.get_buffer()
     if not gst_buffer:
         return Gst.PadProbeReturn.OK
-
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     if not batch_meta:
         return Gst.PadProbeReturn.OK
 
-    # QA: refrescar entry_exit_pads desde Redis en caliente
     global _entry_exit_probe_count
     _entry_exit_probe_count += 1
-    if _IS_QA_ENABLED and _entry_exit_probe_count % _ENTRY_EXIT_REFRESH_EVERY == 0:
+    if _entry_exit_probe_count % _ENTRY_EXIT_REFRESH_EVERY == 0:
         _refresh_entry_exit_from_redis()
 
-    # QA: acumula datos de todas las cámaras en este buffer (reset por llamada)
-    _qa_frame_bgr: Optional[np.ndarray] = None   # frame tileado BGR, capturado 1 vez
-    _qa_all_tracks: List[dict] = []
+    for frame_meta in _iter_pyds_list(
+        batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
+    ):
+        frame_num          = frame_meta.frame_num
+        pad_index          = frame_meta.pad_index
+        camera_id          = _camera_id_for(pad_index)
+        is_entry_exit_cam  = pad_index in _entry_exit_pads
+
+        _update_fps_stats(pad_index)
+
+        # Lazy frame read: solo cuando hay detecciones Y algún worker necesita pixel data
+        frame_np = None
+        _needs_pixel = (
+            frame_meta.num_obj_meta > 0
+            and (_pose_worker is not None
+                 or _face_recognizer is not None
+                 or _appearance_worker is not None)
+        )
+        if _needs_pixel:
+            try:
+                n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+                frame_np = np.array(n_frame, copy=True, order='C')
+                frame_np = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGR)
+                if frame_num == 0:
+                    fh, fw = frame_np.shape[:2]
+                    logger.info("[QA Probe A] Resolución full-res cámara %s: %dx%d",
+                                camera_id, fw, fh)
+            except Exception as e:
+                if frame_num % 30 == 0:
+                    logger.warning("pre_tiler get_nvds_buf_surface frame=%d: %s", frame_num, e)
+
+        # ── Primera pasada: colectar personas y caras ─────────────────────────
+        persons_meta: List = []
+        face_metas:   List = []
+        for obj_meta in _iter_pyds_list(
+            frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast
+        ):
+            uid = obj_meta.unique_component_id
+            if uid == PGIE_UNIQUE_ID and obj_meta.confidence >= OSD_CONFIDENCE_THRESHOLD:
+                cid = int(obj_meta.class_id)
+                if cid == PGIE_CLASS_PERSON:
+                    persons_meta.append(obj_meta)
+                elif cid == PGIE_CLASS_FACE:
+                    face_metas.append(obj_meta)
+
+        # ── Face recognition ──────────────────────────────────────────────────
+        if _face_handler and face_metas and frame_np is not None:
+            if _is_capability_active("face_recognition"):
+                for face_obj_meta in face_metas:
+                    _face_handler.process_face(
+                        face_obj_meta, frame_num, frame_np, persons_meta, camera_id
+                    )
+
+        # ── Segunda pasada: handler por persona ───────────────────────────────
+        visible_ids: Set[int] = set()
+        for obj_meta in persons_meta:
+            p_track_id = int(obj_meta.object_id)
+            visible_ids.add(p_track_id)
+            r = obj_meta.rect_params
+            bbox = {
+                "left":   max(0, int(r.left)),
+                "top":    max(0, int(r.top)),
+                "width":  int(r.width),
+                "height": int(r.height),
+            }
+
+            track_key = (pad_index, p_track_id)
+            now = time.monotonic()
+
+            if track_key not in _active_tracks:
+                _active_tracks[track_key] = _TrackState(
+                    first_frame=frame_num,
+                    last_frame=frame_num,
+                    first_ts=now,
+                    camera_id=camera_id,
+                    is_entry_exit_cam=is_entry_exit_cam,
+                )
+                api_client.post_person_entry(
+                    camera_id, p_track_id, bbox,
+                    float(obj_meta.confidence), is_entry_exit_cam,
+                )
+                _get_analytics(pad_index)["person_count"] += 1
+            else:
+                _active_tracks[track_key].last_frame = frame_num
+
+            # AppearanceWorker
+            if _appearance_worker is not None:
+                state = _active_tracks[track_key]
+                if not state.appearance_sent:
+                    vec = _appearance_worker.get_result(p_track_id)
+                    if vec is not None:
+                        api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
+                        state.appearance_sent = True
+                if (frame_np is not None
+                        and frame_num % 15 == 0
+                        and not state.appearance_sent
+                        and bbox["width"] >= CROP_MIN_WIDTH
+                        and bbox["height"] >= CROP_MIN_HEIGHT):
+                    crop = frame_np[
+                        bbox["top"]:bbox["top"] + bbox["height"],
+                        bbox["left"]:bbox["left"] + bbox["width"],
+                    ]
+                    if crop.size > 0:
+                        _appearance_worker.enqueue(crop, p_track_id, frame_num)
+
+            _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
+
+            # Handlers activos
+            qa_fall = False
+            qa_age_gender = ""
+            for handler in _active_handlers:
+                if not _is_capability_active(getattr(handler, "_cap_name", "")):
+                    continue
+                result = handler.process(obj_meta, frame_num, frame_np=frame_np)
+                if result is None:
+                    continue
+                if result.osd_text:
+                    _set_osd_text(obj_meta, result.osd_text, border_color=result.border_color)
+                    if isinstance(handler, _AgeGenderHandler):
+                        qa_age_gender = result.osd_text
+                if result.event_type == "person_classified":
+                    api_client.post_person_classified(
+                        camera_id, p_track_id, bbox, result.det_extra.get("demographics", {})
+                    )
+                    an = _get_analytics(pad_index)
+                    au = result.analytics_update
+                    if "age_gender_classes" in au:
+                        lbl = au["age_gender_classes"]
+                        an["age_gender_classes"][lbl] = an["age_gender_classes"].get(lbl, 0) + 1
+                    if "gender_key" in au:
+                        an[au["gender_key"]] += 1
+                elif result.event_type == "fall_detected":
+                    qa_fall = True
+                    api_client.post_fall_detected(
+                        camera_id, p_track_id, bbox,
+                        result.det_extra.get("fall_score", 0),
+                        result.det_extra.get("avg_kp_conf", 0.0),
+                    )
+
+            # Face identity OSD
+            qa_face_name = None
+            if _face_handler:
+                identity = _face_handler.get_identity(p_track_id)
+                if identity:
+                    name, conf = identity
+                    if name != "Desconocido":
+                        cur = obj_meta.text_params.display_text or f"P#{p_track_id}"
+                        _set_osd_text(
+                            obj_meta,
+                            f"{cur} | {name} {conf:.0%}",
+                            border_color=(0.2, 1.0, 0.4, 1.0),
+                        )
+                        qa_face_name = f"{name} {conf:.0%}"
+
+            # Escribir labels para Probe B
+            _track_labels[p_track_id] = {
+                "face_name":  qa_face_name,
+                "fall":       qa_fall,
+                "age_gender": qa_age_gender,
+            }
+
+            # Crop capture
+            if frame_np is not None:
+                last_crop = _crop_last_frame.get(p_track_id, -CROP_SAMPLE_INTERVAL)
+                count = _crop_counts.get(p_track_id, 0)
+                if (count < CROP_MAX_PER_PERSON
+                        and (frame_num - last_crop) >= CROP_SAMPLE_INTERVAL
+                        and bbox["height"] >= CROP_MIN_HEIGHT
+                        and bbox["width"] >= CROP_MIN_WIDTH):
+                    crop = frame_np[
+                        bbox["top"]:bbox["top"] + bbox["height"],
+                        bbox["left"]:bbox["left"] + bbox["width"],
+                    ]
+                    if crop.size > 0:
+                        _save_and_send_crop(crop, camera_id, p_track_id, frame_num, bbox)
+                        _crop_counts[p_track_id] = count + 1
+                        _crop_last_frame[p_track_id] = frame_num
+
+        # Expirar tracks perdidos y limpiar _track_labels
+        _expire_lost_tracks(pad_index, frame_num, visible_ids)
+        active_track_ids = {k[1] for k in _active_tracks}
+        for tid in list(_track_labels):
+            if tid not in active_track_ids:
+                _track_labels.pop(tid, None)
+
+        # Reference frame
+        if (not _reference_frame_sent.get(pad_index, False)
+                and frame_np is not None
+                and len(visible_ids) == 0
+                and frame_meta.num_obj_meta == 0):
+            fh, fw = frame_np.shape[:2]
+            _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            frame_b64 = base64.b64encode(buf).decode("utf-8")
+            api_client.post_reference_frame(camera_id, frame_num, frame_b64, fw, fh)
+            _reference_frame_sent[pad_index] = True
+            logger.info("Frame de referencia enviado camera=%s (frame=%d, %dx%d)",
+                        camera_id, frame_num, fw, fh)
+
+        # Position snapshot
+        if _ws_client is not None and visible_ids and frame_np is not None:
+            fh, fw = frame_np.shape[:2]
+            _accumulate_positions(pad_index, camera_id, persons_meta, fw, fh, frame_num)
+
+        # Analytics snapshot
+        now = time.monotonic()
+        if now - _get_analytics_last_sent(pad_index) >= ANALYTICS_SEND_INTERVAL_SECS:
+            an = _get_analytics(pad_index)
+            api_client.post_analytics_snapshot(camera_id, {
+                "people_count":       an["person_count"],
+                "gender_male":        an["gender_male"],
+                "gender_female":      an["gender_female"],
+                "age_gender_classes": an["age_gender_classes"],
+            }, period_seconds=ANALYTICS_SEND_INTERVAL_SECS)
+            _analytics[pad_index] = {
+                "person_count": 0, "gender_male": 0,
+                "gender_female": 0, "age_gender_classes": {},
+            }
+            _analytics_last_sent[pad_index] = now
+
+    return Gst.PadProbeReturn.OK
+
+
+def osd_sink_pad_buffer_probe(_pad, info):
+    """
+    En producción (NX_QA_ENABLED=false): probe único en caps_rgba src-pad.
+      Recibe frames RGBA full-res por cámara. Ejecuta todos los analytics.
+    En QA mode (NX_QA_ENABLED=true): Probe B en tiler src-pad.
+      Recibe frame RGBA tileado 640x360. Solo dibuja overlays y sirve MJPEG.
+      pre_tiler_analytics_probe (Probe A) ya ejecutó todos los analytics.
+    """
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    if not batch_meta:
+        return Gst.PadProbeReturn.OK
+
+    if _IS_QA_ENABLED:
+        return _qa_overlay_probe(gst_buffer, batch_meta)
+    return _production_analytics_probe(gst_buffer, batch_meta)
+
+
+def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
+    """Probe B (QA mode): lee frame tileado RGBA, dibuja overlays, sirve MJPEG.
+    Los analytics ya fueron ejecutados por pre_tiler_analytics_probe (Probe A).
+    Los labels vienen de _track_labels escrito por Probe A."""
+    qa_frame_bgr: Optional[np.ndarray] = None
+    qa_all_tracks: List[dict] = []
+
+    for frame_meta in _iter_pyds_list(
+        batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
+    ):
+        # Leer frame tileado una sola vez (post-tiler es un frame compuesto unico)
+        if qa_frame_bgr is None:
+            try:
+                n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+                qa_frame_bgr = cv2.cvtColor(
+                    np.array(n_frame, copy=True, order='C'), cv2.COLOR_RGBA2BGR
+                )
+            except Exception as e:
+                if frame_meta.frame_num % 30 == 0:
+                    logger.warning("[QA Probe B] buf_surface: %s", e)
+
+        pad_index = frame_meta.pad_index
+        camera_id = _camera_id_for(pad_index)
+
+        # Solo bboxes de personas (class_id=0) para el overlay visual
+        for obj_meta in _iter_pyds_list(
+            frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast
+        ):
+            if (obj_meta.unique_component_id != PGIE_UNIQUE_ID
+                    or int(obj_meta.class_id) != PGIE_CLASS_PERSON
+                    or obj_meta.confidence < OSD_CONFIDENCE_THRESHOLD):
+                continue
+
+            p_track_id = int(obj_meta.object_id)
+            r = obj_meta.rect_params
+
+            # Age/gender directo del SGIE classifier_meta (sin pixel data)
+            age_gender_text = ""
+            for cls_meta in _iter_pyds_list(
+                obj_meta.classifier_meta_list, pyds.NvDsClassifierMeta.cast
+            ):
+                if cls_meta.unique_component_id == SGIE_AGE_GENDER_ID:
+                    _, gender_disp, age_disp, _ = _parse_age_gender(cls_meta)
+                    if gender_disp:
+                        age_gender_text = f"{gender_disp}|{age_disp}"
+                    break
+
+            # Face name y fall desde _track_labels (escrito por Probe A)
+            labels = _track_labels.get(p_track_id, {})
+            label_parts = [f"P#{p_track_id}"]
+            if age_gender_text:
+                label_parts.append(age_gender_text)
+            if labels.get("face_name"):
+                label_parts.append(labels["face_name"])
+
+            qa_all_tracks.append({
+                "pad_index":  pad_index,
+                "channel_id": camera_id,
+                "track_id":   p_track_id,
+                "confidence": round(float(obj_meta.confidence), 3),
+                "bbox_tiled": (
+                    max(0, int(r.left)), max(0, int(r.top)),
+                    int(r.width), int(r.height),
+                ),
+                "label": " | ".join(label_parts),
+                "fall":  labels.get("fall", False),
+            })
+
+    if qa_frame_bgr is not None:
+        try:
+            _draw_qa_overlays(qa_frame_bgr, qa_all_tracks)
+        except Exception as _e:
+            logger.debug("[QA] overlay error: %s", _e)
+
+        try:
+            tiled_frame_queue.put_nowait(qa_frame_bgr.copy())
+        except queue.Full:
+            pass
+
+        for pad_idx in _channel_map:
+            cam_id = _camera_id_for(pad_idx)
+            q = camera_frame_queues.get(cam_id)
+            if q is None:
+                continue
+            ox = (pad_idx % _qa_tiler_cols) * _qa_cell_w
+            oy = (pad_idx // _qa_tiler_cols) * _qa_cell_h
+            if (oy + _qa_cell_h <= qa_frame_bgr.shape[0]
+                    and ox + _qa_cell_w <= qa_frame_bgr.shape[1]):
+                try:
+                    q.put_nowait(qa_frame_bgr[oy:oy + _qa_cell_h, ox:ox + _qa_cell_w].copy())
+                except queue.Full:
+                    pass
+
+        if qa_all_tracks:
+            by_cam: Dict[str, List] = {}
+            for t in qa_all_tracks:
+                by_cam.setdefault(t["channel_id"], []).append({
+                    "track_id":   t["track_id"],
+                    "confidence": t["confidence"],
+                    "label":      t["label"],
+                    "fall":       t["fall"],
+                })
+            for cam_id, tracks in by_cam.items():
+                _qa_publish("nx:qa:detections", {
+                    "cam":    cam_id,
+                    "ts":     datetime.now(timezone.utc).isoformat(),
+                    "tracks": tracks,
+                })
+
+    return Gst.PadProbeReturn.OK
+
+
+def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
+    """Probe unico en produccion (NX_QA_ENABLED=false).
+    Recibe frames RGBA full-res por camara (sin tiler en el pipeline).
+    Lazy frame read: solo copia GPU->CPU cuando hay detecciones y workers de pixel."""
+    global _entry_exit_probe_count
+    _entry_exit_probe_count += 1
+    if _entry_exit_probe_count % _ENTRY_EXIT_REFRESH_EVERY == 0:
+        _refresh_entry_exit_from_redis()
+
+    for frame_meta in _iter_pyds_list(
+        batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
+    ):
+        frame_num         = frame_meta.frame_num
+        pad_index         = frame_meta.pad_index
+        camera_id         = _camera_id_for(pad_index)
+        is_entry_exit_cam = pad_index in _entry_exit_pads
+
+        # Lazy frame read: solo cuando hay objetos Y algun worker necesita pixel data
+        frame_np = None
+        _needs_pixel = (
+            frame_meta.num_obj_meta > 0
+            and (_pose_worker is not None
+                 or _face_recognizer is not None
+                 or _appearance_worker is not None)
+        )
+        if _needs_pixel:
+            try:
+                n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+                frame_np = np.array(n_frame, copy=True, order='C')
+                frame_np = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGR)
+            except Exception as e:
+                if frame_num % 30 == 0:
+                    logger.warning("get_nvds_buf_surface fallo frame=%d: %s", frame_num, e)
+
+        persons_meta: List = []
+        face_metas:   List = []
+        for obj_meta in _iter_pyds_list(
+            frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast
+        ):
+            uid = obj_meta.unique_component_id
+            if (uid == PGIE_UNIQUE_ID
+                    and obj_meta.confidence >= OSD_CONFIDENCE_THRESHOLD
+                    and int(obj_meta.class_id) == PGIE_CLASS_PERSON):
+                persons_meta.append(obj_meta)
+            elif (uid == PGIE_UNIQUE_ID
+                    and int(obj_meta.class_id) == PGIE_CLASS_FACE):
+                face_metas.append(obj_meta)
+
+        if _face_handler and face_metas and frame_np is not None:
+            if _is_capability_active("face_recognition"):
+                for face_obj_meta in face_metas:
+                    _face_handler.process_face(
+                        face_obj_meta, frame_num, frame_np, persons_meta, camera_id
+                    )
+
+        visible_ids: Set[int] = set()
+        for obj_meta in persons_meta:
+            p_track_id = int(obj_meta.object_id)
+            visible_ids.add(p_track_id)
+            r = obj_meta.rect_params
+            bbox = {
+                "left":   max(0, int(r.left)),
+                "top":    max(0, int(r.top)),
+                "width":  int(r.width),
+                "height": int(r.height),
+            }
+
+            track_key = (pad_index, p_track_id)
+            now = time.monotonic()
+
+            if track_key not in _active_tracks:
+                _active_tracks[track_key] = _TrackState(
+                    first_frame=frame_num,
+                    last_frame=frame_num,
+                    first_ts=now,
+                    camera_id=camera_id,
+                    is_entry_exit_cam=is_entry_exit_cam,
+                )
+                api_client.post_person_entry(
+                    camera_id, p_track_id, bbox,
+                    float(obj_meta.confidence), is_entry_exit_cam,
+                )
+                _get_analytics(pad_index)["person_count"] += 1
+            else:
+                _active_tracks[track_key].last_frame = frame_num
+
+            if _appearance_worker is not None:
+                state = _active_tracks[track_key]
+                if not state.appearance_sent:
+                    vec = _appearance_worker.get_result(p_track_id)
+                    if vec is not None:
+                        api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
+                        state.appearance_sent = True
+                if (frame_np is not None
+                        and frame_num % 15 == 0
+                        and not state.appearance_sent
+                        and bbox["width"] >= CROP_MIN_WIDTH
+                        and bbox["height"] >= CROP_MIN_HEIGHT):
+                    crop = frame_np[
+                        bbox["top"]:bbox["top"] + bbox["height"],
+                        bbox["left"]:bbox["left"] + bbox["width"],
+                    ]
+                    if crop.size > 0:
+                        _appearance_worker.enqueue(crop, p_track_id, frame_num)
+
+            _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
+
+            for handler in _active_handlers:
+                if not _is_capability_active(getattr(handler, "_cap_name", "")):
+                    continue
+                result = handler.process(obj_meta, frame_num, frame_np=frame_np)
+                if result is None:
+                    continue
+                if result.osd_text:
+                    _set_osd_text(obj_meta, result.osd_text, border_color=result.border_color)
+                if result.event_type == "person_classified":
+                    api_client.post_person_classified(
+                        camera_id, p_track_id, bbox, result.det_extra.get("demographics", {})
+                    )
+                    an = _get_analytics(pad_index)
+                    au = result.analytics_update
+                    if "age_gender_classes" in au:
+                        lbl = au["age_gender_classes"]
+                        an["age_gender_classes"][lbl] = an["age_gender_classes"].get(lbl, 0) + 1
+                    if "gender_key" in au:
+                        an[au["gender_key"]] += 1
+                elif result.event_type == "fall_detected":
+                    api_client.post_fall_detected(
+                        camera_id, p_track_id, bbox,
+                        result.det_extra.get("fall_score", 0),
+                        result.det_extra.get("avg_kp_conf", 0.0),
+                    )
+
+            if _face_handler:
+                identity = _face_handler.get_identity(p_track_id)
+                if identity:
+                    name, conf = identity
+                    if name != "Desconocido":
+                        cur = obj_meta.text_params.display_text or f"P#{p_track_id}"
+                        _set_osd_text(
+                            obj_meta,
+                            f"{cur} | {name} {conf:.0%}",
+                            border_color=(0.2, 1.0, 0.4, 1.0),
+                        )
+
+            if frame_np is not None:
+                last_crop = _crop_last_frame.get(p_track_id, -CROP_SAMPLE_INTERVAL)
+                count = _crop_counts.get(p_track_id, 0)
+                if (count < CROP_MAX_PER_PERSON
+                        and (frame_num - last_crop) >= CROP_SAMPLE_INTERVAL
+                        and bbox["height"] >= CROP_MIN_HEIGHT
+                        and bbox["width"] >= CROP_MIN_WIDTH):
+                    crop = frame_np[
+                        bbox["top"]:bbox["top"] + bbox["height"],
+                        bbox["left"]:bbox["left"] + bbox["width"],
+                    ]
+                    if crop.size > 0:
+                        _save_and_send_crop(crop, camera_id, p_track_id, frame_num, bbox)
+                        _crop_counts[p_track_id] = count + 1
+                        _crop_last_frame[p_track_id] = frame_num
+
+        _expire_lost_tracks(pad_index, frame_num, visible_ids)
+
+        if (not _reference_frame_sent.get(pad_index, False)
+                and frame_np is not None
+                and len(visible_ids) == 0
+                and frame_meta.num_obj_meta == 0):
+            fh, fw = frame_np.shape[:2]
+            _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            frame_b64 = base64.b64encode(buf).decode("utf-8")
+            api_client.post_reference_frame(camera_id, frame_num, frame_b64, fw, fh)
+            _reference_frame_sent[pad_index] = True
+            logger.info("Frame de referencia enviado camera=%s (frame=%d, %dx%d)",
+                        camera_id, frame_num, fw, fh)
+
+        if _ws_client is not None and visible_ids and frame_np is not None:
+            fh, fw = frame_np.shape[:2]
+            _accumulate_positions(pad_index, camera_id, persons_meta, fw, fh, frame_num)
+
+        now = time.monotonic()
+        if now - _get_analytics_last_sent(pad_index) >= ANALYTICS_SEND_INTERVAL_SECS:
+            an = _get_analytics(pad_index)
+            api_client.post_analytics_snapshot(camera_id, {
+                "people_count":       an["person_count"],
+                "gender_male":        an["gender_male"],
+                "gender_female":      an["gender_female"],
+                "age_gender_classes": an["age_gender_classes"],
+            }, period_seconds=ANALYTICS_SEND_INTERVAL_SECS)
+            _analytics[pad_index] = {
+                "person_count": 0, "gender_male": 0,
+                "gender_female": 0, "age_gender_classes": {},
+            }
+            _analytics_last_sent[pad_index] = now
+
+    return Gst.PadProbeReturn.OK
 
     for frame_meta in _iter_pyds_list(
         batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
