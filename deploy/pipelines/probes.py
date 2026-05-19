@@ -187,8 +187,9 @@ CROP_MIN_WIDTH: int       = 48
 CROP_MIN_HEIGHT: int      = 96
 # Frames to wait for an appearance embedding before emitting person_entry anyway.
 # At 30 fps: first enqueue on frame 0, result typically arrives by frame ~2.
-# 90 frames ≈ 3 seconds is a conservative deadline for slow or occluded crops.
-ENTRY_EMIT_DEADLINE_FRAMES: int = 90
+# 30 frames ≈ 1 second — enough for OSNet on CPU even under queue pressure.
+# (Was 90, which delayed person_entry 3 s on slow crops — too visible in QA app.)
+ENTRY_EMIT_DEADLINE_FRAMES: int = 30
 
 
 # ==============================================================================
@@ -1401,6 +1402,11 @@ def _handle_appearance_reid(
                     p_track_id, camera_id, event_type, global_id, prev_camera,
                 )
 
+                # Same-camera channel_change = tracker briefly lost + re-detected same person.
+                # Treat as person_return so we don't emit a spurious cross-camera event.
+                if event_type == "channel_change" and prev_camera == camera_id:
+                    event_type = "person_return"
+
                 if not state.entry_emitted:
                     state.entry_emitted = True
                     if event_type == "channel_change":
@@ -1525,9 +1531,14 @@ def pre_tiler_analytics_probe(_pad, info):
             if _pose_worker is not None or _face_recognizer is not None:
                 _needs_pixel = True
             if not _needs_pixel and _appearance_worker is not None:
+                # Count only person tracks (class 0), not bags/faces which inflate num_obj_meta.
+                n_persons_in_frame = sum(
+                    1 for om in _iter_pyds_list(frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast)
+                    if int(om.class_id) == PGIE_CLASS_PERSON
+                )
                 n_known = sum(1 for k in _active_tracks if k[0] == pad_index)
                 _needs_pixel = (
-                    frame_meta.num_obj_meta > n_known
+                    n_persons_in_frame > n_known
                     or any(not s.appearance_sent
                            for k, s in _active_tracks.items() if k[0] == pad_index)
                 )
@@ -1910,9 +1921,14 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
             if _pose_worker is not None or _face_recognizer is not None:
                 _needs_pixel = True
             if not _needs_pixel and _appearance_worker is not None:
+                # Count only person tracks (class 0), not bags/faces which inflate num_obj_meta.
+                n_persons_in_frame = sum(
+                    1 for om in _iter_pyds_list(frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast)
+                    if int(om.class_id) == PGIE_CLASS_PERSON
+                )
                 n_known = sum(1 for k in _active_tracks if k[0] == pad_index)
                 _needs_pixel = (
-                    frame_meta.num_obj_meta > n_known
+                    n_persons_in_frame > n_known
                     or any(not s.appearance_sent
                            for k, s in _active_tracks.items() if k[0] == pad_index)
                 )
