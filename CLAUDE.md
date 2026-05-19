@@ -114,10 +114,11 @@ Identifica cuando la misma persona aparece en cámaras distintas usando embeddin
 - `person_entry` (`entry_type: "return"`) — misma persona, reapareció tras > 5 min de ausencia
 - `person_channel_change` — misma persona, cambió de cámara dentro de la ventana de presencia (≤5 min)
 
-La emisión de `person_entry` se **difiere** hasta que el embedding esté listo (deadline 90 frames / ~3 s). Si el embedding no llega, se emite con `global_id: null`.
+La emisión de `person_entry` se **difiere** hasta que el embedding esté listo (deadline 30 frames / ~1 s a 30fps). Si el embedding no llega, se emite con `global_id: null`.
 
-- **Embedding:** OSNet-x0.25 ONNX — vectores 512-dim L2-normalizados. `AppearanceWorker` (Python thread)
-- **Matching:** similitud coseno (dot product) ≥ 0.65. `ReIdManager` — O(N µs) para N embeddings en DB
+- **Embedding:** OSNet-x0.25 ONNX — vectores 512-dim L2-normalizados. `AppearanceWorker` (Python thread). Clave interna: `(pad_index, track_id)` — los track IDs son locales por cámara en DeepStream, por lo que la clave debe incluir el índice del stream.
+- **Matching:** similitud coseno (dot product) ≥ 0.60. `ReIdManager` — O(N µs) para N embeddings en DB. Actualización del embedding por EMA (alpha=0.7) para estabilidad frente a crops parciales.
+- **Same-camera re-detection:** si `channel_change` ocurre con `prev_camera == camera_id` (tracker pierde y re-detecta en la misma cámara), se demota a `person_return` para no emitir un evento de cambio de cámara espurio.
 - **Persistencia:** `deploy/reid_db.json` — sobrevive reinicios; TTL 1 hora sin actividad
 - **Ventana de presencia:** 5 min (configurable en `reid_manager.py` como `PRESENCE_WINDOW_S`)
 - Se activa automáticamente si el modelo existe en `models/osnet/`
@@ -262,11 +263,14 @@ Checklist para este cambio:
 - [ ] Regla 6: ¿Impacta el flujo de instalación en campo? → [sí/no, cómo]
 - [ ] Regla 7: ¿La tecnología es open source y on-edge? → [verificación]
 - [ ] Regla 8: ¿Hay conflictos con otras partes del proyecto? → [GPU, GIE IDs, config, etc.]
-- [ ] Regla 9: ¿Necesita actualizar CLAUDE.md? → [sí/no, qué sección]
+- [ ] Regla 9: Actualizar CLAUDE.md → [qué sección, obligatorio]
+- [ ] Regla 2 (post): Actualizar README.md → [qué sección, obligatorio si aplica]
 - [ ] Regla 10: ¿Hay errores que registrar en ErrorHistory.md? → [sí/no]
 - [ ] Regla 11: ¿Hay mejoras futuras que registrar en Future.md? → [sí/no]
 - [ ] Regla 12: ¿Cambia algún payload, endpoint o evento de API? → [sí/no — actualizar APIBackend.md]
 ```
+
+**Las reglas 9 y 2 (post) son obligatorias en todo cambio que modifique comportamiento, constantes, flujos o archivos** — no dependen de juicio del agente. Si el cambio fue pequeño y ninguna descripción en CLAUDE.md ni README.md quedó desactualizada, indicarlo explícitamente ("sin cambios necesarios en documentación porque X").
 
 No es necesario incluir reglas que claramente no aplican. El objetivo es que el usuario pueda ver el plan de trabajo antes de que se ejecute.
 
@@ -286,7 +290,7 @@ Antes de:
 
 **→ Detenerse y confirmar con el usuario antes de proceder.**
 
-### 2. Siempre revisar README.md antes de hacer cambios
+### 2. Revisar README.md antes de cambios Y actualizarlo al terminar
 
 `README.md` es la fuente de verdad del proyecto:
 - Define los paquetes y sus capacidades
@@ -294,7 +298,9 @@ Antes de:
 - Describe el flujo de instalación y actualización
 - Explica el esquema de config y variables de entorno
 
-Si un cambio afecta algo documentado en `README.md`, actualizar el README también.
+**Antes de implementar:** leer las secciones relevantes para no contradecir lo ya documentado.
+
+**Al terminar cualquier implementación:** revisar si el cambio afecta algo en README.md y, si es así, actualizarlo en ese mismo momento — no al final de la conversación ni cuando el usuario lo pida. Esto incluye: comportamiento de componentes, flujos de datos, eventos emitidos, constantes o umbrales configurables, y diagramas de arquitectura.
 
 ### 3. Siempre revisar setup.sh cuando se agrega algo al proyecto
 
@@ -367,16 +373,18 @@ Antes de implementar cualquier cambio, revisar:
 - **Docker image size**: Agregar dependencias pesadas al `Dockerfile.jetson` aumenta tiempo de rebuild en campo
 - **Conflictos de config**: Revisar `config_loader.py` para asegurarse que los nuevos parámetros no choquen con los existentes
 
-### 9. Mantener este archivo actualizado después de cada cambio significativo
+### 9. Mantener este archivo actualizado — obligatorio al terminar cualquier implementación
 
-Cada vez que se realice un cambio que altere la arquitectura, se agregue un nuevo archivo, se modifique el stack tecnológico, o cambie el comportamiento de algún componente importante:
-- Revisar si la sección de **Descripción Detallada de Archivos** refleja el estado actual
-- Revisar si la sección de **Stack Tecnológico** necesita actualizarse (nueva librería, nuevo modelo)
-- Revisar si la sección de **Arquitectura del Pipeline** sigue siendo precisa
-- Actualizar la tabla de paquetes/capacidades si se agrega o modifica alguna capacidad
-- Si se agrega un archivo nuevo relevante, documentarlo aquí
+**Esta actualización es parte de la tarea, no un paso opcional.** Toda implementación que modifique el comportamiento de un componente, cambie una constante o umbral, agregue o elimine un archivo, o altere el flujo del pipeline debe terminar con la actualización de este archivo. No esperar a que el usuario lo pida.
 
-Este archivo es la guía de trabajo de Claude en este proyecto. Si no se mantiene actualizado, las instrucciones pierden valor.
+Revisar siempre al finalizar:
+- ¿La sección de **Descripción Detallada de Archivos** refleja el estado actual? — Constantes, umbrales, firmas de métodos, comportamiento documentado
+- ¿La sección de **Stack Tecnológico** necesita actualizarse? — Nueva librería, nuevo modelo, versión cambiada
+- ¿La sección de **Arquitectura del Pipeline** sigue siendo precisa? — Flujo de datos, elementos GStreamer, probes
+- ¿La sección de **Capacidades del Sistema** refleja el comportamiento actual? — Umbrales, eventos emitidos, lógica de decisión
+- ¿La tabla de paquetes/capacidades cambió?
+
+Este archivo es la guía de trabajo de Claude en este proyecto. Si no se mantiene actualizado, el próximo agente trabajará con información incorrecta y repetirá errores ya resueltos.
 
 ### 10. Consultar y mantener `ErrorHistory.md`
 
@@ -567,7 +575,7 @@ Worker thread para detección de caídas. Ejecuta MoveNet Lightning ONNX (entrad
 Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x0.25 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Encola el primer crop inmediatamente y luego cada 15 frames hasta tener resultado. El resultado es consumido por `_handle_appearance_reid()` en `probes.py`.
 
 **`reid_manager.py`** (~170 líneas)
-Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con embedding, timestamps y cámara actual. `match_or_create(embedding, camera_id)` hace un dot product vectorizado contra todos los embeddings almacenados y retorna `(global_id, event_type, prev_camera_id)`. Persiste la DB en `deploy/reid_db.json` cada 30 s y al apagar el pipeline (`flush()`). Carga al inicio descartando entradas con TTL vencido. Constantes configurables: `SIMILARITY_THRESHOLD=0.65`, `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
+Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con embedding, timestamps y cámara actual. `match_or_create(embedding, camera_id)` hace un dot product vectorizado contra todos los embeddings almacenados y retorna `(global_id, event_type, prev_camera_id)`. Actualiza el embedding con EMA (alpha=0.7) para mantener referencia estable. Persiste la DB en `deploy/reid_db.json` cada 30 s y al apagar el pipeline (`flush()`). Carga al inicio descartando entradas con TTL vencido. Constantes configurables: `SIMILARITY_THRESHOLD=0.60` (guía: 0.65 muy estricto, 0.45 causa falsos positivos), `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
 
 **`ws_client.py`** (~136 líneas)
 WebSocket persistente hacia el backend. Envía snapshots de posiciones normalizadas (x, y, track_id) cada 10 segundos por cámara. Reconexión automática con backoff exponencial (1s → 30s). Silencioso si no hay conexión.

@@ -462,10 +462,16 @@ The pipeline generates a 512-dimensional **appearance embedding** (OSNet-x0.25 O
 
 **How it works:**
 
-1. Person detected → `person_entry` event (immediate)
-2. AppearanceWorker processes the crop (~1-2s) → `person_appearance` event with 512-dim vector
-3. Both share the same `(jetson_id, camera_id, track_id)` triplet — the backend joins them
-4. When the same person appears on a different camera within 120s, the backend matches vectors (cosine similarity > 0.65) and assigns a `global_person_id` to link both sightings
+1. Person detected → `person_entry` emission deferred until embedding is ready (up to ~1 s / 30 frames)
+2. AppearanceWorker processes the crop in a background thread → 512-dim L2-normalized vector
+3. `ReIdManager` matches the vector against the local DB (cosine similarity ≥ 0.60) and returns a `global_id`
+4. `person_entry` event is sent with `global_id` and `entry_type: "new"` | `"return"`, or `person_channel_change` if same person moved cameras within 5 min
+5. If embedding never arrives before deadline, `person_entry` is sent with `global_id: null`
+
+**Event types emitted:**
+- `person_entry` (`entry_type: "new"`) — never seen before
+- `person_entry` (`entry_type: "return"`) — same `global_id`, last seen > 5 min ago
+- `person_channel_change` — same `global_id`, switched cameras within the presence window
 
 **What this enables:**
 - Count unique visitors (not camera views)
@@ -473,7 +479,7 @@ The pipeline generates a 512-dimensional **appearance embedding** (OSNet-x0.25 O
 - Calculate true store dwell time (entry cam → exit cam)
 - Identify employees in cameras where their face is not visible
 
-The cross-camera matching itself runs in the **backend** — the Jetson only generates and sends the vector. This allows matching across multiple Jetsons on the same client site.
+The cross-camera matching runs **locally on the Jetson** via `ReIdManager` (no cloud round-trip). Identity DB persists across restarts at `deploy/reid_db.json` with a 1-hour TTL. Note: internal AppearanceWorker key is `(pad_index, track_id)` because DeepStream assigns track IDs locally per stream — two cameras can have the same track ID simultaneously.
 
 OSNet model is auto-downloaded by `setup.sh`. To download manually:
 ```bash
@@ -522,7 +528,7 @@ DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
   (QA mode: probe also draws overlays + feeds MjpegServer on :8080 + publishes Redis metadata)
 
 Async paths (background threads, never block pipeline):
-  people_counting → AppearanceWorker → OSNet ONNX → 512-dim vector → POST /api/events (person_appearance)
+  people_counting → AppearanceWorker → OSNet ONNX → 512-dim vector → ReIdManager (local match) → POST /api/events (person_entry with global_id | person_channel_change)
   fall_detection  → PoseWorker       → MoveNet ONNX → 17 keypoints → POST /api/events (fall_detected)
   face_recognition→ FaceRecognizer   → InsightFace ArcFace → POST /api/events (employee_seen / known_person_seen)
   all cameras     → NxApiClient      → REST POST /api/events, /api/analytics, /api/crops

@@ -164,6 +164,36 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## Auto-redescubrimiento de IP del DVR cuando cambia por DHCP
+
+**Descripción:** El DVR usa DHCP y cambia de IP cada vez que se reinicia o el router renueva el lease. Actualmente el técnico debe correr `nmap -p 554 192.168.10.0/24 --open` manualmente, actualizar `/etc/nx_dvr_ip` y reiniciar deepstream. Esto ocurrió el 2026-05-13 y el 2026-05-19. La solución automática haría que el pipeline detecte el fallo de todas las fuentes RTSP y reintente con la IP actualizada sin intervención humana.
+
+**Por qué sería mejor:** El pipeline hoy simplemente continúa sin fuentes activas — no hay video, no hay detecciones, y el problema pasa desapercibido hasta que alguien lo nota. Un mecanismo automático garantizaría uptime sin necesidad de monitoreo manual.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/app.py`
+- Sección / función: `_on_bus_message()` — handler de errores RTSP del bus GStreamer
+- Descripción: actualmente logguea WARNING y continúa sin hacer nada más cuando todas las fuentes RTSP fallan
+
+**Soluciones posibles (de menor a mayor complejidad):**
+
+1. **DHCP reservation en el router (solución de infraestructura — recomendada):** Asignar IP fija al DVR por MAC address en la configuración del router. Costo: 5 minutos de configuración una sola vez. No requiere cambios de código. Ver ErrorHistory.md 2026-05-13.
+
+2. **Re-scan automático en `_on_bus_message` cuando fallan todas las fuentes:**
+   - Llevar un contador de fuentes RTSP fallidas. Si el conteo llega a N (total de cámaras configuradas), lanzar un thread que corra `nmap -p 554 <subnet> --open` (subprocess), compare la IP encontrada con `/etc/nx_dvr_ip`, y si difiere: actualice el archivo y haga `pipeline.set_state(Gst.State.NULL)` + reconstruya las fuentes con la nueva IP.
+   - Limitación: `nmap` tarda ~3-5 segundos. Durante ese tiempo el pipeline está sin fuentes.
+
+3. **Watchdog en `setup.sh` / systemd:** Un script separado que corre cada 5 min y verifica `ping $DVR_IP`. Si no responde, corre el nmap, actualiza `/etc/nx_dvr_ip` y hace `docker restart deepstream`. Independiente del código Python.
+
+**Tech stack propuesto:**
+- `subprocess` + `nmap` (ya instalado en el Jetson por `setup.sh`)
+- Alternativa más rápida: `python-nmap` (Apache 2.0) — wraps nmap con API Python
+- La opción 3 (watchdog shell) no requiere dependencias nuevas
+
+**Consideraciones:** La solución de infraestructura (opción 1) es la correcta a largo plazo y debe hacerse en cada instalación. Las opciones 2 y 3 son fallbacks para instalaciones donde no se tiene acceso al router. El nmap requiere que el Jetson esté en la misma subred que el DVR (siempre cumplido). Esfuerzo: opción 1 = 0 código; opción 2 = ~4 horas; opción 3 = ~2 horas.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]
