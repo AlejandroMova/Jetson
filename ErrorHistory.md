@@ -194,6 +194,33 @@ missing ScriptRunContext! This warning can be ignored when running in bare mode.
 
 ---
 
+## 2026-05-20 — QA bbox flickering: bounding boxes desaparecen en frames sin inferencia
+
+**Contexto:** `deploy/pipelines/probes.py` — `_qa_overlay_probe` (Probe B, post-tiler, modo QA).
+
+**Síntoma:** Los bounding boxes en el stream MJPEG parpadeaban visiblemente incluso para personas detectadas con alta confianza. El track_id no cambiaba entre apariciones (el tracker seguía activo), por lo que era un problema puramente de visualización.
+
+**Causa raíz:** PeopleNet PGIE tiene `interval=4` — solo ejecuta inferencia 1 de cada 5 frames. En los frames intermedios, `nvtracker` mantiene los tracks internamente y Probe A (pre-tiler) los ve correctamente en `NvDsObjectMeta`. Sin embargo, Probe B (post-tiler) recibe el frame tileado con `obj_meta_list` vacío en esos frames: nvinfer no propaga object metadata en frames de intervalo al elemento downstream del tiler. El resultado es que Probe B no dibujaba ningún bbox y empujaba un frame limpio al MJPEG → parpadeo 4 de cada 5 frames.
+
+**Solución:** Agregar `_probe_b_sticky_bboxes: Dict[int, dict] = {}` global (junto a `_track_labels`). En `_qa_overlay_probe`, cada vez que se ve un objeto en `obj_meta_list` se guarda su bbox tileado. Al terminar el loop de objetos, se itera `_track_labels` (escrito por Probe A) y para cualquier track activo que no apareció en el `obj_meta_list` del frame actual se usa su último bbox conocido para dibujar el overlay. Los tracks eliminados de `_track_labels` se limpian también de `_probe_b_sticky_bboxes`.
+
+---
+
+## 2026-05-20 — ReID no reconoce misma persona al reentrar o cambiar cámara
+
+**Contexto:** `deploy/pipelines/probes.py` → `_handle_appearance_reid()` + `deploy/pipelines/reid_manager.py`.
+
+**Síntoma:** El ReID funcionaba correctamente dentro de la misma sesión de tracking (mismo `track_id` activo), pero al salir una persona del frame y volver a entrar (nuevo `track_id`) o aparecer en otra cámara, siempre producía `EVENT_NEW_PERSON` en lugar de reconocer el `global_id` existente.
+
+**Causa raíz:** `_handle_appearance_reid()` tenía un guard `if not state.appearance_sent:` que envolvía todo el bloque de procesamiento. Una vez que el primer embedding era generado y consumido, `appearance_sent = True` permanecía para siempre — nunca más se encolaban crops ni se consumían resultados del `AppearanceWorker`. El embedding almacenado en `ReIdManager` era del primer crop (posiblemente parcial, desde el borde del frame) y nunca se actualizaba. Cuando la persona reaparecía con un nuevo `track_id`, su nuevo embedding se comparaba contra ese embedding inicial estale; si la similitud era < 0.60 (o 0.55), se creaba un nuevo `global_id`.
+
+**Solución:**
+- `probes.py` → `_handle_appearance_reid()`: eliminar el guard exterior. Llamar `get_result()` y `clear_result()` incondicionalmente. Después del primer match (`appearance_sent=False`), seguir encolando crops: primero frame, luego cada 15 frames hasta tener resultado, luego cada 90 frames para refresh periódico. Cuando ya hay `global_id`, el nuevo vector se pasa a `_reid_manager.update_embedding()` (EMA) en lugar de `match_or_create()`.
+- `reid_manager.py`: agregar método `update_embedding(global_id, embedding)` que aplica EMA (alpha=0.7) al embedding existente sin pasar por el matching.
+- `reid_manager.py`: bajar `SIMILARITY_THRESHOLD` de 0.60 a 0.55 para mejorar recall cross-cámara.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Fecha] — Título breve del error

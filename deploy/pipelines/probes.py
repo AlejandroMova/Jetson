@@ -72,6 +72,11 @@ _CAMERA_TYPE_REFRESH_EVERY: int  = 30
 # Solo se popula cuando _IS_QA_ENABLED=True. GIL garantiza acceso seguro (hilo único GStreamer).
 _track_labels: Dict[int, dict] = {}
 
+# QA: último bbox conocido por track_id en espacio tileado.
+# Reutilizado en frames donde nvtracker no popula obj_meta_list (frames de intervalo
+# del PGIE con interval=N), evitando que el bbox desaparezca del overlay QA.
+_probe_b_sticky_bboxes: Dict[int, dict] = {}
+
 
 def init_channel_map(channels: list):
     """Llamar desde app.py después de load_config(), antes de arrancar el pipeline."""
@@ -156,7 +161,7 @@ PGIE_CLASS_BAG:    int = 1
 PGIE_CLASS_FACE:   int = 2
 
 # ── Confidence thresholds ─────────────────────────────────────────────────────
-OSD_CONFIDENCE_THRESHOLD: float      = 0.40
+OSD_CONFIDENCE_THRESHOLD: float      = 0.30
 MIN_CLASSIFICATION_PROB: float       = 0.3
 FACE_DET_CONFIDENCE_THRESHOLD: float = 0.40
 
@@ -1387,9 +1392,12 @@ def _handle_appearance_reid(
     state = _active_tracks[track_key]
 
     # ── Try to consume a ready embedding ─────────────────────────────────────
-    if not state.appearance_sent:
-        vec = _appearance_worker.get_result(p_track_id, pad_index)
-        if vec is not None:
+    vec = _appearance_worker.get_result(p_track_id, pad_index)
+    if vec is not None:
+        _appearance_worker.clear_result(p_track_id, pad_index)  # consumido
+
+        if not state.appearance_sent:
+            # Primera embedding: determinar identidad global via match_or_create
             state.appearance_sent = True
 
             if _reid_manager is not None:
@@ -1426,18 +1434,31 @@ def _handle_appearance_reid(
                 # Legacy path: send vector to backend for server-side re-ID
                 api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
 
-        # ── Enqueue crop: immediately on first frame, then every 15 frames ──
-        if (frame_np is not None
-                and not state.appearance_sent
-                and bbox["width"]  >= CROP_MIN_WIDTH
-                and bbox["height"] >= CROP_MIN_HEIGHT):
-            if frame_num == state.first_frame or frame_num % 15 == 0:
-                crop = frame_np[
-                    bbox["top"]:bbox["top"]    + bbox["height"],
-                    bbox["left"]:bbox["left"]  + bbox["width"],
-                ]
-                if crop.size > 0:
-                    _appearance_worker.enqueue(crop, p_track_id, pad_index, frame_num)
+        elif state.global_id is not None and _reid_manager is not None:
+            # Embeddings posteriores: actualizar el DB con EMA para mantener el
+            # vector fresco. Mejora el re-ID cuando la persona regresa o cambia de
+            # cámara, ya que la referencia evoluciona con su apariencia real.
+            _reid_manager.update_embedding(state.global_id, vec)
+
+    # ── Enqueue crops ─────────────────────────────────────────────────────────
+    # · Primer frame: inmediatamente (inicio del track)
+    # · Antes del primer match: cada 15 frames hasta recibir la embedding
+    # · Después del primer match: cada 90 frames (~3 s a 30 fps) para refrescar el DB
+    if (frame_np is not None
+            and bbox["width"]  >= CROP_MIN_WIDTH
+            and bbox["height"] >= CROP_MIN_HEIGHT):
+        needs_crop = (
+            frame_num == state.first_frame
+            or (not state.appearance_sent and frame_num % 15 == 0)
+            or (state.appearance_sent and state.global_id is not None and frame_num % 90 == 0)
+        )
+        if needs_crop:
+            crop = frame_np[
+                bbox["top"]:bbox["top"]    + bbox["height"],
+                bbox["left"]:bbox["left"]  + bbox["width"],
+            ]
+            if crop.size > 0:
+                _appearance_worker.enqueue(crop, p_track_id, pad_index, frame_num)
 
     # ── Deadline fallback: emit entry if embedding never arrived ─────────────
     if (_reid_manager is not None
@@ -1763,9 +1784,16 @@ def osd_sink_pad_buffer_probe(_pad, info):
 def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
     """Probe B (QA mode): lee frame tileado RGBA, dibuja overlays, sirve MJPEG.
     Los analytics ya fueron ejecutados por pre_tiler_analytics_probe (Probe A).
-    Los labels vienen de _track_labels escrito por Probe A."""
+    Los labels vienen de _track_labels escrito por Probe A.
+
+    Sticky bbox: con nvinfer interval=N, en los N frames intermedios (sin inferencia)
+    el nvtracker puede no popular obj_meta_list del frame tileado. Para evitar que el
+    bbox parpadee, se guarda el último bbox conocido en _probe_b_sticky_bboxes y se
+    reutiliza cuando el track sigue activo en Probe A pero no aparece en obj_meta_list.
+    """
     qa_frame_bgr: Optional[np.ndarray] = None
     qa_all_tracks: List[dict] = []
+    seen_in_overlay: Set[int] = set()   # track_ids vistos en obj_meta_list este frame
 
     for frame_meta in _iter_pyds_list(
         batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
@@ -1794,6 +1822,7 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
                 continue
 
             p_track_id = int(obj_meta.object_id)
+            seen_in_overlay.add(p_track_id)
             r = obj_meta.rect_params
 
             # Camera attribution: el tiler produce un frame compuesto único cuyo
@@ -1805,6 +1834,16 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
             tiled_row = min(cy // _qa_cell_h, _qa_tiler_rows - 1) if _qa_cell_h else 0
             obj_pad_idx = tiled_row * _qa_tiler_cols + tiled_col
             obj_camera_id = _camera_id_for(obj_pad_idx)
+
+            bbox_tiled = (
+                max(0, int(r.left)), max(0, int(r.top)),
+                max(1, int(r.width)), max(1, int(r.height)),
+            )
+            _probe_b_sticky_bboxes[p_track_id] = {
+                "bbox_tiled": bbox_tiled,
+                "pad_idx":    obj_pad_idx,
+                "camera_id":  obj_camera_id,
+            }
 
             # Age/gender directo del SGIE classifier_meta (sin pixel data)
             age_gender_text = ""
@@ -1840,13 +1879,53 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
                 "channel_id": obj_camera_id,
                 "track_id":   p_track_id,
                 "confidence": round(float(obj_meta.confidence), 3),
-                "bbox_tiled": (
-                    max(0, int(r.left)), max(0, int(r.top)),
-                    max(1, int(r.width)), max(1, int(r.height)),
-                ),
+                "bbox_tiled": bbox_tiled,
                 "label": " | ".join(label_parts),
                 "fall":  labels.get("fall", False),
             })
+
+    # ── Sticky bbox fallback ───────────────────────────────────────────────────
+    # Tracks que Probe A considera activos (_track_labels) pero que no aparecieron
+    # en el obj_meta_list de este frame tileado (frames de intervalo sin inferencia).
+    # Se dibujan con el último bbox conocido para eliminar el parpadeo visual.
+    for p_track_id, labels in _track_labels.items():
+        if p_track_id in seen_in_overlay:
+            continue
+        sticky = _probe_b_sticky_bboxes.get(p_track_id)
+        if sticky is None:
+            continue
+        obj_pad_idx   = sticky["pad_idx"]
+        obj_camera_id = sticky["camera_id"]
+        _obj_is_external = obj_pad_idx in _external_pads
+        if _obj_is_external and not _count_external:
+            continue
+        if not _obj_is_external and not _count_internal:
+            continue
+        gid = labels.get("global_id")
+        base_label = f"P#{p_track_id}" + (f"·{gid[:6]}" if gid else "")
+        label_parts = [base_label]
+        ag = labels.get("age_gender", "")
+        if ag:
+            parts = ag.split(" | ", 1)
+            if len(parts) > 1:
+                label_parts.append(parts[1])
+        if labels.get("face_name"):
+            label_parts.append(labels["face_name"])
+        qa_all_tracks.append({
+            "pad_index":  obj_pad_idx,
+            "channel_id": obj_camera_id,
+            "track_id":   p_track_id,
+            "confidence": 0.0,
+            "bbox_tiled": sticky["bbox_tiled"],
+            "label": " | ".join(label_parts),
+            "fall":  labels.get("fall", False),
+        })
+
+    # Limpiar sticky bboxes de tracks ya expirados
+    active_ids = set(_track_labels)
+    for tid in list(_probe_b_sticky_bboxes):
+        if tid not in active_ids:
+            del _probe_b_sticky_bboxes[tid]
 
     if qa_frame_bgr is not None:
         try:

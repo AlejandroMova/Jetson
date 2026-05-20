@@ -572,10 +572,14 @@ Worker thread para reconocimiento facial. Carga `known_faces.json` (nombre → l
 Worker thread para detección de caídas. Ejecuta MoveNet Lightning ONNX (entrada 192×192). Aplica 3 reglas: ángulo del torso > 45°, bbox más ancho que alto, caderas cerca de los tobillos. Caída si ≥ 2/3 reglas. Cooldown de 4 segundos por `track_id`.
 
 **`appearance_worker.py`** (~139 líneas)
-Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x0.25 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Encola el primer crop inmediatamente y luego cada 15 frames hasta tener resultado. El resultado es consumido por `_handle_appearance_reid()` en `probes.py`.
+Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x0.25 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Crop enviado al worker en 3 momentos: (1) primer frame del track, (2) cada 15 frames hasta recibir la primera embedding, (3) cada 90 frames después del primer match para mantener el DB fresco. El resultado es consumido y limpiado (`clear_result`) por `_handle_appearance_reid()` en `probes.py`.
 
-**`reid_manager.py`** (~170 líneas)
-Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con embedding, timestamps y cámara actual. `match_or_create(embedding, camera_id)` hace un dot product vectorizado contra todos los embeddings almacenados y retorna `(global_id, event_type, prev_camera_id)`. Actualiza el embedding con EMA (alpha=0.7) para mantener referencia estable. Persiste la DB en `deploy/reid_db.json` cada 30 s y al apagar el pipeline (`flush()`). Carga al inicio descartando entradas con TTL vencido. Constantes configurables: `SIMILARITY_THRESHOLD=0.60` (guía: 0.65 muy estricto, 0.45 causa falsos positivos), `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
+**`reid_manager.py`** (~185 líneas)
+Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con embedding, timestamps y cámara actual. API pública:
+- `match_or_create(embedding, camera_id)` — dot product vectorizado, retorna `(global_id, event_type, prev_camera_id)`.
+- `update_embedding(global_id, embedding)` — EMA-update de un `global_id` conocido sin matching; usado para refrescar el vector durante un track activo.
+- `flush()` — persiste a disco al apagar el pipeline.
+Actualiza el embedding con EMA (alpha=0.7) para mantener referencia estable. Persiste la DB en `deploy/reid_db.json` cada 30 s. Carga al inicio descartando entradas con TTL vencido. Constantes configurables: `SIMILARITY_THRESHOLD=0.55` (guía: 0.65 muy estricto, 0.45 causa falsos positivos), `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
 
 **`ws_client.py`** (~136 líneas)
 WebSocket persistente hacia el backend. Envía snapshots de posiciones normalizadas (x, y, track_id) cada 10 segundos por cámara. Reconexión automática con backoff exponencial (1s → 30s). Silencioso si no hay conexión.
