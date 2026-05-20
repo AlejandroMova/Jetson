@@ -6,6 +6,32 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## ~~Galería de embeddings por global_id en ReIdManager (reemplazar EMA único)~~ ✅ IMPLEMENTADO (2026-05-20)
+
+**Descripción:** En lugar de mantener un solo vector EMA por `global_id`, almacenar una galería de hasta K embeddings (propuesta: K=5) que representen distintos ángulos y poses de la persona. Al matchear, la similitud se calcula como `max(query @ emb_i for emb_i in gallery)` — si algún ángulo coincide, el match ocurre aunque el ángulo actual difiera del resto.
+
+**Por qué sería mejor:** El EMA mezcla embeddings de diferentes poses en un único vector que puede no representar bien ninguna de ellas — un embedding de espaldas promediado con uno de frente queda en un punto del espacio que no corresponde a ninguna pose real. La galería captura la variedad de apariencias real de la persona, igual que hace `FaceRecognizer` con las fotos de enrolamiento. Esto mejora directamente el recall cross-cámara (la persona puede llegar por otro ángulo y aún matchear).
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/reid_manager.py`
+- Sección / función: clase `_Entry` (campo `embedding: np.ndarray`) + `match_or_create()` líneas ~93-132 + `update_embedding()` líneas ~134-150
+- Descripción: `_Entry.embedding` pasa de un array `(512,)` a una lista de arrays `List[np.ndarray]`; `_find_best_match` pasa de un único dot product a `max` sobre la galería; `update_embedding` añade el nuevo vector a la galería solo si es suficientemente distinto a los existentes
+
+**Lógica de adición a la galería:**
+- Si la galería tiene < K embeddings: añadir siempre
+- Si la galería está llena: añadir solo si `max(new @ emb_i) < 0.85` para todos los embeddings existentes (el nuevo vector es suficientemente distinto = ángulo nuevo)
+- Si el nuevo vector es muy similar a uno existente (`sim > 0.85`): ignorar (duplicado del mismo ángulo)
+- Esto garantiza que la galería cubre distintas poses sin almacenar duplicados
+
+**Tech stack propuesto:**
+- Solo numpy — sin dependencias nuevas
+- Matching: `np.stack(gallery) @ query` → `max` — sigue siendo O(N×K) pero K≤5, negligible
+- Persistencia: `_save()` guarda lista de embeddings por `global_id` en JSON (lista de listas)
+
+**Consideraciones:** Cambio de esquema en `reid_db.json` — requiere migración o reset del archivo al desplegar. El matching sigue siendo vectorizable por numpy. Esfuerzo estimado: 2-3 horas. Relacionado con [[EMA adaptativo con pesos por calidad de crop en ReIdManager]] — si se implementa la galería, el EMA adaptativo pierde relevancia.
+
+---
+
 ## EMA adaptativo con pesos por calidad de crop en ReIdManager
 
 **Descripción:** El embedding de referencia en `ReIdManager` se actualiza con EMA fija (alpha=0.7). Una mejora sería ponderar el update según la calidad del crop: crops grandes y bien iluminados deberían tener más peso que crops pequeños u ocluidos.

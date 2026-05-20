@@ -5,8 +5,15 @@ Persistent identity database that links local (pad_index, track_id) pairs to sta
 global_ids across cameras and time.  Backed by a JSON file so identities survive
 container restarts and are retained for up to REID_TTL_S (default 1 hour).
 
-Matching is a vectorised dot-product over L2-normalised 512-dim embeddings — O(N)
-and orders of magnitude cheaper than the OSNet inference that produces the vectors.
+Each global_id stores a gallery of up to GALLERY_MAX_SIZE L2-normalised 512-dim
+embeddings covering distinct poses/angles.  Matching uses max-similarity over the
+gallery — if any gallery angle matches, the identity is recognised even if the
+current angle differs from the others.  New embeddings are added to the gallery
+only when they are sufficiently different from all existing gallery members
+(cosine similarity < GALLERY_DIVERSITY_THRESHOLD), preventing duplicates.
+
+Matching is vectorised: gallery_matrix @ query → shape (N×K,), then max per entry.
+O(N×K) but K≤5, negligible vs. OSNet inference.
 
 Returned event types:
   EVENT_NEW_PERSON    — no match found; new global_id created
@@ -19,9 +26,9 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -34,10 +41,13 @@ logger = logging.getLogger(__name__)
 #   0.60 → recommended: good recall with few false positives after (pad,track_id) fix
 #   0.55 → marginal; use only if 0.60 still misses cross-camera matches
 #   0.45 → too low: causes false positives (different people matching same global_id)
-SIMILARITY_THRESHOLD: float = 0.55
-PRESENCE_WINDOW_S:    float = 300.0  # 5 min — within this, camera switch = channel_change
-REID_TTL_S:           float = 3600.0 # 1 hour — global_id expires if unseen for this long
-SAVE_INTERVAL_S:      float = 30.0   # persist to disk at most every N seconds
+SIMILARITY_THRESHOLD:      float = 0.55
+PRESENCE_WINDOW_S:         float = 300.0  # 5 min — within this, camera switch = channel_change
+REID_TTL_S:                float = 3600.0 # 1 hour — global_id expires if unseen for this long
+SAVE_INTERVAL_S:           float = 30.0   # persist to disk at most every N seconds
+GALLERY_MAX_SIZE:          int   = 5      # max embeddings per global_id
+# New embedding added to gallery only if sim < this vs. all existing members (novel angle).
+GALLERY_DIVERSITY_THRESHOLD: float = 0.85
 
 # ── Event type constants ─────────────────────────────────────────────────────────
 EVENT_NEW_PERSON     = "new_person"
@@ -48,11 +58,51 @@ EVENT_CHANNEL_CHANGE = "channel_change"
 @dataclass
 class _Entry:
     global_id:     str
-    embedding:     np.ndarray  # 512-dim, L2-normalised float32
-    first_seen_ts: float       # wall clock (time.time()) when first created
-    last_seen_ts:  float       # updated on every match
-    camera_id:     str         # last camera_id where seen
-    visit_count:   int = 1     # increments on each entry/return, NOT on channel_change
+    gallery:       List[np.ndarray]  # up to GALLERY_MAX_SIZE L2-normalised 512-dim vecs
+    first_seen_ts: float             # wall clock (time.time()) when first created
+    last_seen_ts:  float             # updated on every match
+    camera_id:     str               # last camera_id where seen
+    visit_count:   int = 1           # increments on each entry/return, NOT on channel_change
+
+
+def _gallery_add(gallery: List[np.ndarray], embedding: np.ndarray) -> bool:
+    """
+    Add embedding to gallery if it represents a novel angle.
+    Returns True if the embedding was added.
+
+    Addition rules:
+    - Gallery has fewer than GALLERY_MAX_SIZE entries → always add.
+    - Gallery is full → add only if max similarity vs. all existing < GALLERY_DIVERSITY_THRESHOLD
+      (the new vector is sufficiently different = captures a new pose).
+    - If too similar to any existing member → skip (duplicate angle).
+    """
+    if gallery:
+        gallery_mat = np.stack(gallery)          # (K, 512)
+        sims = gallery_mat @ embedding           # (K,)
+        if float(np.max(sims)) >= GALLERY_DIVERSITY_THRESHOLD:
+            return False  # too similar to an existing angle, skip
+    if len(gallery) < GALLERY_MAX_SIZE:
+        gallery.append(embedding.copy())
+        return True
+    # Gallery full and the new vector is sufficiently diverse — replace the member
+    # that is most similar to the others (least informative) to keep max diversity.
+    gallery_mat = np.stack(gallery)              # (K, 512)
+    # Each member's max similarity to the rest
+    self_sims = np.array([
+        float(np.max(np.delete(gallery_mat, i, axis=0) @ gallery[i]))
+        for i in range(len(gallery))
+    ])
+    replace_idx = int(np.argmax(self_sims))
+    gallery[replace_idx] = embedding.copy()
+    return True
+
+
+def _gallery_best_sim(gallery: List[np.ndarray], embedding: np.ndarray) -> float:
+    """Return the maximum cosine similarity between embedding and any gallery member."""
+    if not gallery:
+        return -1.0
+    gallery_mat = np.stack(gallery)  # (K, 512)
+    return float(np.max(gallery_mat @ embedding))
 
 
 class ReIdManager:
@@ -96,7 +146,7 @@ class ReIdManager:
                 gid = uuid.uuid4().hex[:12]
                 self._db[gid] = _Entry(
                     global_id=gid,
-                    embedding=embedding.copy(),
+                    gallery=[embedding.copy()],
                     first_seen_ts=now,
                     last_seen_ts=now,
                     camera_id=camera_id,
@@ -109,12 +159,7 @@ class ReIdManager:
             time_absent = now - entry.last_seen_ts
             prev_camera  = entry.camera_id
 
-            # EMA update: weight old embedding 0.7 to keep a stable reference even if
-            # the latest crop comes from a bad angle or partial occlusion.
-            _alpha = 0.7
-            blended = _alpha * entry.embedding + (1.0 - _alpha) * embedding
-            _norm = np.linalg.norm(blended)
-            entry.embedding    = blended / _norm if _norm > 1e-6 else embedding.copy()
+            added = _gallery_add(entry.gallery, embedding)
             entry.last_seen_ts = now
             entry.camera_id    = camera_id
 
@@ -125,29 +170,31 @@ class ReIdManager:
                 entry.visit_count += 1
 
             logger.debug(
-                "ReID: %s global_id=%s sim=%.3f absent=%.0fs cam=%s→%s",
+                "ReID: %s global_id=%s sim=%.3f absent=%.0fs cam=%s→%s gallery=%d%s",
                 event, best_gid, best_sim, time_absent, prev_camera, camera_id,
+                len(entry.gallery), " +angle" if added else "",
             )
             self._maybe_save()
             return best_gid, event, prev_camera
 
     def update_embedding(self, global_id: str, embedding: np.ndarray) -> None:
-        """EMA-update the embedding of a known global_id without matching.
-        Called periodically for active tracks to keep the stored vector fresh,
-        improving re-ID accuracy when the person returns or switches cameras.
+        """Add embedding to the gallery of a known global_id without matching.
+        Called periodically for active tracks to keep the gallery fresh.
+        Only adds when the embedding represents a novel angle (diversity check).
         No-op if global_id is not in the DB (expired or never created).
         """
         with self._lock:
             entry = self._db.get(global_id)
             if entry is None:
                 return
-            _alpha = 0.7
-            blended = _alpha * entry.embedding + (1.0 - _alpha) * embedding
-            _norm = np.linalg.norm(blended)
-            entry.embedding    = blended / _norm if _norm > 1e-6 else embedding.copy()
+            added = _gallery_add(entry.gallery, embedding)
             entry.last_seen_ts = time.time()
             self._maybe_save()
-            logger.debug("ReID: updated embedding global_id=%s", global_id)
+            if added:
+                logger.debug(
+                    "ReID: gallery updated global_id=%s size=%d",
+                    global_id, len(entry.gallery),
+                )
 
     def flush(self) -> None:
         """Force-save the DB to disk. Call on pipeline shutdown."""
@@ -159,12 +206,27 @@ class ReIdManager:
     def _find_best_match(self, embedding: np.ndarray) -> Tuple[Optional[str], float]:
         if not self._db:
             return None, -1.0
-        ids    = list(self._db.keys())
-        embeds = np.stack([self._db[gid].embedding for gid in ids])  # (N, 512)
-        sims   = embeds @ embedding                                    # (N,)
-        idx    = int(np.argmax(sims))
-        sim    = float(sims[idx])
-        return (ids[idx], sim) if sim >= SIMILARITY_THRESHOLD else (None, sim)
+        ids      = list(self._db.keys())
+        galleries = [self._db[gid].gallery for gid in ids]
+        sizes    = [len(g) for g in galleries]
+
+        # Single BLAS call over all gallery vectors concatenated — O(N×K) with no
+        # per-entry Python loop doing matrix math.
+        all_vecs = np.concatenate([np.stack(g) for g in galleries])  # (sum_K, 512)
+        all_sims = all_vecs @ embedding                               # (sum_K,)
+
+        # Reduce: max similarity per entry using cumulative offsets.
+        best_sim = -1.0
+        best_idx = 0
+        offset   = 0
+        for i, size in enumerate(sizes):
+            s = float(np.max(all_sims[offset:offset + size]))
+            if s > best_sim:
+                best_sim = s
+                best_idx = i
+            offset += size
+
+        return (ids[best_idx], best_sim) if best_sim >= SIMILARITY_THRESHOLD else (None, best_sim)
 
     def _expire_stale(self) -> None:
         now = time.time()
@@ -184,7 +246,7 @@ class ReIdManager:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 gid: {
-                    "embedding":     e.embedding.tolist(),
+                    "gallery":       [v.tolist() for v in e.gallery],
                     "first_seen_ts": e.first_seen_ts,
                     "last_seen_ts":  e.last_seen_ts,
                     "camera_id":     e.camera_id,
@@ -209,20 +271,38 @@ class ReIdManager:
             raw     = json.loads(self._path.read_text())
             loaded  = 0
             expired = 0
+            skipped = 0
             for gid, v in raw.items():
                 if now - v["last_seen_ts"] > REID_TTL_S:
                     expired += 1
                     continue
+
+                # Schema migration: old DB stored a single "embedding" float list.
+                # Convert to gallery format transparently so no manual reset is needed.
+                if "gallery" in v:
+                    gallery = [np.array(e, dtype=np.float32) for e in v["gallery"]]
+                elif "embedding" in v:
+                    gallery = [np.array(v["embedding"], dtype=np.float32)]
+                else:
+                    skipped += 1
+                    continue
+
+                if not gallery:
+                    skipped += 1
+                    continue
+
                 self._db[gid] = _Entry(
                     global_id     = gid,
-                    embedding     = np.array(v["embedding"], dtype=np.float32),
+                    gallery       = gallery,
                     first_seen_ts = v["first_seen_ts"],
                     last_seen_ts  = v["last_seen_ts"],
                     camera_id     = v.get("camera_id", ""),
                     visit_count   = v.get("visit_count", 1),
                 )
                 loaded += 1
-            logger.info("ReID: loaded %d entries (%d expired) from %s",
-                        loaded, expired, self._path)
+            logger.info(
+                "ReID: loaded %d entries (%d expired, %d skipped) from %s",
+                loaded, expired, skipped, self._path,
+            )
         except Exception as exc:
             logger.warning("ReID: load failed from %s: %s", self._path, exc)

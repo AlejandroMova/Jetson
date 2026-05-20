@@ -117,7 +117,7 @@ Identifica cuando la misma persona aparece en cámaras distintas usando embeddin
 La emisión de `person_entry` se **difiere** hasta que el embedding esté listo (deadline 30 frames / ~1 s a 30fps). Si el embedding no llega, se emite con `global_id: null`.
 
 - **Embedding:** OSNet-x0.25 ONNX — vectores 512-dim L2-normalizados. `AppearanceWorker` (Python thread). Clave interna: `(pad_index, track_id)` — los track IDs son locales por cámara en DeepStream, por lo que la clave debe incluir el índice del stream.
-- **Matching:** similitud coseno (dot product) ≥ 0.60. `ReIdManager` — O(N µs) para N embeddings en DB. Actualización del embedding por EMA (alpha=0.7) para estabilidad frente a crops parciales.
+- **Matching:** max-similitud coseno ≥ 0.55 sobre **galería de hasta 5 embeddings** por persona. `ReIdManager` — O(N×K) con K≤5, vectorizable con numpy. Nuevos ángulos se añaden a la galería solo si son suficientemente distintos a los existentes (sim < 0.85); cuando la galería está llena se reemplaza el miembro menos informativo.
 - **Same-camera re-detection:** si `channel_change` ocurre con `prev_camera == camera_id` (tracker pierde y re-detecta en la misma cámara), se demota a `person_return` para no emitir un evento de cambio de cámara espurio.
 - **Persistencia:** `deploy/reid_db.json` — sobrevive reinicios; TTL 1 hora sin actividad
 - **Ventana de presencia:** 5 min (configurable en `reid_manager.py` como `PRESENCE_WINDOW_S`)
@@ -574,12 +574,12 @@ Worker thread para detección de caídas. Ejecuta MoveNet Lightning ONNX (entrad
 **`appearance_worker.py`** (~139 líneas)
 Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x0.25 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Crop enviado al worker en 3 momentos: (1) primer frame del track, (2) cada 15 frames hasta recibir la primera embedding, (3) cada 90 frames después del primer match para mantener el DB fresco. El resultado es consumido y limpiado (`clear_result`) por `_handle_appearance_reid()` en `probes.py`.
 
-**`reid_manager.py`** (~185 líneas)
-Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con embedding, timestamps y cámara actual. API pública:
-- `match_or_create(embedding, camera_id)` — dot product vectorizado, retorna `(global_id, event_type, prev_camera_id)`.
-- `update_embedding(global_id, embedding)` — EMA-update de un `global_id` conocido sin matching; usado para refrescar el vector durante un track activo.
+**`reid_manager.py`** (~235 líneas)
+Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con **galería de embeddings**, timestamps y cámara actual. Cada `global_id` almacena hasta `GALLERY_MAX_SIZE=5` vectores que representan distintos ángulos/poses. El matching usa `max(query @ emb_i for emb_i in gallery)` — si cualquier ángulo coincide, la identidad se reconoce aunque el ángulo actual difiera del resto. API pública:
+- `match_or_create(embedding, camera_id)` — matching por max-similitud sobre la galería, retorna `(global_id, event_type, prev_camera_id)`.
+- `update_embedding(global_id, embedding)` — intenta añadir el embedding a la galería de un `global_id` conocido (diversity check: solo si `max_sim < GALLERY_DIVERSITY_THRESHOLD=0.85`); reemplaza el miembro menos informativo cuando la galería está llena.
 - `flush()` — persiste a disco al apagar el pipeline.
-Actualiza el embedding con EMA (alpha=0.7) para mantener referencia estable. Persiste la DB en `deploy/reid_db.json` cada 30 s. Carga al inicio descartando entradas con TTL vencido. Constantes configurables: `SIMILARITY_THRESHOLD=0.55` (guía: 0.65 muy estricto, 0.45 causa falsos positivos), `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
+Función libre `_gallery_add(gallery, embedding)` — lógica de adición/reemplazo en la galería; `_gallery_best_sim(gallery, embedding)` — max dot product contra todos los miembros. Persiste la DB en `deploy/reid_db.json` cada 30 s. **Migración automática** de esquema antiguo (`"embedding"` → `"gallery"`) en `_load()`. Carga al inicio descartando entradas con TTL vencido. Constantes configurables: `SIMILARITY_THRESHOLD=0.55` (guía: 0.65 muy estricto, 0.45 causa falsos positivos), `GALLERY_MAX_SIZE=5`, `GALLERY_DIVERSITY_THRESHOLD=0.85`, `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
 
 **`ws_client.py`** (~136 líneas)
 WebSocket persistente hacia el backend. Envía snapshots de posiciones normalizadas (x, y, track_id) cada 10 segundos por cámara. Reconexión automática con backoff exponencial (1s → 30s). Silencioso si no hay conexión.
