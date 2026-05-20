@@ -1827,6 +1827,14 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
             if labels.get("face_name"):
                 label_parts.append(labels["face_name"])
 
+            # Respetar filtros de cámara externa/interna: si la cámara no debe
+            # contar, tampoco se dibujan sus bboxes en el overlay QA.
+            _obj_is_external = obj_pad_idx in _external_pads
+            if _obj_is_external and not _count_external:
+                continue
+            if not _obj_is_external and not _count_internal:
+                continue
+
             qa_all_tracks.append({
                 "pad_index":  obj_pad_idx,
                 "channel_id": obj_camera_id,
