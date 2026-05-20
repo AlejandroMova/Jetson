@@ -194,18 +194,6 @@ missing ScriptRunContext! This warning can be ignored when running in bare mode.
 
 ---
 
-## 2026-05-20 — QA bbox flickering: bounding boxes desaparecen en frames sin inferencia
-
-**Contexto:** `deploy/pipelines/probes.py` — `_qa_overlay_probe` (Probe B, post-tiler, modo QA).
-
-**Síntoma:** Los bounding boxes en el stream MJPEG parpadeaban visiblemente incluso para personas detectadas con alta confianza. El track_id no cambiaba entre apariciones (el tracker seguía activo), por lo que era un problema puramente de visualización.
-
-**Causa raíz:** PeopleNet PGIE tiene `interval=4` — solo ejecuta inferencia 1 de cada 5 frames. En los frames intermedios, `nvtracker` mantiene los tracks internamente y Probe A (pre-tiler) los ve correctamente en `NvDsObjectMeta`. Sin embargo, Probe B (post-tiler) recibe el frame tileado con `obj_meta_list` vacío en esos frames: nvinfer no propaga object metadata en frames de intervalo al elemento downstream del tiler. El resultado es que Probe B no dibujaba ningún bbox y empujaba un frame limpio al MJPEG → parpadeo 4 de cada 5 frames.
-
-**Solución:** Agregar `_probe_b_sticky_bboxes: Dict[int, dict] = {}` global (junto a `_track_labels`). En `_qa_overlay_probe`, cada vez que se ve un objeto en `obj_meta_list` se guarda su bbox tileado. Al terminar el loop de objetos, se itera `_track_labels` (escrito por Probe A) y para cualquier track activo que no apareció en el `obj_meta_list` del frame actual se usa su último bbox conocido para dibujar el overlay. Los tracks eliminados de `_track_labels` se limpian también de `_probe_b_sticky_bboxes`.
-
----
-
 ## 2026-05-20 — ReID no reconoce misma persona al reentrar o cambiar cámara
 
 **Contexto:** `deploy/pipelines/probes.py` → `_handle_appearance_reid()` + `deploy/pipelines/reid_manager.py`.
