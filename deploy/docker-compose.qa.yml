@@ -17,6 +17,8 @@ services:
     restart: "no"
     ports:
       - "8501:8501"
+    volumes:
+      - ./clients:/nx_tech/clients
     environment:
       REDIS_HOST: redis
       MJPEG_PORT: "8080"

@@ -176,6 +176,7 @@ Herramienta de inspección remota para el equipo NX. Permite que cualquier miemb
 - Log de API calls: JSON expandible de cada POST que el Jetson envía al backend
 - Panel de resoluciones: tabla de resolución por componente (fuente DVR, PGIE, SGIEs, workers, tiler)
 - Panel de FPS: fps total y fps por cámara, actualizado cada 5 segundos desde Redis
+- **Editor de config** (sidebar): edita todas las variables de `config.yaml` en tiempo real. Cambios de pipeline/stream/tracker/canales/PGIE/SGIE requieren reinicio; los demás (entrada/salida, externas, conteo) aplican en caliente. El botón **💾 Guardar** escribe todos los valores actuales a `clients/<cliente>/config.yaml` usando `ruamel.yaml` (preserva comentarios). Las ediciones se persisten en Redis bajo `nx:qa:config_overrides` entre reinicios del dashboard.
 
 **Cómo funciona internamente:**
 1. **Probe A** (`pre_tiler_analytics_probe`, en `caps_rgba src-pad`): corre sobre frames RGBA full-res por cámara. Ejecuta todos los analytics (face recognition, fall detection, age/gender, re-ID, track lifecycle, API events). Llama `_update_fps_stats()` por frame. Escribe `_track_labels[track_id]` (face_name, fall, age_gender) para que Probe B pueda leerlos.
@@ -193,6 +194,7 @@ Herramienta de inspección remota para el equipo NX. Permite que cualquier miemb
 | Estado del pipeline | Redis key `nx:qa:status` (JSON con client, channels, capabilities, component_resolutions) |
 | FPS del pipeline | Redis key `nx:qa:pipeline_stats` (JSON: fps_per_camera, fps_total, ts — actualizado cada 5s por Probe A) |
 | Feature toggles | Redis hash `nx:qa:capabilities` (leído por el probe antes de cada handler) |
+| Config editor (QA) | Redis key `nx:qa:config_overrides` (JSON con todas las variables de config.yaml editables en el dashboard; el botón Guardar las persiste al archivo con `ruamel.yaml`) |
 | Acceso remoto | Tailscale — la IP se extrae de `st.context.headers["host"]` en Streamlit |
 | Container QA app | `python:3.11-slim` ARM64, sin GPU |
 
@@ -653,14 +655,14 @@ Credenciales del backend: `API_BASE_URL`, `API_KEY`, `WS_BASE_URL`. **Gitignorea
 
 ### `deploy/qa_app/` — Dashboard QA Visual (Streamlit)
 
-**`streamlit_app.py`** (~300 líneas)
-Dashboard Streamlit accesible vía Tailscale desde cualquier dispositivo del equipo NX. Se autorefresea cada 500 ms (`st_autorefresh`). Sidebar: info del pipeline (cliente, paquete, sector, canales), selector de cámara, toggles de features (escribe en Redis hash `nx:qa:capabilities`), sección "Entrada/Salida" con checkbox por cámara (escribe en Redis string `nx:qa:entry_exit` como JSON con lista de channel numbers — el pipeline los lee en caliente cada 30 batches sin reinicio), estado de conexión Redis. Panel principal: video MJPEG embebido con `st.iframe(viewer_url, height=560)` — el `viewer_url` apunta a `/viewer/<key>` del MjpegServer (mismo origen, sin CORS, el browser mantiene la conexión MJPEG estable entre rerenders porque React no destruye el iframe si el src no cambia). La IP del Jetson se extrae de `st.context.headers["host"]`. Detecciones y API calls se leen de deques a nivel de proceso (`@st.cache_resource`) escritos por un thread daemon subscriber de Redis — esto evita el problema de `st.session_state` siendo descartado silenciosamente cuando se escribe fuera del ScriptRunContext. El subscriber tiene auto-reconexión (`time.sleep(2)` tras excepción).
+**`streamlit_app.py`** (~520 líneas)
+Dashboard Streamlit accesible vía Tailscale desde cualquier dispositivo del equipo NX. Se autorefresea cada 500 ms (`st_autorefresh`). Sidebar: info del pipeline (cliente, paquete, sector, canales), selector de cámara, toggles de features (escribe en Redis hash `nx:qa:capabilities`), sección "Entrada/Salida" con checkbox por cámara (escribe en Redis string `nx:qa:entry_exit` como JSON con lista de channel numbers — el pipeline los lee en caliente cada 30 batches sin reinicio), **editor de configuración completo** con todas las variables de `config.yaml` (paquete, stream type, tracker, canales, PGIE/SGIE interval, PGIE batch, ReID gallery size, puerto DVR, RTSP pattern) + botón **💾 Guardar en config.yaml** que escribe el archivo con `ruamel.yaml` (preserva comentarios) y captura también los valores live de entrada/salida, externas y conteo. Las ediciones en el editor se persisten en Redis bajo `nx:qa:config_overrides` entre rerenders; session_state preserva los valores del usuario entre autorefreshes de 500ms. Estado de conexión Redis. Panel principal: video MJPEG embebido con `st.iframe(viewer_url, height=560)` — el `viewer_url` apunta a `/viewer/<key>` del MjpegServer (mismo origen, sin CORS, el browser mantiene la conexión MJPEG estable entre rerenders porque React no destruye el iframe si el src no cambia). La IP del Jetson se extrae de `st.context.headers["host"]`. Detecciones y API calls se leen de deques a nivel de proceso (`@st.cache_resource`) escritos por un thread daemon subscriber de Redis — esto evita el problema de `st.session_state` siendo descartado silenciosamente cuando se escribe fuera del ScriptRunContext. El subscriber tiene auto-reconexión (`time.sleep(2)` tras excepción).
 
 **`Dockerfile.qa`**
-Imagen `python:3.11-slim`. Instala solo `streamlit`, `redis` y `streamlit-autorefresh`. No necesita acceso a GPU. Healthcheck en `/_stcore/health`.
+Imagen `python:3.11-slim`. Instala solo `streamlit`, `redis`, `streamlit-autorefresh` y `ruamel.yaml`. No necesita acceso a GPU. Healthcheck en `/_stcore/health`.
 
 **`requirements.txt`**
-`streamlit>=1.32`, `redis>=5.0`, `streamlit-autorefresh>=1.0.0`.
+`streamlit>=1.32`, `redis>=5.0`, `streamlit-autorefresh>=1.0.0`, `ruamel.yaml>=0.18`.
 
 ---
 
@@ -670,7 +672,7 @@ Imagen `python:3.11-slim`. Instala solo `streamlit`, `redis` y `streamlit-autore
 Tres servicios: `deepstream` (pipeline principal, puerto 8080 expuesto — activo solo con QA), `db` (TimescaleDB PostgreSQL 16, puerto 5432), `redis` (Redis 7, puerto 6379). Monta los directorios de pipelines, modelos, clientes y tools.
 
 **`docker-compose.qa.yml`**
-Override file para modo QA. Solo se carga desde `qa.sh`. Agrega `NX_QA_ENABLED: "true"` al servicio `deepstream` y añade el servicio `qa_app` (Streamlit, puerto 8501). Nunca se usa en producción.
+Override file para modo QA. Solo se carga desde `qa.sh`. Agrega `NX_QA_ENABLED: "true"` al servicio `deepstream` y añade el servicio `qa_app` (Streamlit, puerto 8501). Monta `./clients:/nx_tech/clients` en el servicio `qa_app` para que el botón Guardar pueda escribir en `clients/<cliente>/config.yaml`. Nunca se usa en producción.
 
 **`qa.sh`**
 Script de activación del modo QA. Subcomandos: `start` (default) y `stop`. Al arrancar: detiene el pipeline de producción, inicia los containers con el override QA, espera a que Streamlit esté listo, imprime la URL Tailscale clickable. `Ctrl+C` o `stop` restauran la producción automáticamente vía `trap cleanup`.

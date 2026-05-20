@@ -290,6 +290,12 @@ def main():
                 "stream_width":        cfg.stream_width,
                 "stream_height":       cfg.stream_height,
                 "stream_type":         cfg.stream_type,
+                "dvr_port":            cfg.dvr_port,
+                "rtsp_url_pattern":    cfg.rtsp_url_pattern,
+                "pgie_batch_size":     cfg.pgie_batch_size,
+                "pgie_interval":       cfg.pgie_interval,
+                "sgie_interval":       cfg.sgie_interval,
+                "reid_gallery_size":   cfg.reid_gallery_size,
                 "component_resolutions": {
                     "source":           f"{cfg.stream_width}x{cfg.stream_height}",
                     "probe_a_frame":    f"{cfg.stream_width}x{cfg.stream_height}",
