@@ -1122,6 +1122,7 @@ def init_workers(
     face_db_path: str = "",
     ws_base_url: str = "",
     api_key: str = "",
+    reid_gallery_size: int = 10,
 ) -> None:
     global _pose_worker, _face_recognizer, _appearance_worker, _reid_manager, _ws_client
 
@@ -1135,7 +1136,7 @@ def init_workers(
         from reid_manager import ReIdManager
         _appearance_worker = AppearanceWorker(osnet_path)
         reid_db_path = str(Path(model_dir).parent / "reid_db.json")
-        _reid_manager = ReIdManager(db_path=reid_db_path)
+        _reid_manager = ReIdManager(db_path=reid_db_path, gallery_max_size=reid_gallery_size)
         logger.info("ReIdManager active — DB: %s", reid_db_path)
     else:
         logger.warning("OSNet model not found at %s — appearance vectors and local ReID disabled. "

@@ -183,6 +183,7 @@ def main():
         face_db_path=face_db_path,
         ws_base_url=ws_base_url,
         api_key=api_key,
+        reid_gallery_size=cfg.reid_gallery_size,
     )
     init_handlers(cfg.pipeline)
 

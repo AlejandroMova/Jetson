@@ -45,7 +45,7 @@ SIMILARITY_THRESHOLD:      float = 0.55
 PRESENCE_WINDOW_S:         float = 300.0  # 5 min — within this, camera switch = channel_change
 REID_TTL_S:                float = 3600.0 # 1 hour — global_id expires if unseen for this long
 SAVE_INTERVAL_S:           float = 30.0   # persist to disk at most every N seconds
-GALLERY_MAX_SIZE:          int   = 5      # max embeddings per global_id
+GALLERY_MAX_SIZE:          int   = 10     # max embeddings per global_id
 # New embedding added to gallery only if sim < this vs. all existing members (novel angle).
 GALLERY_DIVERSITY_THRESHOLD: float = 0.85
 
@@ -65,13 +65,13 @@ class _Entry:
     visit_count:   int = 1           # increments on each entry/return, NOT on channel_change
 
 
-def _gallery_add(gallery: List[np.ndarray], embedding: np.ndarray) -> bool:
+def _gallery_add(gallery: List[np.ndarray], embedding: np.ndarray, max_size: int = GALLERY_MAX_SIZE) -> bool:
     """
     Add embedding to gallery if it represents a novel angle.
     Returns True if the embedding was added.
 
     Addition rules:
-    - Gallery has fewer than GALLERY_MAX_SIZE entries → always add.
+    - Gallery has fewer than max_size entries → always add.
     - Gallery is full → add only if max similarity vs. all existing < GALLERY_DIVERSITY_THRESHOLD
       (the new vector is sufficiently different = captures a new pose).
     - If too similar to any existing member → skip (duplicate angle).
@@ -81,7 +81,7 @@ def _gallery_add(gallery: List[np.ndarray], embedding: np.ndarray) -> bool:
         sims = gallery_mat @ embedding           # (K,)
         if float(np.max(sims)) >= GALLERY_DIVERSITY_THRESHOLD:
             return False  # too similar to an existing angle, skip
-    if len(gallery) < GALLERY_MAX_SIZE:
+    if len(gallery) < max_size:
         gallery.append(embedding.copy())
         return True
     # Gallery full and the new vector is sufficiently diverse — replace the member
@@ -115,8 +115,9 @@ class ReIdManager:
         mgr.flush()   # call on shutdown
     """
 
-    def __init__(self, db_path: str = "/opt/nx/reid_db.json"):
+    def __init__(self, db_path: str = "/opt/nx/reid_db.json", gallery_max_size: int = GALLERY_MAX_SIZE):
         self._path = Path(db_path)
+        self._gallery_max_size = gallery_max_size
         self._db: Dict[str, _Entry] = {}
         self._lock = threading.Lock()
         self._last_save_ts: float = 0.0
@@ -159,7 +160,7 @@ class ReIdManager:
             time_absent = now - entry.last_seen_ts
             prev_camera  = entry.camera_id
 
-            added = _gallery_add(entry.gallery, embedding)
+            added = _gallery_add(entry.gallery, embedding, self._gallery_max_size)
             entry.last_seen_ts = now
             entry.camera_id    = camera_id
 
@@ -187,7 +188,7 @@ class ReIdManager:
             entry = self._db.get(global_id)
             if entry is None:
                 return
-            added = _gallery_add(entry.gallery, embedding)
+            added = _gallery_add(entry.gallery, embedding, self._gallery_max_size)
             entry.last_seen_ts = time.time()
             self._maybe_save()
             if added:
