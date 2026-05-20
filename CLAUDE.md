@@ -556,8 +556,8 @@ Servidor HTTP MJPEG daemon. Solo se instancia cuando `NX_QA_ENABLED=true` (desde
 
 Arquitectura interna de dos threads: `_encode_loop` (consume queues de frames, encoda a JPEG en background) + hilo HTTP (`run()`, sirve multipart/x-mixed-replace a 25 fps con lock mínimo). Calidad JPEG configurable (default 72). Cero impacto en producción sin QA.
 
-**`config_loader.py`** (~326 líneas)
-Carga y fusiona configuración desde 5 fuentes (prioridad: env vars > `/etc/nx_*` > `config.yaml` > `.env` > defaults). Define los 15 paquetes predefinidos (`PACKAGE_DEFINITIONS`), capacidades válidas, límites de NVDEC, y genera URLs RTSP interpolando el patrón del DVR. Retorna un `ClientConfig` dataclass.
+**`config_loader.py`** (~330 líneas)
+Carga y fusiona configuración desde 5 fuentes (prioridad: env vars > `/etc/nx_*` > `config.yaml` > `.env` > defaults). Define los 15 paquetes predefinidos (`PACKAGE_DEFINITIONS`), capacidades válidas, límites de NVDEC, y genera URLs RTSP interpolando el patrón del DVR. Retorna un `ClientConfig` dataclass. Campos configurables desde `config.yaml` (con defaults): `pgie_batch_size=0`, `pgie_interval=-1`, `sgie_interval=-1`, `reid_gallery_size=10` (máximo de embeddings por persona en `ReIdManager`; ajustar según número de cámaras del cliente).
 
 **`common/bus_call.py`**
 Handler genérico de mensajes del bus GStreamer (EOS, WARNING, ERROR). Estándar de ejemplos NVIDIA DeepStream.

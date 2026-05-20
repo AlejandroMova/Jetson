@@ -32,7 +32,7 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
-## EMA adaptativo con pesos por calidad de crop en ReIdManager
+## ~~EMA adaptativo con pesos por calidad de crop en ReIdManager~~ ❌ DESCARTADO (2026-05-20 — reemplazado por galería)
 
 **Descripción:** El embedding de referencia en `ReIdManager` se actualiza con EMA fija (alpha=0.7). Una mejora sería ponderar el update según la calidad del crop: crops grandes y bien iluminados deberían tener más peso que crops pequeños u ocluidos.
 
