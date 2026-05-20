@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import gi
@@ -307,6 +308,10 @@ def main():
                     "osnet_input":      "128x256",
                 },
             }))
+            # Nuevo arranque — borrar overrides viejos del config editor y publicar generación
+            # para que el dashboard Streamlit detecte el reinicio y resetee su session_state.
+            _redis_qa.delete("nx:qa:config_overrides")
+            _redis_qa.set("nx:qa:config_gen", str(time.time()))
             # Inicializar nx:qa:entry_exit solo si no existe (preserva cambios QA en vivo)
             if not _redis_qa.exists("nx:qa:entry_exit"):
                 import json as _json

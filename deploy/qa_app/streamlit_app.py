@@ -401,6 +401,16 @@ with st.sidebar:
     if not status:
         st.info("Inicia el pipeline para editar la config.")
     else:
+        # Detect pipeline restart: if config_gen in Redis changed, clear stale session_state
+        # so widgets re-initialize from the fresh pipeline status instead of old values.
+        _cfg_gen = (_r.get("nx:qa:config_gen") if _r else None) or ""
+        if _cfg_gen != st.session_state.get("_cfg_gen"):
+            for _k in ["cfg_package", "cfg_stream_type", "cfg_tracker", "cfg_channels",
+                       "cfg_pgie_interval", "cfg_pgie_batch", "cfg_sgie_interval",
+                       "cfg_reid_gallery", "cfg_dvr_port", "cfg_rtsp_pattern"]:
+                st.session_state.pop(_k, None)
+            st.session_state["_cfg_gen"] = _cfg_gen
+
         # Read persisted overrides from Redis (initializes widget defaults on first load)
         _cfg_ov: dict = {}
         if _r:
