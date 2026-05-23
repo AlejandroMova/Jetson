@@ -401,17 +401,39 @@ with st.sidebar:
     if not status:
         st.info("Inicia el pipeline para editar la config.")
     else:
-        # Detect pipeline restart: if config_gen in Redis changed, clear stale session_state
-        # so widgets re-initialize from the fresh pipeline status instead of old values.
+        # ── Initialize session_state from pipeline status ──────────────────────
+        # Correct Streamlit pattern: set session_state BEFORE rendering widgets,
+        # then render WITHOUT value=/index= to avoid the double-render flicker.
+        # Re-initialize when: first load, pipeline restarted (new config_gen),
+        # or user clicks Reset.
         _cfg_gen = (_r.get("nx:qa:config_gen") if _r else None) or ""
-        if _cfg_gen != st.session_state.get("_cfg_gen"):
-            for _k in ["cfg_package", "cfg_stream_type", "cfg_tracker", "cfg_channels",
-                       "cfg_pgie_interval", "cfg_pgie_batch", "cfg_sgie_interval",
-                       "cfg_reid_gallery", "cfg_dvr_port", "cfg_rtsp_pattern"]:
-                st.session_state.pop(_k, None)
-            st.session_state["_cfg_gen"] = _cfg_gen
+        _needs_init = (
+            "_cfg_gen" not in st.session_state or
+            _cfg_gen != st.session_state.get("_cfg_gen")
+        )
+        if _needs_init:
+            if _r:
+                try:
+                    _r.delete("nx:qa:config_overrides")
+                except Exception:
+                    pass
+            _ch_init = status.get("channels") or [1]
+            st.session_state.update({
+                "_cfg_gen":          _cfg_gen,
+                "cfg_package":       status.get("package") or "manual",
+                "cfg_stream_type":   status.get("stream_type") or "main",
+                "cfg_tracker":       status.get("tracker") or "nvdcf",
+                "cfg_channels":      ", ".join(str(c) for c in _ch_init),
+                "cfg_pgie_interval": int(status["pgie_interval"])  if status.get("pgie_interval")  is not None else -1,
+                "cfg_pgie_batch":    int(status["pgie_batch_size"]) if status.get("pgie_batch_size") is not None else 0,
+                "cfg_sgie_interval": int(status["sgie_interval"])  if status.get("sgie_interval")  is not None else -1,
+                "cfg_reid_gallery":  int(status["reid_gallery_size"]) if status.get("reid_gallery_size") is not None else 10,
+                "cfg_dvr_port":      int(status["dvr_port"]) if status.get("dvr_port") is not None else 554,
+                "cfg_rtsp_pattern":  status.get("rtsp_url_pattern") or
+                                     "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream",
+            })
 
-        # Read persisted overrides from Redis (initializes widget defaults on first load)
+        # Read persisted overrides from Redis (only used for the Save button / comparison)
         _cfg_ov: dict = {}
         if _r:
             try:
@@ -421,95 +443,76 @@ with st.sidebar:
             except Exception:
                 pass
 
-        def _cfgv(key, default):
-            return _cfg_ov.get(key, status.get(key, default))
-
-        # ── Pipeline ──────────────────────────────────────────────────────────
-        _pkg_cur = _cfgv("package", "manual")
-        _pkg_idx = _PACKAGES.index(_pkg_cur) if _pkg_cur in _PACKAGES else len(_PACKAGES) - 1
-        _new_pkg = st.selectbox("Paquete", _PACKAGES, index=_pkg_idx, key="cfg_package")
-
-        _st_opts = ["main", "sub"]
-        _st_cur  = _cfgv("stream_type", "main")
-        _new_st  = st.selectbox("Stream type", _st_opts,
-                                index=_st_opts.index(_st_cur) if _st_cur in _st_opts else 0,
-                                key="cfg_stream_type")
-
-        _tr_opts = ["nvdcf", "iou"]
-        _tr_cur  = _cfgv("tracker", "nvdcf")
-        _new_tr  = st.selectbox("Tracker", _tr_opts,
-                                index=_tr_opts.index(_tr_cur) if _tr_cur in _tr_opts else 0,
-                                key="cfg_tracker")
-
-        _ch_cur = _cfgv("channels", [1])
-        _ch_str = ", ".join(str(c) for c in (_ch_cur if isinstance(_ch_cur, list) else [1]))
-        _new_ch_str = st.text_input("Canales activos", value=_ch_str, key="cfg_channels",
+        # ── Widgets — NO value=/index= to avoid double-render flicker ─────────
+        _new_pkg    = st.selectbox("Paquete", _PACKAGES, key="cfg_package")
+        _new_st     = st.selectbox("Stream type", ["main", "sub"], key="cfg_stream_type")
+        _new_tr     = st.selectbox("Tracker", ["nvdcf", "iou"], key="cfg_tracker")
+        _new_ch_str = st.text_input("Canales activos", key="cfg_channels",
                                     help="Números separados por coma: 1, 2, 3")
         try:
             _new_chs = sorted({int(x.strip()) for x in _new_ch_str.split(",")
-                               if x.strip().isdigit()}) or list(_ch_cur)
+                               if x.strip().isdigit()}) or (status.get("channels") or [1])
         except Exception:
-            _new_chs = list(_ch_cur)
+            _new_chs = status.get("channels") or [1]
 
-        # ── Inferencia GPU ────────────────────────────────────────────────────
         st.markdown("**Inferencia GPU**")
-        _gc1, _gc2 = st.columns(2)
-        with _gc1:
-            _new_pgi = st.number_input("PGIE interval", min_value=-1, max_value=10,
-                                       value=int(_cfgv("pgie_interval", -1)), step=1,
-                                       key="cfg_pgie_interval",
-                                       help="-1 = desde nvinfer_config.txt")
-            _new_pgb = st.number_input("PGIE batch", min_value=0, max_value=16,
-                                       value=int(_cfgv("pgie_batch_size", 0)), step=1,
-                                       key="cfg_pgie_batch",
-                                       help="0 = desde nvinfer_config.txt")
-        with _gc2:
-            _new_sgi = st.number_input("SGIE interval", min_value=-1, max_value=10,
-                                       value=int(_cfgv("sgie_interval", -1)), step=1,
-                                       key="cfg_sgie_interval",
-                                       help="-1 = desde config_infer.txt")
-            _new_rgs = st.number_input("ReID gallery", min_value=1, max_value=20,
-                                       value=int(_cfgv("reid_gallery_size", 10)), step=1,
-                                       key="cfg_reid_gallery",
-                                       help="Embeddings máx por persona")
+        _new_pgi = st.number_input("PGIE interval", min_value=-1, max_value=10,
+                                   step=1, key="cfg_pgie_interval",
+                                   help="-1 = desde nvinfer_config.txt")
+        _new_pgb = st.number_input("PGIE batch", min_value=0, max_value=16,
+                                   step=1, key="cfg_pgie_batch",
+                                   help="0 = desde nvinfer_config.txt")
+        _new_sgi = st.number_input("SGIE interval", min_value=-1, max_value=10,
+                                   step=1, key="cfg_sgie_interval",
+                                   help="-1 = desde config_infer.txt")
+        _new_rgs = st.number_input("ReID gallery", min_value=1, max_value=20,
+                                   step=1, key="cfg_reid_gallery",
+                                   help="Embeddings máx por persona")
 
-        # ── DVR ───────────────────────────────────────────────────────────────
         st.markdown("**DVR**")
         _new_port = st.number_input("Puerto DVR", min_value=1, max_value=65535,
-                                    value=int(_cfgv("dvr_port", 554)), step=1,
-                                    key="cfg_dvr_port")
-        _pat_cur  = _cfgv("rtsp_url_pattern",
-                          "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream")
-        _new_pat  = st.text_input("RTSP URL pattern", value=_pat_cur,
-                                  key="cfg_rtsp_pattern")
+                                    step=1, key="cfg_dvr_port")
+        _new_pat  = st.text_input("RTSP URL pattern", key="cfg_rtsp_pattern")
 
-        # Persist current widget state to Redis after every render
+        # Persist to Redis only when values actually changed (avoids 500ms write loop)
         _new_ov = {
-            "package":          _new_pkg,
-            "stream_type":      _new_st,
-            "tracker":          _new_tr,
-            "channels":         _new_chs,
-            "pgie_interval":    _new_pgi,
-            "pgie_batch_size":  _new_pgb,
-            "sgie_interval":    _new_sgi,
+            "package":           _new_pkg,
+            "stream_type":       _new_st,
+            "tracker":           _new_tr,
+            "channels":          _new_chs,
+            "pgie_interval":     _new_pgi,
+            "pgie_batch_size":   _new_pgb,
+            "sgie_interval":     _new_sgi,
             "reid_gallery_size": _new_rgs,
-            "dvr_port":         _new_port,
-            "rtsp_url_pattern": _new_pat,
+            "dvr_port":          _new_port,
+            "rtsp_url_pattern":  _new_pat,
         }
-        if _r:
+        if _r and _new_ov != _cfg_ov:
             try:
                 _r.set("nx:qa:config_overrides", json.dumps(_new_ov))
             except Exception:
                 pass
 
-        # ── Save ──────────────────────────────────────────────────────────────
-        st.caption("Captura todo lo de arriba más entrada/salida, externas y conteo.")
+        # ── Actions ───────────────────────────────────────────────────────────
         st.caption("🔄 Paquete, Stream, Tracker, Canales, PGIE/SGIE y DVR requieren reinicio.")
         if st.button("💾 Guardar en config.yaml", use_container_width=True,
-                     type="primary", key="btn_save_config",
-                     disabled=(_r is None)):
+                     type="primary", key="btn_save_config", disabled=(_r is None)):
             _ok, _msg = _save_config_yaml()
             st.session_state["_save_result"] = (_ok, _msg)
+        if st.button("↺ Recargar del pipeline", use_container_width=True,
+                     key="btn_reset_config", disabled=not status,
+                     help="Descarta cambios y recarga los valores actuales del pipeline"):
+            if _r:
+                try:
+                    _r.delete("nx:qa:config_overrides")
+                except Exception:
+                    pass
+            for _k in ["_cfg_gen", "cfg_package", "cfg_stream_type", "cfg_tracker",
+                       "cfg_channels", "cfg_pgie_interval", "cfg_pgie_batch",
+                       "cfg_sgie_interval", "cfg_reid_gallery", "cfg_dvr_port",
+                       "cfg_rtsp_pattern"]:
+                st.session_state.pop(_k, None)
+            # No st.rerun() — el click del botón ya dispara un rerun automáticamente
 
         if "_save_result" in st.session_state:
             _ok_r, _msg_r = st.session_state["_save_result"]
