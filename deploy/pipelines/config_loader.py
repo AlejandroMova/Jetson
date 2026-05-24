@@ -104,6 +104,7 @@ class ClientConfig:
     pgie_interval: int = -1    # ≥0 = override nvinfer_config.txt at runtime; -1 = use file value
     sgie_interval: int = -1    # ≥0 = override all SGIE nvinfer configs at runtime; -1 = use file value
     reid_gallery_size: int = 10  # max embeddings per global_id in ReIdManager (1 per distinct angle/camera)
+    recording_enabled: bool = False  # grabar video cuando se detectan personas (QA y producción)
 
     def tracker_config_path(self) -> str:
         if self.tracker not in TRACKER_CONFIGS:
@@ -315,6 +316,7 @@ def load_config() -> ClientConfig:
         pgie_interval=int(cfg.get("pgie_interval", -1)),
         sgie_interval=int(cfg.get("sgie_interval", -1)),
         reid_gallery_size=int(cfg.get("reid_gallery_size", 10)),
+        recording_enabled=bool(cfg.get("recording_enabled", False)),
     )
     _warn_decoder_load(config)
     return config

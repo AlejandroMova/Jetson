@@ -62,13 +62,19 @@ def _find_video(path_arg):
 def main():
     parser = argparse.ArgumentParser(description="NX video testing pipeline")
     parser.add_argument("video", nargs="?", default=None)
+    parser.add_argument("--input", "-i", default=None,
+                        help="Path to video file (alias for positional arg, used by entrypoint)")
     parser.add_argument("--capabilities", "-c", default="people_counting,age_gender",
                         help="Comma-separated capabilities (default: people_counting,age_gender)")
     parser.add_argument("--client", default=None,
                         help="Client name for face DB (default: /etc/nx_client or 'demo')")
+    parser.add_argument("--no-loop", action="store_true",
+                        help="Exit when video ends instead of looping (usado en modo playback)")
     args = parser.parse_args()
 
-    video_path = _find_video(args.video)
+    # --input tiene prioridad sobre el arg posicional
+    video_path = _find_video(args.input or args.video)
+    loop_video = not args.no_loop
     pipeline_caps = [c.strip() for c in args.capabilities.split(",") if c.strip()]
     if "people_counting" not in pipeline_caps:
         pipeline_caps = ["people_counting"] + pipeline_caps
@@ -208,10 +214,14 @@ def main():
     def _on_bus_message(_bus, message):
         t = message.type
         if t == Gst.MessageType.EOS:
-            logger.info("EOS — looping video for testing.")
-            pipeline.seek_simple(
-                Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0
-            )
+            if loop_video:
+                logger.info("EOS — looping video for testing.")
+                pipeline.seek_simple(
+                    Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0
+                )
+            else:
+                logger.info("EOS — video terminado (modo playback, sin loop).")
+                loop.quit()
         elif t == Gst.MessageType.WARNING:
             err, dbg = message.parse_warning()
             logger.warning("GStreamer WARNING: %s — %s", err, dbg)

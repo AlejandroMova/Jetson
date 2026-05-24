@@ -16,6 +16,7 @@ Arrancar con: ./qa.sh  (desde deploy/)
 
 import json
 import os
+import shutil
 import threading
 import time
 from collections import deque
@@ -36,8 +37,9 @@ try:
     MJPEG_HOST = _host_hdr.split(":")[0] if _host_hdr else "localhost"
 except Exception:
     MJPEG_HOST = "localhost"
-MAX_DETECTIONS = 200
-MAX_APICALLS   = 50
+MAX_DETECTIONS  = 200
+MAX_APICALLS    = 50
+RECORDINGS_DIR  = Path("/nx_tech/recordings")
 
 st.set_page_config(
     page_title="NX QA Visual",
@@ -428,9 +430,10 @@ with st.sidebar:
                 "cfg_pgie_batch":    int(status["pgie_batch_size"]) if status.get("pgie_batch_size") is not None else 0,
                 "cfg_sgie_interval": int(status["sgie_interval"])  if status.get("sgie_interval")  is not None else -1,
                 "cfg_reid_gallery":  int(status["reid_gallery_size"]) if status.get("reid_gallery_size") is not None else 10,
-                "cfg_dvr_port":      int(status["dvr_port"]) if status.get("dvr_port") is not None else 554,
-                "cfg_rtsp_pattern":  status.get("rtsp_url_pattern") or
-                                     "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream",
+                "cfg_dvr_port":       int(status["dvr_port"]) if status.get("dvr_port") is not None else 554,
+                "cfg_rtsp_pattern":   status.get("rtsp_url_pattern") or
+                                      "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream",
+                "cfg_recording_enabled": bool(status.get("recording_enabled", False)),
             })
 
         # Read persisted overrides from Redis (only used for the Save button / comparison)
@@ -469,6 +472,10 @@ with st.sidebar:
                                    step=1, key="cfg_reid_gallery",
                                    help="Embeddings máx por persona")
 
+        st.markdown("**Grabación**")
+        _new_rec = st.checkbox("recording_enabled", key="cfg_recording_enabled",
+                               help="Grabar video cuando se detectan personas (producción + QA). Aplica en caliente al guardar.")
+
         st.markdown("**DVR**")
         _new_port = st.number_input("Puerto DVR", min_value=1, max_value=65535,
                                     step=1, key="cfg_dvr_port")
@@ -476,16 +483,17 @@ with st.sidebar:
 
         # Persist to Redis only when values actually changed (avoids 500ms write loop)
         _new_ov = {
-            "package":           _new_pkg,
-            "stream_type":       _new_st,
-            "tracker":           _new_tr,
-            "channels":          _new_chs,
-            "pgie_interval":     _new_pgi,
-            "pgie_batch_size":   _new_pgb,
-            "sgie_interval":     _new_sgi,
-            "reid_gallery_size": _new_rgs,
-            "dvr_port":          _new_port,
-            "rtsp_url_pattern":  _new_pat,
+            "package":            _new_pkg,
+            "stream_type":        _new_st,
+            "tracker":            _new_tr,
+            "channels":           _new_chs,
+            "pgie_interval":      _new_pgi,
+            "pgie_batch_size":    _new_pgb,
+            "sgie_interval":      _new_sgi,
+            "reid_gallery_size":  _new_rgs,
+            "recording_enabled":  _new_rec,
+            "dvr_port":           _new_port,
+            "rtsp_url_pattern":   _new_pat,
         }
         if _r and _new_ov != _cfg_ov:
             try:
@@ -509,8 +517,8 @@ with st.sidebar:
                     pass
             for _k in ["_cfg_gen", "cfg_package", "cfg_stream_type", "cfg_tracker",
                        "cfg_channels", "cfg_pgie_interval", "cfg_pgie_batch",
-                       "cfg_sgie_interval", "cfg_reid_gallery", "cfg_dvr_port",
-                       "cfg_rtsp_pattern"]:
+                       "cfg_sgie_interval", "cfg_reid_gallery", "cfg_recording_enabled",
+                       "cfg_dvr_port", "cfg_rtsp_pattern"]:
                 st.session_state.pop(_k, None)
             # No st.rerun() — el click del botón ya dispara un rerun automáticamente
 
@@ -520,6 +528,20 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # Estado de grabación
+    if _r:
+        try:
+            _sb_rec = (_r.get("nx:qa:recording_active") or "0") == "1"
+            _sb_pb  = bool(_r.get("nx:qa:playback_video"))
+            if _sb_pb:
+                st.warning("⏯ Modo playback")
+            elif _sb_rec:
+                st.success("⏺ Grabando")
+            else:
+                st.caption("⚫ Sin grabación activa")
+        except Exception:
+            pass
+
     if _redis_ok():
         st.success("● Redis conectado")
     else:
@@ -527,58 +549,199 @@ with st.sidebar:
         st.caption("Verifica que el pipeline esté corriendo con `./qa.sh`")
 
 
-# ── MAIN — Video + Detecciones ────────────────────────────────────────────────
-col_video, col_det = st.columns([55, 45])
+# ── MAIN — Tabs: En Vivo | Grabaciones ────────────────────────────────────────
+tab_live, tab_recordings = st.tabs(["🔴 En Vivo", "📹 Grabaciones"])
 
-with col_video:
-    st.markdown("### 📹 Video en vivo")
-    stream_label = "Todas las cámaras (tiled)" if stream_key == "all" else stream_key
-    # st.iframe preserva el iframe entre rerenders si el src no cambia
-    # → sin interrupciones del stream. El HTML lo sirve el propio MjpegServer
-    # desde /viewer/<key> con un <img src="/stream/<key>"> mismo-origen.
-    viewer_url = f"http://{MJPEG_HOST}:{MJPEG_PORT}/viewer/{stream_key}"
-    st.iframe(viewer_url, height=560)
-    st.caption(f"Stream: `{stream_label}` · 640×360 · MJPEG nativo")
+# ── Tab: En Vivo ──────────────────────────────────────────────────────────────
+with tab_live:
+    col_video, col_det = st.columns([55, 45])
 
-with col_det:
-    st.markdown("### 📊 Detecciones")
-    det_items = list(_bufs["detections"])
-    if not det_items:
-        st.info("Sin detecciones aún. El pipeline debe estar activo.")
+    with col_video:
+        st.markdown("### 📹 Video en vivo")
+        stream_label = "Todas las cámaras (tiled)" if stream_key == "all" else stream_key
+        viewer_url = f"http://{MJPEG_HOST}:{MJPEG_PORT}/viewer/{stream_key}"
+        st.iframe(viewer_url, height=560)
+        st.caption(f"Stream: `{stream_label}` · 640×360 · MJPEG nativo")
+
+    with col_det:
+        st.markdown("### 📊 Detecciones")
+        det_items = list(_bufs["detections"])
+        if not det_items:
+            st.info("Sin detecciones aún. El pipeline debe estar activo.")
+        else:
+            with st.container(height=360):
+                for d in det_items[:60]:
+                    ts     = (d.get("ts") or "")[-12:-4]
+                    cam    = d.get("cam", "")
+                    tracks = d.get("tracks", [])
+                    if not tracks:
+                        continue
+                    cam_short = cam.split("-ch")[-1] if "-ch" in cam else cam
+                    st.markdown(f"**{ts}** · `ch{cam_short}`")
+                    for t in tracks:
+                        icon  = "⚠️" if t.get("fall") else "👤"
+                        label = t.get("label", f"P#{t.get('track_id', '?')}")
+                        conf  = t.get("confidence", 0)
+                        st.markdown(
+                            f"&nbsp;&nbsp;{icon} `{label}` &nbsp;·&nbsp;`ch{cam_short}` &nbsp;conf={conf:.2f}",
+                            unsafe_allow_html=True,
+                        )
+
+    st.markdown("---")
+    st.markdown("### 📨 API Calls")
+    api_items = list(_bufs["apicalls"])
+    if not api_items:
+        st.info("Sin API calls aún.")
     else:
-        with st.container(height=360):
-            for d in det_items[:60]:
-                ts     = (d.get("ts") or "")[-12:-4]
-                cam    = d.get("cam", "")
-                tracks = d.get("tracks", [])
-                if not tracks:
-                    continue
-                cam_short = cam.split("-ch")[-1] if "-ch" in cam else cam
-                st.markdown(f"**{ts}** · `ch{cam_short}`")
-                for t in tracks:
-                    icon  = "⚠️" if t.get("fall") else "👤"
-                    label = t.get("label", f"P#{t.get('track_id', '?')}")
-                    conf  = t.get("confidence", 0)
-                    st.markdown(
-                        f"&nbsp;&nbsp;{icon} `{label}` &nbsp;·&nbsp;`ch{cam_short}` &nbsp;conf={conf:.2f}",
-                        unsafe_allow_html=True,
-                    )
+        for call in api_items[:15]:
+            ts      = (call.get("ts") or "")[-12:-4]
+            ep      = call.get("endpoint", "/api/?")
+            payload = call.get("payload", {})
+            evt     = payload.get("event_type") or ep.rsplit("/", 1)[-1]
+            cam_raw = payload.get("camera_id", "")
+            cam_lbl = f"  ·  `{cam_raw}`" if cam_raw else ""
+            with st.expander(f"`{ts}`  POST `{ep}`  **{evt}**{cam_lbl}"):
+                st.json(payload)
 
 
-# ── API CALLS ─────────────────────────────────────────────────────────────────
-st.markdown("---")
-st.markdown("### 📨 API Calls")
+# ── Tab: Grabaciones ──────────────────────────────────────────────────────────
+with tab_recordings:
+    # Estado de grabación activa
+    rec_active = False
+    rec_info: dict = {}
+    playback_video = ""
+    if _r:
+        try:
+            rec_active = (_r.get("nx:qa:recording_active") or "0") == "1"
+            if rec_active:
+                rec_info = json.loads(_r.get("nx:qa:recording_info") or "{}")
+            playback_video = _r.get("nx:qa:playback_video") or ""
+        except Exception:
+            pass
 
-api_items = list(_bufs["apicalls"])
-if not api_items:
-    st.info("Sin API calls aún.")
-else:
-    for call in api_items[:15]:
-        ts      = (call.get("ts") or "")[-12:-4]
-        ep      = call.get("endpoint", "/api/?")
-        payload = call.get("payload", {})
-        evt     = payload.get("event_type") or ep.rsplit("/", 1)[-1]
-        cam_raw = payload.get("camera_id", "")
-        cam_lbl = f"  ·  `{cam_raw}`" if cam_raw else ""
-        with st.expander(f"`{ts}`  POST `{ep}`  **{evt}**{cam_lbl}"):
-            st.json(payload)
+    col_status, col_playback = st.columns([1, 1])
+    with col_status:
+        if rec_active:
+            ts_rec = rec_info.get("clip_name", "")
+            n_ppl  = rec_info.get("people_count", 0)
+            st.success(f"⏺ Grabando: {ts_rec} · {n_ppl} personas")
+        else:
+            st.info("⚫ Grabación inactiva — se activa al detectar personas")
+
+    with col_playback:
+        if playback_video:
+            st.warning(f"⏯ Playback: `{Path(playback_video).name}`")
+            if st.button("🔴 Volver a En Vivo", type="primary", key="btn_back_live"):
+                if _r:
+                    try:
+                        _r.delete("nx:qa:playback_video")
+                        st.toast("Volviendo a modo live en el próximo ciclo del pipeline...")
+                    except Exception:
+                        pass
+
+    st.markdown("---")
+
+    # Lista de clips
+    clips: list = []
+    if RECORDINGS_DIR.exists():
+        clips = sorted(
+            [d for d in RECORDINGS_DIR.iterdir() if d.is_dir()],
+            reverse=True,
+        )
+
+    if not clips:
+        st.info("No hay grabaciones aún. Se crean automáticamente cuando se detectan personas con el pipeline QA activo.")
+    else:
+        st.markdown(f"**{len(clips)} clip(s) guardados** · máx 10 GB (auto-rotativo)")
+        st.markdown("")
+
+        for clip_dir in clips:
+            meta_path  = clip_dir / "metadata.json"
+            thumb_path = clip_dir / "thumbnail.jpg"
+            tiled_path = clip_dir / "tiled.mp4"
+
+            try:
+                meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            except Exception:
+                meta = {}
+
+            ts_label  = meta.get("timestamp", clip_dir.name)
+            duration  = meta.get("duration_s", 0)
+            max_ppl   = meta.get("max_people", 0)
+            n_frames  = meta.get("frame_count", 0)
+            cam_ids   = meta.get("channels", [])
+
+            expander_label = f"📹 {ts_label}  ·  {duration:.0f}s  ·  {max_ppl} pers. máx"
+            with st.expander(expander_label):
+                col_thumb, col_info, col_act = st.columns([3, 4, 3])
+
+                with col_thumb:
+                    if thumb_path.exists():
+                        st.image(str(thumb_path), use_container_width=True)
+                    else:
+                        st.caption("Sin thumbnail")
+
+                with col_info:
+                    st.caption(f"Duración: {duration:.1f} s")
+                    st.caption(f"Frames tileados: {n_frames}")
+                    st.caption(f"Personas máx: {max_ppl}")
+                    st.caption(f"Cámaras: {len(cam_ids)}")
+                    if tiled_path.exists():
+                        st.caption("✅ tiled.mp4 (640×360)")
+                    for cam_id in cam_ids:
+                        cam_file = clip_dir / f"{cam_id}.mp4"
+                        if cam_file.exists():
+                            st.caption(f"✅ {cam_id}.mp4 (full-res)")
+
+                with col_act:
+                    # Preview del video tileado
+                    if tiled_path.exists():
+                        if st.button("▶ Preview tiled", key=f"prev_{clip_dir.name}"):
+                            st.session_state["_preview_path"] = str(tiled_path)
+                            st.session_state["_preview_label"] = ts_label
+
+                    # Correr inferencia sobre un clip (requiere reinicio del pipeline ~30-60 s)
+                    video_options = []
+                    if tiled_path.exists():
+                        video_options.append(("tiled.mp4", str(tiled_path)))
+                    for cam_id in cam_ids:
+                        cam_file = clip_dir / f"{cam_id}.mp4"
+                        if cam_file.exists():
+                            video_options.append((f"{cam_id}.mp4", str(cam_file)))
+
+                    if video_options and _r:
+                        selected_idx = st.selectbox(
+                            "Inferencia en:",
+                            options=range(len(video_options)),
+                            format_func=lambda i: video_options[i][0],
+                            key=f"inf_sel_{clip_dir.name}",
+                        )
+                        if st.button("▶ Correr Inferencia", key=f"inf_{clip_dir.name}",
+                                     type="primary"):
+                            video_path = video_options[selected_idx][1]
+                            try:
+                                _r.set("nx:qa:playback_video", video_path)
+                                st.success("Pipeline reiniciando con el video seleccionado (~30–60 s)...")
+                            except Exception as exc:
+                                st.error(f"Error: {exc}")
+
+                    # Eliminar clip
+                    if st.button("🗑 Eliminar", key=f"del_{clip_dir.name}"):
+                        shutil.rmtree(clip_dir, ignore_errors=True)
+                        st.toast(f"Clip {ts_label} eliminado.")
+                        st.rerun()
+
+    # ── Preview inline ────────────────────────────────────────────────────────
+    if "_preview_path" in st.session_state:
+        preview_path = st.session_state["_preview_path"]
+        preview_lbl  = st.session_state.get("_preview_label", "")
+        st.markdown("---")
+        st.markdown(f"### Preview: {preview_lbl}")
+        if Path(preview_path).exists():
+            st.video(preview_path)
+        else:
+            st.warning("Archivo no encontrado.")
+        if st.button("✕ Cerrar preview", key="btn_close_preview"):
+            st.session_state.pop("_preview_path", None)
+            st.session_state.pop("_preview_label", None)
+            st.rerun()

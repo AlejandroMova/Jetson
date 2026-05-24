@@ -16,6 +16,10 @@ import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from queue import Queue, Empty
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from recording_manager import RecordingManager
 
 
 class MjpegServer(threading.Thread):
@@ -37,12 +41,14 @@ class MjpegServer(threading.Thread):
         camera_queues: dict,        # camera_id (str) → Queue
         port: int = 8080,
         quality: int = 72,
+        recorder: "RecordingManager | None" = None,
     ):
         super().__init__(daemon=True, name="MjpegServer")
         self._port = port
         self._quality = quality
         self._tiled_queue = tiled_frame_queue
         self._cam_queues = camera_queues        # {"jetson-nx-001-ch01": Queue, ...}
+        self._recorder = recorder               # RecordingManager (QA recording, optional)
         self._lock = threading.Lock()
         self._jpegs: dict = {}                  # "all" | camera_id → bytes
         self._enc_thread = threading.Thread(
@@ -74,6 +80,9 @@ class MjpegServer(threading.Thread):
                         self._jpegs["all"] = jpeg
                 except Exception:
                     pass
+                # Pasar al recorder si está grabando (no copia extra: el frame ya es copia del probe)
+                if self._recorder is not None:
+                    self._recorder.push_tiled_frame(frame)
             except Empty:
                 pass
 

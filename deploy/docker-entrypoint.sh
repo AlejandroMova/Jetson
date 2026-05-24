@@ -74,4 +74,49 @@ print('[entrypoint] InsightFace buffalo_l listo.')
     fi
 fi
 
-exec "$@"
+# ── Main loop: live (app.py) o playback (app_video_testing.py) ───────────────
+# Solo en QA mode. En producción (NX_QA_ENABLED no seteado) ejecuta el CMD directo.
+if [ "${NX_QA_ENABLED:-false}" != "true" ]; then
+    exec "$@"
+fi
+
+echo "[entrypoint] QA mode — loop live/playback activo"
+while true; do
+    # Verificar si Streamlit solicitó modo playback via Redis
+    PLAYBACK_VIDEO=$(python3 - <<'PYEOF' 2>/dev/null
+import os, sys
+try:
+    import redis
+    r = redis.Redis(host=os.environ.get("REDIS_HOST", "redis"), socket_timeout=2)
+    v = r.get("nx:qa:playback_video")
+    print(v.decode() if v else "")
+except Exception:
+    print("")
+PYEOF
+)
+
+    if [ -n "$PLAYBACK_VIDEO" ]; then
+        echo "[entrypoint] Modo playback: $PLAYBACK_VIDEO"
+        python3 /nx_tech/pipelines/app_video_testing.py --input "$PLAYBACK_VIDEO" --no-loop || true
+        # Limpiar la key para que el siguiente ciclo arranque en live
+        python3 - <<'PYEOF' 2>/dev/null
+import os
+try:
+    import redis
+    redis.Redis(host=os.environ.get("REDIS_HOST", "redis"), socket_timeout=2).delete("nx:qa:playback_video")
+except Exception:
+    pass
+PYEOF
+        echo "[entrypoint] Playback terminado — volviendo a modo live"
+    else
+        # Modo live: arrancar pipeline principal
+        "$@"
+        EXIT_CODE=$?
+        # Código 42 = solicitud de cambio a playback mode (app.py lo emite y loop continúa)
+        # Cualquier otro código de error = salir
+        if [ $EXIT_CODE -ne 0 ] && [ $EXIT_CODE -ne 42 ]; then
+            echo "[entrypoint] Pipeline terminó con error (código $EXIT_CODE) — saliendo"
+            exit $EXIT_CODE
+        fi
+    fi
+done

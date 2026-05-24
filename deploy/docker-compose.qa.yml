@@ -10,6 +10,10 @@ services:
       # Opcional: apuntar al staging para no contaminar el backend de producción
       # API_BASE_URL: https://staging.api.nxcomputing.ai
 
+  deepstream:
+    volumes:
+      - ./recordings:/nx_tech/recordings
+
   qa_app:
     build:
       context: .
@@ -19,6 +23,7 @@ services:
       - "8501:8501"
     volumes:
       - ./clients:/nx_tech/clients
+      - ./recordings:/nx_tech/recordings
     environment:
       REDIS_HOST: redis
       MJPEG_PORT: "8080"

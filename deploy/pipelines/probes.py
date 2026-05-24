@@ -72,6 +72,15 @@ _CAMERA_TYPE_REFRESH_EVERY: int  = 30
 # Solo se popula cuando _IS_QA_ENABLED=True. GIL garantiza acceso seguro (hilo único GStreamer).
 _track_labels: Dict[int, dict] = {}
 
+# RecordingManager: instanciado desde app.py cuando NX_QA_ENABLED=true.
+# Probe A le pasa frames full-res por cámara para grabación de video.
+_recording_manager = None
+
+
+def set_recording_manager(rm) -> None:
+    global _recording_manager
+    _recording_manager = rm
+
 
 
 def init_channel_map(channels: list):
@@ -1543,8 +1552,9 @@ def pre_tiler_analytics_probe(_pad, info):
         # For pose/face: always copy when detections exist.
         # For appearance/ReID: only copy when there are new tracks or tracks still awaiting
         # their first embedding — once all settled, skip the copy to avoid blocking GStreamer.
+        # For recording: always copy when the RecordingManager is actively recording.
         frame_np = None
-        _needs_pixel = False
+        _needs_pixel = _recording_manager is not None and _recording_manager.is_recording
         if frame_meta.num_obj_meta > 0:
             if _pose_worker is not None or _face_recognizer is not None:
                 _needs_pixel = True
@@ -1569,6 +1579,9 @@ def pre_tiler_analytics_probe(_pad, info):
                     fh, fw = frame_np.shape[:2]
                     logger.info("[QA Probe A] Resolución full-res cámara %s: %dx%d",
                                 camera_id, fw, fh)
+                # Pasar frame full-res al recorder (ya es copia; no se necesita copia adicional)
+                if _recording_manager is not None and _recording_manager.is_recording:
+                    _recording_manager.push_camera_frame(camera_id, frame_np)
             except Exception as e:
                 if frame_num % 30 == 0:
                     logger.warning("pre_tiler get_nvds_buf_surface frame=%d: %s", frame_num, e)
@@ -1594,6 +1607,10 @@ def pre_tiler_analytics_probe(_pad, info):
                     _face_handler.process_face(
                         face_obj_meta, frame_num, frame_np, persons_meta, camera_id
                     )
+
+        # Notificar al recorder (funciona en QA y producción; no necesita Redis)
+        if _recording_manager is not None and persons_meta:
+            _recording_manager.notify_detection(len(persons_meta))
 
         # ── Segunda pasada: handler por persona ───────────────────────────────
         visible_ids: Set[int] = set()
@@ -1944,8 +1961,9 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
         # For pose/face: always copy when detections exist.
         # For appearance/ReID: only copy when there are new tracks or tracks still awaiting
         # their first embedding — once all settled, skip the copy to avoid blocking GStreamer.
+        # For recording: always copy when RecordingManager is actively recording.
         frame_np = None
-        _needs_pixel = False
+        _needs_pixel = _recording_manager is not None and _recording_manager.is_recording
         if frame_meta.num_obj_meta > 0:
             if _pose_worker is not None or _face_recognizer is not None:
                 _needs_pixel = True
@@ -1966,6 +1984,8 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
                 n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
                 frame_np = np.array(n_frame, copy=True, order='C')
                 frame_np = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGR)
+                if _recording_manager is not None and _recording_manager.is_recording:
+                    _recording_manager.push_camera_frame(camera_id, frame_np)
             except Exception as e:
                 if frame_num % 30 == 0:
                     logger.warning("get_nvds_buf_surface fallo frame=%d: %s", frame_num, e)
@@ -1990,6 +2010,10 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
                     _face_handler.process_face(
                         face_obj_meta, frame_num, frame_np, persons_meta, camera_id
                     )
+
+        # Notificar al recorder cuando hay personas (no necesita Redis)
+        if _recording_manager is not None and persons_meta:
+            _recording_manager.notify_detection(len(persons_meta))
 
         visible_ids: Set[int] = set()
         for obj_meta in persons_meta:

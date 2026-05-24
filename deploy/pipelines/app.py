@@ -36,6 +36,7 @@ from probes import (
     init_channel_map, init_sector, init_entry_exit_pads, init_camera_types,
     init_handlers, init_workers, start_workers, stop_workers,
     init_qa_grid, init_qa_cameras, init_pipeline_stats,
+    set_recording_manager,
     tiled_frame_queue, camera_frame_queues,
     _IS_QA_ENABLED, _redis_qa,
 )
@@ -259,16 +260,32 @@ def main():
         tiler.set_property("width",   640)
         tiler.set_property("height",  360)
 
+    # ── RecordingManager — activo cuando recording_enabled=true en config.yaml ─
+    # En QA mode siempre está activo (independiente del valor en config.yaml).
+    # En producción solo si cfg.recording_enabled=true.
+    _recording_manager = None
+    if cfg.recording_enabled or _IS_QA_ENABLED:
+        from recording_manager import RecordingManager
+        _recording_manager = RecordingManager(
+            recordings_dir="/nx_tech/recordings",
+            redis_client=_redis_qa,   # None en producción sin QA; se ignora elegantemente
+        )
+        set_recording_manager(_recording_manager)
+        _recording_manager.start()
+        logger.info("[Recording] RecordingManager iniciado — /nx_tech/recordings/")
+
     # QA: informar grid al probe + arrancar MjpegServer
     if _IS_QA_ENABLED:
         cell_w = 640 // tiler_cols
         cell_h = 360 // tiler_rows
         init_qa_grid(tiler_cols, tiler_rows, cell_w, cell_h)
+
         from mjpeg_server import MjpegServer
         _mjpeg_srv = MjpegServer(
             tiled_frame_queue=tiled_frame_queue,
             camera_queues=camera_frame_queues,
             port=8080,
+            recorder=_recording_manager,
         )
         _mjpeg_srv.start()
         logger.info("[QA] MjpegServer en :8080  /stream/all + /stream/<camera_id>")
@@ -297,6 +314,7 @@ def main():
                 "pgie_interval":       cfg.pgie_interval,
                 "sgie_interval":       cfg.sgie_interval,
                 "reid_gallery_size":   cfg.reid_gallery_size,
+                "recording_enabled":   cfg.recording_enabled,
                 "component_resolutions": {
                     "source":           f"{cfg.stream_width}x{cfg.stream_height}",
                     "probe_a_frame":    f"{cfg.stream_width}x{cfg.stream_height}",
@@ -410,6 +428,21 @@ def main():
 
     bus.connect("message", _on_bus_message)
 
+    # QA: detectar solicitud de modo playback desde Streamlit cada 5 s
+    _exit_for_playback = [False]
+    if _IS_QA_ENABLED and _redis_qa:
+        def _check_playback_mode():
+            try:
+                v = _redis_qa.get("nx:qa:playback_video")
+                if v and not _exit_for_playback[0]:
+                    _exit_for_playback[0] = True
+                    logger.info("[QA] Modo playback solicitado: %s — enviando EOS", v)
+                    pipeline.send_event(Gst.Event.new_eos())
+            except Exception:
+                pass
+            return True  # mantener el timeout activo
+        GLib.timeout_add(5000, _check_playback_mode)
+
     logger.info("Starting pipeline…")
     pipeline.set_state(Gst.State.PLAYING)
     start_workers()
@@ -422,6 +455,12 @@ def main():
         pipeline.set_state(Gst.State.NULL)
         api_client.stop()
         stop_workers()
+        if _recording_manager is not None:
+            _recording_manager.stop()
+
+    # Salir con código 42 para que docker-entrypoint.sh arranque modo playback
+    if _exit_for_playback[0]:
+        sys.exit(42)
 
 
 if __name__ == "__main__":

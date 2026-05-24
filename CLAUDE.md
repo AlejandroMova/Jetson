@@ -169,7 +169,8 @@ Herramienta de inspección remota para el equipo NX. Permite que cualquier miemb
 **Activación:** Solo cuando el técnico ejecuta `./qa.sh` en el Jetson. Usa un docker-compose override (`docker-compose.qa.yml`) que setea `NX_QA_ENABLED=true` en el container deepstream y agrega el container `qa_app`. Al salir (Ctrl+C o `./qa.sh stop`), el pipeline de producción se restaura automáticamente. **Cero impacto cuando no está activo.**
 
 **Lo que muestra el dashboard:**
-- Video en vivo con bounding boxes y labels por cada feature activa (verde = persona, rojo = caída)
+- **Tab "En Vivo":** Video MJPEG con bboxes/labels, log de detecciones en tiempo real, log de API calls
+- **Tab "Grabaciones":** Biblioteca de clips grabados automáticamente; preview en el dashboard; botón para correr inferencia sobre el clip (reinicia el pipeline en modo playback)
 - Selector de cámara: vista tileada (todas) o cámara individual
 - Toggles por capacidad: apagar/prender `age_gender`, `fall_detection`, `face_recognition` sin reiniciar el pipeline
 - Log de detecciones en tiempo real: track_id, label, confianza, alert de caída
@@ -177,12 +178,16 @@ Herramienta de inspección remota para el equipo NX. Permite que cualquier miemb
 - Panel de resoluciones: tabla de resolución por componente (fuente DVR, PGIE, SGIEs, workers, tiler)
 - Panel de FPS: fps total y fps por cámara, actualizado cada 5 segundos desde Redis
 - **Editor de config** (sidebar): edita todas las variables de `config.yaml` en tiempo real. Cambios de pipeline/stream/tracker/canales/PGIE/SGIE requieren reinicio; los demás (entrada/salida, externas, conteo) aplican en caliente. El botón **💾 Guardar** escribe todos los valores actuales a `clients/<cliente>/config.yaml` usando `ruamel.yaml` (preserva comentarios). Las ediciones se persisten en Redis bajo `nx:qa:config_overrides` entre reinicios del dashboard.
+- **Indicador de estado** (sidebar): muestra si el pipeline está grabando (⏺), en modo playback (⏯), o sin grabación activa.
 
 **Cómo funciona internamente:**
-1. **Probe A** (`pre_tiler_analytics_probe`, en `caps_rgba src-pad`): corre sobre frames RGBA full-res por cámara. Ejecuta todos los analytics (face recognition, fall detection, age/gender, re-ID, track lifecycle, API events). Llama `_update_fps_stats()` por frame. Escribe `_track_labels[track_id]` (face_name, fall, age_gender) para que Probe B pueda leerlos.
+1. **Probe A** (`pre_tiler_analytics_probe`, en `caps_rgba src-pad`): corre sobre frames RGBA full-res por cámara. Ejecuta todos los analytics (face recognition, fall detection, age/gender, re-ID, track lifecycle, API events). Llama `_update_fps_stats()` por frame. Escribe `_track_labels[track_id]` (face_name, fall, age_gender) para que Probe B pueda leerlos. Si `RecordingManager.is_recording`: lee el frame full-res y lo pasa a `RecordingManager.push_camera_frame()`.
 2. **Probe B** (`osd_sink_pad_buffer_probe` → `_qa_overlay_probe`, en `tiler src-pad`): corre sobre el frame tileado 640×360. Solo dibuja bboxes de personas + labels (leídos de `_track_labels`). Encola el frame tileado en `tiled_frame_queue` y crops por cámara en `camera_frame_queues`. Publica `nx:qa:detections` a Redis.
-3. `MjpegServer` (thread daemon en el container deepstream) consume esas queues, encoda a JPEG en background, y sirve HTTP multipart/x-mixed-replace en `:8080` bajo `/stream/all` y `/stream/<camera_id>`. También sirve `/viewer/<key>` — una página HTML mínima con `<img src="/stream/<key>">` mismo origen.
-4. `qa_app` (container Streamlit en `:8501`) embebe el viewer con `st.iframe(viewer_url)` — React preserva el iframe entre rerenders cuando el src no cambia, por lo que el stream MJPEG no se interrumpe con el autorefresh de 500ms. Un thread daemon suscribe a Redis y escribe en deques `@st.cache_resource` (accesibles desde cualquier rerender sin ScriptRunContext).
+3. `MjpegServer` (thread daemon en el container deepstream) consume esas queues, encoda a JPEG en background, y sirve HTTP multipart/x-mixed-replace en `:8080` bajo `/stream/all` y `/stream/<camera_id>`. También sirve `/viewer/<key>` — una página HTML mínima con `<img src="/stream/<key>">` mismo origen. En su encode loop pasa el frame tileado a `RecordingManager.push_tiled_frame()` si está grabando.
+4. `RecordingManager` (thread daemon en el container deepstream): recibe notificaciones directamente desde los probes (`notify_detection()`, sin Redis). Cuando detecta personas, inicia una grabación MP4 con OpenCV VideoWriter. Graba `tiled.mp4` (640×360, solo QA) y `<camera_id>.mp4` (full-res por cámara, QA y producción). Cierra el clip tras 10 s sin detecciones (cooldown) o 5 min máximo. Descarta clips < 5 s. Auto-limpia cuando el total supera 10 GB. Publica estado en `nx:qa:recording_active` y `nx:qa:recording_info`. Directorio: `/nx_tech/recordings/<YYYYMMDD_HHMMSS>/` con `thumbnail.jpg`, `metadata.json`, `tiled.mp4`, `<cam_id>.mp4`. Se activa si `cfg.recording_enabled=true` (producción) o siempre en QA mode.
+5. `app.py` en QA mode: cada 5 s verifica `nx:qa:playback_video` en Redis (via GLib.timeout_add). Si está seteada, envía EOS al pipeline y sale con código 42.
+6. `docker-entrypoint.sh` (QA mode): loop que detecta si `nx:qa:playback_video` está en Redis; si es así arranca `app_video_testing.py --input <path> --no-loop`; al terminar borra la key y vuelve a `app.py`. En producción (`NX_QA_ENABLED` no seteado): exec directo sin loop.
+7. `qa_app` (container Streamlit en `:8501`) embebe el viewer con `st.iframe(viewer_url)`. Tab "Grabaciones": lista clips de `/nx_tech/recordings/` (volumen compartido), muestra thumbnail+metadata, botón preview con `st.video()`, botón "▶ Correr Inferencia" que escribe `nx:qa:playback_video` en Redis.
 
 **Tech stack:**
 | Componente | Tecnología |
@@ -195,6 +200,8 @@ Herramienta de inspección remota para el equipo NX. Permite que cualquier miemb
 | FPS del pipeline | Redis key `nx:qa:pipeline_stats` (JSON: fps_per_camera, fps_total, ts — actualizado cada 5s por Probe A) |
 | Feature toggles | Redis hash `nx:qa:capabilities` (leído por el probe antes de cada handler) |
 | Config editor (QA) | Redis key `nx:qa:config_overrides` (JSON con todas las variables de config.yaml editables en el dashboard; el botón Guardar las persiste al archivo con `ruamel.yaml`) |
+| Grabación de clips | `RecordingManager` — MP4 via OpenCV VideoWriter; `nx:qa:recording_active` + `nx:qa:recording_info` en Redis |
+| Modo playback | Redis key `nx:qa:playback_video` (path al video) — detectado por `app.py` cada 5 s + manejado por `docker-entrypoint.sh` |
 | Acceso remoto | Tailscale — la IP se extrae de `st.context.headers["host"]` en Streamlit |
 | Container QA app | `python:3.11-slim` ARM64, sin GPU |
 
@@ -559,7 +566,7 @@ Servidor HTTP MJPEG daemon. Solo se instancia cuando `NX_QA_ENABLED=true` (desde
 Arquitectura interna de dos threads: `_encode_loop` (consume queues de frames, encoda a JPEG en background) + hilo HTTP (`run()`, sirve multipart/x-mixed-replace a 25 fps con lock mínimo). Calidad JPEG configurable (default 72). Cero impacto en producción sin QA.
 
 **`config_loader.py`** (~330 líneas)
-Carga y fusiona configuración desde 5 fuentes (prioridad: env vars > `/etc/nx_*` > `config.yaml` > `.env` > defaults). Define los 15 paquetes predefinidos (`PACKAGE_DEFINITIONS`), capacidades válidas, límites de NVDEC, y genera URLs RTSP interpolando el patrón del DVR. Retorna un `ClientConfig` dataclass. Campos configurables desde `config.yaml` (con defaults): `pgie_batch_size=0`, `pgie_interval=-1`, `sgie_interval=-1`, `reid_gallery_size=10` (máximo de embeddings por persona en `ReIdManager`; ajustar según número de cámaras del cliente).
+Carga y fusiona configuración desde 5 fuentes (prioridad: env vars > `/etc/nx_*` > `config.yaml` > `.env` > defaults). Define los 15 paquetes predefinidos (`PACKAGE_DEFINITIONS`), capacidades válidas, límites de NVDEC, y genera URLs RTSP interpolando el patrón del DVR. Retorna un `ClientConfig` dataclass. Campos configurables desde `config.yaml` (con defaults): `pgie_batch_size=0`, `pgie_interval=-1`, `sgie_interval=-1`, `reid_gallery_size=10` (máximo de embeddings por persona en `ReIdManager`; ajustar según número de cámaras del cliente), `recording_enabled=false` (activar grabación automática de clips cuando se detectan personas; funciona tanto en producción como en QA — en QA siempre graba independientemente de este campo).
 
 **`common/bus_call.py`**
 Handler genérico de mensajes del bus GStreamer (EOS, WARNING, ERROR). Estándar de ejemplos NVIDIA DeepStream.
@@ -582,6 +589,9 @@ Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_
 - `update_embedding(global_id, embedding)` — intenta añadir el embedding a la galería de un `global_id` conocido (diversity check: solo si `max_sim < GALLERY_DIVERSITY_THRESHOLD=0.85`); reemplaza el miembro menos informativo cuando la galería está llena.
 - `flush()` — persiste a disco al apagar el pipeline.
 Función libre `_gallery_add(gallery, embedding)` — lógica de adición/reemplazo en la galería; `_gallery_best_sim(gallery, embedding)` — max dot product contra todos los miembros. Persiste la DB en `deploy/reid_db.json` cada 30 s. **Migración automática** de esquema antiguo (`"embedding"` → `"gallery"`) en `_load()`. Carga al inicio descartando entradas con TTL vencido. Constantes configurables: `SIMILARITY_THRESHOLD=0.55` (guía: 0.65 muy estricto, 0.45 causa falsos positivos), `GALLERY_MAX_SIZE=10`, `GALLERY_DIVERSITY_THRESHOLD=0.85`, `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
+
+**`recording_manager.py`** (~230 líneas)
+Worker thread para grabación automática de clips de video en QA mode. Suscribe a `nx:qa:detections` (Redis pub/sub) y arranca grabación cuando detecta personas. Estado: IDLE → RECORDING → IDLE. Graba `tiled.mp4` (desde `push_tiled_frame()`, llamado por MjpegServer) y `<camera_id>.mp4` full-res (desde `push_camera_frame()`, llamado por Probe A). Cooldown: 10 s sin detecciones. Duración mínima: 5 s (clips más cortos se descartan). Duración máxima: 5 min. Auto-prune: elimina clips más antiguos cuando total > 10 GB. Publica `nx:qa:recording_active` y `nx:qa:recording_info` a Redis. Directorio `/nx_tech/recordings/<YYYYMMDD_HHMMSS>/`: `thumbnail.jpg`, `metadata.json`, `tiled.mp4`, `<cam_id>.mp4`.
 
 **`ws_client.py`** (~136 líneas)
 WebSocket persistente hacia el backend. Envía snapshots de posiciones normalizadas (x, y, track_id) cada 10 segundos por cámara. Reconexión automática con backoff exponencial (1s → 30s). Silencioso si no hay conexión.
@@ -655,8 +665,10 @@ Credenciales del backend: `API_BASE_URL`, `API_KEY`, `WS_BASE_URL`. **Gitignorea
 
 ### `deploy/qa_app/` — Dashboard QA Visual (Streamlit)
 
-**`streamlit_app.py`** (~520 líneas)
-Dashboard Streamlit accesible vía Tailscale desde cualquier dispositivo del equipo NX. Se autorefresea cada 500 ms (`st_autorefresh`). Sidebar: info del pipeline (cliente, paquete, sector, canales), selector de cámara, toggles de features (escribe en Redis hash `nx:qa:capabilities`), sección "Entrada/Salida" con checkbox por cámara (escribe en Redis string `nx:qa:entry_exit` como JSON con lista de channel numbers — el pipeline los lee en caliente cada 30 batches sin reinicio), **editor de configuración completo** con todas las variables de `config.yaml` (paquete, stream type, tracker, canales, PGIE/SGIE interval, PGIE batch, ReID gallery size, puerto DVR, RTSP pattern) + botón **💾 Guardar en config.yaml** que escribe el archivo con `ruamel.yaml` (preserva comentarios) y captura también los valores live de entrada/salida, externas y conteo. Las ediciones en el editor se persisten en Redis bajo `nx:qa:config_overrides` entre rerenders; session_state preserva los valores del usuario entre autorefreshes de 500ms. Estado de conexión Redis. Panel principal: video MJPEG embebido con `st.iframe(viewer_url, height=560)` — el `viewer_url` apunta a `/viewer/<key>` del MjpegServer (mismo origen, sin CORS, el browser mantiene la conexión MJPEG estable entre rerenders porque React no destruye el iframe si el src no cambia). La IP del Jetson se extrae de `st.context.headers["host"]`. Detecciones y API calls se leen de deques a nivel de proceso (`@st.cache_resource`) escritos por un thread daemon subscriber de Redis — esto evita el problema de `st.session_state` siendo descartado silenciosamente cuando se escribe fuera del ScriptRunContext. El subscriber tiene auto-reconexión (`time.sleep(2)` tras excepción).
+**`streamlit_app.py`** (~620 líneas)
+Dashboard Streamlit accesible vía Tailscale desde cualquier dispositivo del equipo NX. Se autorefresea cada 500 ms (`st_autorefresh`). Sidebar: info del pipeline, selector de cámara, toggles de features, sección Entrada/Salida, editor de config completo, indicador de estado de grabación/playback. Main area con dos tabs:
+- **Tab "En Vivo"**: video MJPEG embebido (`st.iframe`), log de detecciones, log de API calls.
+- **Tab "Grabaciones"**: estado de grabación activa (Redis `nx:qa:recording_active`), estado de playback (Redis `nx:qa:playback_video`), lista de clips de `/nx_tech/recordings/` con thumbnail+metadata, botón **▶ Preview** (`st.video()`), botón **▶ Correr Inferencia** (escribe `nx:qa:playback_video` en Redis → pipeline se reinicia en modo playback), botón **🗑 Eliminar**, botón **🔴 Volver a En Vivo** (borra `nx:qa:playback_video`). El volumen `./recordings:/nx_tech/recordings` en `docker-compose.qa.yml` es el que permite a Streamlit leer los clips.
 
 **`Dockerfile.qa`**
 Imagen `python:3.11-slim`. Instala solo `streamlit`, `redis`, `streamlit-autorefresh` y `ruamel.yaml`. No necesita acceso a GPU. Healthcheck en `/_stcore/health`.
@@ -672,7 +684,7 @@ Imagen `python:3.11-slim`. Instala solo `streamlit`, `redis`, `streamlit-autoref
 Tres servicios: `deepstream` (pipeline principal, puerto 8080 expuesto — activo solo con QA), `db` (TimescaleDB PostgreSQL 16, puerto 5432), `redis` (Redis 7, puerto 6379). Monta los directorios de pipelines, modelos, clientes y tools.
 
 **`docker-compose.qa.yml`**
-Override file para modo QA. Solo se carga desde `qa.sh`. Agrega `NX_QA_ENABLED: "true"` al servicio `deepstream` y añade el servicio `qa_app` (Streamlit, puerto 8501). Monta `./clients:/nx_tech/clients` en el servicio `qa_app` para que el botón Guardar pueda escribir en `clients/<cliente>/config.yaml`. Nunca se usa en producción.
+Override file para modo QA. Solo se carga desde `qa.sh`. Agrega `NX_QA_ENABLED: "true"` al servicio `deepstream` y añade el servicio `qa_app` (Streamlit, puerto 8501). Monta `./clients:/nx_tech/clients` y `./recordings:/nx_tech/recordings` en el servicio `qa_app` para que el botón Guardar pueda escribir configs y la tab Grabaciones pueda leer/previsualizar clips. El servicio `deepstream` también monta `./recordings:/nx_tech/recordings` para que `RecordingManager` pueda escribir clips. Nunca se usa en producción.
 
 **`qa.sh`**
 Script de activación del modo QA. Subcomandos: `start` (default) y `stop`. Al arrancar: detiene el pipeline de producción, inicia los containers con el override QA, espera a que Streamlit esté listo, imprime la URL Tailscale clickable. `Ctrl+C` o `stop` restauran la producción automáticamente vía `trap cleanup`.
