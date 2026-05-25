@@ -220,6 +220,79 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## PAR (Pedestrian Attribute Recognition) para Age/Gender + Augmentación de ReID
+
+**Descripción:** Reemplazar el SGIE ResNet-18 de age/gender (6 clases via DeepStream nvinfer) con un modelo PAR Python worker que produce 26 atributos PA-100K: gender, 3 grupos de edad, pose, accesorios, tipo y color de ropa. Al mismo tiempo, usar los atributos PAR como validador del ReID: cuando OSNet encuentra un match por similitud de apariencia, PAR verifica que gender y age_group sean compatibles antes de confirmar el match — reduciendo falsos positivos cross-cámara entre personas de distinto género o rango de edad.
+
+**Por qué sería mejor:** El SGIE actual clasifica en 6 categorías fijas (female/male × young/adult/senior). PAR con PA-100K da 26 atributos discriminativos. Para el ReID, el OSNet puro puede confundir personas de apariencia visual similar (mismo color de ropa) — PAR agrega una capa semántica que es complementaria al embedding de apariencia.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/probes.py`
+- Sección / función: `_AgeGenderHandler` (líneas aprox. 785–886) — eliminar lectura de `classifier_meta_list` del SGIE; reemplazar con `_par_worker.get_result(track_id, pad_index)`
+- Archivo: `deploy/pipelines/app.py`
+- Sección / función: `SGIE_CONFIGS["age_gender"]` (línea ~48) — pasar de path a config_infer.txt a `None` (Python worker, no SGIE)
+- Archivo: `deploy/pipelines/reid_manager.py`
+- Sección / función: `_Entry` dataclass y `match_or_create()` — agregar `par_vec: Optional[np.ndarray]` y filtro de compatibilidad PAR
+
+**Archivos nuevos a crear:**
+- `deploy/pipelines/par_worker.py` — Python thread worker, mismo patrón que `appearance_worker.py`; queue de crops BGR, ONNX Runtime GPU, output vector 26-dim sigmoid float32
+- `deploy/tools/export_par_onnx.py` — script para ejecutar en máquina dev: carga checkpoint PA-100K, exporta via `torch.onnx.export()` a `par_resnet18_pa100k.onnx` (opset=11)
+- `deploy/models/par/par_resnet18_pa100k.onnx` — modelo exportado (no en git, se descarga via download_models.py)
+
+**Estrategia de ReID augmentada (Filtro post-matching):**
+```
+OSNet match(query, gallery) → best_match si sim >= 0.55
+↓ Si ambas personas tienen PAR result disponible:
+  gender_ok = |female_prob_query - female_prob_match| < 0.3
+  age_ok    = argmax(age_probs_query) == argmax(age_probs_match)
+  Si NOT (gender_ok AND age_ok) → rechazar match → NEW_PERSON
+```
+El threshold OSNet 0.55 no cambia. El filtro PAR se puede desactivar con `use_par_reid_filter: false` en config.yaml.
+
+**Mapeo de atributos PA-100K → age/gender actual:**
+| Índice | Atributo | Uso |
+|--------|----------|-----|
+| 0 | female | gender display + ReID filter |
+| 1 | age < 18 | → "Joven" + ReID filter |
+| 2 | 18 ≤ age < 60 | → "Adulto/a" + ReID filter |
+| 3 | age ≥ 60 | → "Mayor" + ReID filter |
+| 4–6 | pose (front/side/back) | info solamente |
+| 7–25 | accesorios + ropa | guardados en `_TrackState.par_vec`, reservados para futuro |
+
+**Tech stack propuesto:**
+- Modelo: Strong Baseline ResNet-18 (aajinjin/Strong_Baseline_of_Pedestrian_Attribute_Recognition) — MIT-compatible, puro PyTorch, sin extensiones C++
+- Dataset fine-tuning: PA-100K (26 atributos, disponible públicamente)
+- Input: 256×192 RGB, ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+- Output: sigmoid por atributo, rango [0,1]
+- **Por qué NO OpenPAR (PromptPAR):** CLIP ViT-Base tiene ~87-100M params y 20-40ms de latencia vs ~12M params y 3-8ms del ResNet-18. Para los mismos 26 atributos PA-100K, el costo no justifica la diferencia de accuracy.
+
+**Integración preferida: SGIE (no Python worker)**
+Lo más eficiente es integrarlo como SGIE de DeepStream (igual que el age/gender actual), no como Python worker. El ResNet-18 exporta a ONNX y DeepStream lo convierte a TensorRT automáticamente — batching de crops en GPU, sin overhead de colas Python, integrado en el grafo GStreamer.
+
+El único requisito adicional es un **custom C++ parser** (`custom_sigmoid_parser.so`) que reemplace al `custom_softmax_parser.so` actual. La diferencia: en lugar de leer 6 scores softmax y devolver 1 clase ganadora, lee 26 scores sigmoid independientes y crea 26 `NvDsLabelInfo` entries en `NvDsClassifierMeta` — una por atributo. `_AgeGenderHandler` los leería todos de `classifier_meta_list`.
+
+```
+config_infer.txt del SGIE PAR:
+  gie-unique-id=2          # mismo que el actual
+  num-detected-classes=26  # 26 atributos PA-100K
+  operate-on-gie-id=1      # sobre detecciones del PGIE (personas)
+  operate-on-class-ids=0   # solo class=0 (person)
+  custom-lib-path=libcustom_sigmoid_parser.so
+  parse-classifier-func-name=CustomPARParseFunction
+```
+
+Como alternativa más simple para el experimento inicial: usar Python worker (ONNX Runtime GPU) para evitar el C++, y migrar a SGIE TensorRT una vez validado el modelo.
+
+**Consideraciones:**
+- **Pesos PA-100K:** el repo no los incluye — requiere entrenar en una máquina dev con GPU (~2-4h en RTX 3060+) o buscar checkpoint publicado en HuggingFace. El training es offline, el Jetson solo hace inferencia.
+- **Frecuencia de llamadas:** PAR se llama 1 vez al inicio del track + cada 90 frames (igual que OSNet en modo refresh) — latencia por frame promedio < 0.5ms.
+- **RAM impacto:** +~75MB al footprint actual (~550MB) — bien dentro de 8GB unificados del Orin Nano.
+- **docker-entrypoint.sh:** la compilación de `custom_softmax_parser.so` ya no es necesaria si age_gender usa PAR worker en lugar de SGIE — hacerla condicional.
+- **Rollback:** `use_par_reid_filter=false` en config.yaml desactiva el filtro PAR sin tocar el OSNet ReID. El branch `feat/par-reid` no afecta `main`.
+- Esfuerzo estimado: 1 día de training/export en máquina dev + 2-3 días de integración en el pipeline.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]
