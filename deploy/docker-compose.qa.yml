@@ -9,8 +9,6 @@ services:
       NX_QA_ENABLED: "true"
       # Opcional: apuntar al staging para no contaminar el backend de producción
       # API_BASE_URL: https://staging.api.nxcomputing.ai
-
-  deepstream:
     volumes:
       - ./recordings:/nx_tech/recordings
 
