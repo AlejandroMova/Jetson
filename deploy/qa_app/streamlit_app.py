@@ -55,6 +55,11 @@ st_autorefresh(interval=500, limit=None, key="qa_tick")
 # ── Redis helpers ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def _get_redis():
+    """Crea y cachea la conexión Redis por proceso. Retorna None si Redis no está disponible.
+
+    cache_resource garantiza que solo se crea una conexión por proceso Streamlit,
+    evitando reconexiones en cada rerender del dashboard.
+    """
     try:
         r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True,
                         socket_connect_timeout=2, socket_timeout=2)
@@ -65,6 +70,7 @@ def _get_redis():
 
 
 def _redis_ok() -> bool:
+    """Verifica si la conexión Redis está viva. Retorna False si está caída o no disponible."""
     r = _get_redis()
     if r is None:
         return False
@@ -80,6 +86,11 @@ def _redis_ok() -> bool:
 # aquí y el script lo lee en cada rerender sin problemas de thread safety.
 @st.cache_resource
 def _get_buffers():
+    """Crea y cachea los buffers circulares de detecciones y API calls por proceso.
+
+    Los buffers son compartidos entre el hilo subscriber (que escribe) y el script principal
+    (que lee en cada rerender). cache_resource garantiza que son singletons por proceso.
+    """
     return {
         "detections": deque(maxlen=MAX_DETECTIONS),
         "apicalls":   deque(maxlen=MAX_APICALLS),
@@ -91,6 +102,11 @@ def _ensure_subscriber(_host=REDIS_HOST):
     bufs = _get_buffers()
 
     def _loop():
+        """Loop del hilo subscriber: suscribe a Redis pub/sub y llena los buffers compartidos.
+
+        Se reconecta automáticamente tras cualquier error (Redis caído, red, etc.) con 2 s de espera.
+        Los mensajes se deserializan de JSON y se añaden al deque correspondiente por canal.
+        """
         while True:
             try:
                 r = redis.Redis(host=_host, port=6379, decode_responses=True)
@@ -156,6 +172,11 @@ def _save_config_yaml() -> tuple:
         from ruamel.yaml.comments import CommentedSeq
 
         def _flist(items):
+            """Convierte una lista Python a CommentedSeq con flow style para ruamel.yaml.
+
+            Flow style serializa la lista en una línea: [1, 2, 3] en lugar de formato block YAML.
+            Necesario para que `channels` quede legible en una sola línea en config.yaml.
+            """
             seq = CommentedSeq(items)
             seq.fa.set_flow_style()
             return seq

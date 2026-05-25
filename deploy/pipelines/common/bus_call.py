@@ -20,6 +20,7 @@ import sys
 gi.require_version('Gst', '1.0')
 from gi.repository import GObject, Gst
 def bus_call(bus, message, loop):
+    """Maneja mensajes del bus GStreamer (EOS, WARNING, ERROR). Tomado de ejemplos NVIDIA DeepStream."""
     t = message.type
     if t == Gst.MessageType.EOS:
         sys.stdout.write("End-of-stream")

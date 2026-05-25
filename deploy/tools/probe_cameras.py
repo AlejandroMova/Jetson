@@ -56,6 +56,11 @@ def _digest_auth_header(user: str, password: str, method: str,
 
 
 def _recv_response(s: socket.socket) -> str:
+    """Lee del socket hasta encontrar el fin de las cabeceras RTSP (\\r\\n\\r\\n) o timeout.
+
+    Retorna el texto recibido (decodificado con errors='ignore' para tolerancia a bytes inválidos).
+    Para RTSP solo necesitamos las cabeceras — el cuerpo SDP no es relevante para verificar el canal.
+    """
     data = b""
     try:
         while True:
@@ -92,6 +97,7 @@ def _rtsp_describe(host: str, port: int, path: str,
     url = f"rtsp://{host}:{port}{path}"
 
     def _make_req(auth_header: str = "", cseq: int = 1) -> bytes:
+        """Construye la petición RTSP DESCRIBE en bytes. auth_header vacío = sin autenticación."""
         req = (f"DESCRIBE {url} RTSP/1.0\r\n"
                f"CSeq: {cseq}\r\n"
                f"User-Agent: NX-probe/1.0\r\n"
@@ -199,6 +205,7 @@ def _load_runtime(client_name: str):
 
 
 def _update_config(config_path: Path, channels: List[int]):
+    """Escribe la lista de canales detectados en config.yaml preservando comentarios con ruamel.yaml."""
     ryaml = _YAML()
     ryaml.preserve_quotes = True
     with open(config_path) as f:
@@ -212,6 +219,12 @@ def _update_config(config_path: Path, channels: List[int]):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    """Sondea canales RTSP del DVR y reporta cuáles tienen señal de video activa.
+
+    Para cada canal (1..max_ch), envía RTSP DESCRIBE y evalúa el código de respuesta:
+    200 → activo, 404 → sin cámara, 401 → credenciales incorrectas (aborta), 0 → DVR inalcanzable.
+    Con --update-config escribe los canales encontrados directamente en config.yaml.
+    """
     ap = argparse.ArgumentParser(description="Probe DVR channels via RTSP DESCRIBE")
     ap.add_argument("--client",        default=None,
                     help="Client name (default: reads /etc/nx_client)")

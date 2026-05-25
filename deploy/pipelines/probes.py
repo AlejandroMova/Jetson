@@ -78,6 +78,10 @@ _recording_manager = None
 
 
 def set_recording_manager(rm) -> None:
+    """Registra la instancia de RecordingManager para que los probes puedan pasarle frames.
+
+    Se llama desde app.py después de instanciar RecordingManager, antes de arrancar el pipeline.
+    """
     global _recording_manager
     _recording_manager = rm
 
@@ -91,18 +95,34 @@ def init_channel_map(channels: list):
 
 
 def init_sector(sector: str) -> None:
+    """Configura el sector del cliente: 'comercio', 'industrial' o 'hogar'.
+
+    El sector afecta el tipo de evento emitido por face_recognition
+    (employee_seen vs known_person_seen) y la severidad de fall_detected.
+    """
     global _JETSON_SECTOR
     _JETSON_SECTOR = sector
     logger.info("Sector: %s", sector)
 
 
 def init_entry_exit_pads(pad_indices: set) -> None:
+    """Define qué pad indices corresponden a cámaras de entrada/salida del local.
+
+    Los eventos person_entry/exit de estas cámaras llevan is_entry_exit_camera=True,
+    lo que le permite al backend calcular tráfico de entrada y salida del negocio.
+    """
     global _entry_exit_pads
     _entry_exit_pads = pad_indices
     logger.info("Entry/exit pad indices: %s", pad_indices)
 
 
 def init_camera_types(external_pad_indices: set, count_internal: bool, count_external: bool) -> None:
+    """Configura qué cámaras son externas y si se deben contar sus personas.
+
+    external_pad_indices: pads de cámaras externas (ej. estacionamiento, calle).
+    count_internal: si False, las cámaras internas no generan eventos ni analytics.
+    count_external: si False, las cámaras externas no generan eventos ni analytics.
+    """
     global _external_pads, _count_internal, _count_external
     _external_pads  = external_pad_indices
     _count_internal = count_internal
@@ -335,24 +355,36 @@ def _draw_qa_overlays(frame_bgr: np.ndarray, qa_tracks: list) -> None:
 
 @dataclass
 class _TrackState:
+    """Estado por track activo. Vive en _active_tracks[track_id] desde el primer frame hasta el exit.
+
+    Los campos de ReID (entry_emitted, entry_deadline, global_id, pending_bbox, pending_conf)
+    solo se usan cuando _reid_manager está activo (modelo OSNet encontrado).
+    entry_deadline permite emitir un person_entry de fallback si el embedding tarda demasiado
+    (APPEARANCE_ENTRY_DEADLINE_FRAMES frames sin recibir la primera embedding).
+    """
     first_frame:       int
     last_frame:        int
-    first_ts:          float        # time.monotonic() when first seen
+    first_ts:          float        # time.monotonic() cuando fue visto por primera vez
     camera_id:         str
     is_entry_exit_cam: bool         = False
     appearance_sent:   bool         = False
-    # ReID fields — only populated when _reid_manager is active
-    entry_emitted:     bool         = False   # True once person_entry/channel_change was sent
-    entry_deadline:    int          = 0       # emit fallback entry if frame_num reaches this
-    global_id:         Optional[str] = None   # assigned after ReID match
-    pending_bbox:      Optional[dict] = None  # bbox saved at first detection for deferred emit
-    pending_conf:      float         = 0.0    # confidence saved at first detection
+    # Campos de ReID — solo se usan cuando _reid_manager está activo
+    entry_emitted:     bool         = False   # True una vez que se emitió person_entry o channel_change
+    entry_deadline:    int          = 0       # emitir entry de fallback si frame_num llega aquí sin embedding
+    global_id:         Optional[str] = None   # asignado tras el match de ReID
+    pending_bbox:      Optional[dict] = None  # bbox guardado en la primera detección para emit diferido
+    pending_conf:      float         = 0.0    # confianza guardada en la primera detección
 
 
 # ==============================================================================
 # 1. BUS CALL — manejo de mensajes del pipeline
 # ==============================================================================
 def bus_call(_bus, message, loop):
+    """Maneja mensajes del bus GStreamer: EOS para salida limpia, WARNING y ERROR para logging.
+
+    Retorna True para que GStreamer siga llamando al handler en mensajes futuros.
+    Se conecta al bus en app.py con: bus.add_watch(0, bus_call, loop).
+    """
     t = message.type
     if t == Gst.MessageType.EOS:
         logger.info("Fin del flujo de video (EOS).")
@@ -379,6 +411,12 @@ class NxApiClient:
     """
 
     def __init__(self, base_url: str, api_key: str, max_queue_size: int = 512):
+        """Configura el cliente. La sesión HTTP se crea aquí pero el hilo worker se arranca en start().
+
+        Se usa requests.Session para reusar la conexión TCP entre requests (keep-alive),
+        reduciendo latencia en deployments con muchos eventos simultáneos.
+        max_queue_size=512 evita acumulación indefinida si el backend está lento o caído.
+        """
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
@@ -394,6 +432,7 @@ class NxApiClient:
     # Ciclo de vida
     # ------------------------------------------------------------------
     def start(self):
+        """Arranca el hilo worker que drena la cola de peticiones HTTP."""
         self._running = True
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -404,8 +443,9 @@ class NxApiClient:
         logger.info("NxApiClient iniciado → %s", self._base_url)
 
     def stop(self):
+        """Señaliza al worker que pare, espera hasta 5 s y cierra la sesión HTTP."""
         self._running = False
-        self._queue.put(None)  # Señal de parada
+        self._queue.put(None)  # sentinel para desbloquear el get() en _worker_loop
         if self._worker_thread:
             self._worker_thread.join(timeout=5)
         self._session.close()
@@ -415,6 +455,7 @@ class NxApiClient:
     # Encolar peticiones (llamado desde el probe, sin bloquear)
     # ------------------------------------------------------------------
     def enqueue(self, method: str, endpoint: str, payload: Optional[dict] = None):
+        """Encola una petición HTTP sin bloquear. Descarta con warning si la cola está llena."""
         try:
             self._queue.put_nowait((method, endpoint, payload))
         except queue.Full:
@@ -424,6 +465,7 @@ class NxApiClient:
     # Worker interno
     # ------------------------------------------------------------------
     def _worker_loop(self):
+        """Loop principal del hilo worker: consume la cola y envía peticiones HTTP al backend."""
         while self._running:
             try:
                 item = self._queue.get(timeout=1.0)
@@ -431,13 +473,18 @@ class NxApiClient:
                 continue
 
             if item is None:
-                break
+                break  # sentinel enviado por stop()
 
             method, endpoint, payload = item
             self._send(method, endpoint, payload)
             self._queue.task_done()
 
     def _send(self, method: str, endpoint: str, payload: Optional[dict]):
+        """Envía la petición HTTP al backend. En QA mode publica el payload a Redis antes de enviar.
+
+        Timeout de 5 s por request. Los errores se loguean pero no se propagan
+        — el pipeline nunca debe fallar por un error de red al backend.
+        """
         url = f"{self._base_url}{endpoint}"
         # QA: intercept payload antes de enviar al backend
         if _IS_QA_ENABLED:
@@ -468,6 +515,7 @@ class NxApiClient:
     # Helpers internos
     # ------------------------------------------------------------------
     def _base_event(self, event_type: str, camera_id: str, severity: str = "info") -> dict:
+        """Construye los campos comunes a todos los eventos del backend (id, tipo, sector, timestamp)."""
         return {
             "event_id":  str(uuid.uuid4()),
             "type":      event_type,
@@ -486,6 +534,7 @@ class NxApiClient:
                           confidence: float, is_entry_exit_cam: bool,
                           global_id: Optional[str] = None,
                           is_return: bool = False) -> None:
+        """Emite person_entry. entry_type="return" si la persona ya fue vista antes; "new" si es nueva."""
         payload = self._base_event("person_entry", camera_id)
         payload.update({
             "track_id":            track_id,
@@ -502,6 +551,7 @@ class NxApiClient:
                                    confidence: float, global_id: str,
                                    prev_camera_id: Optional[str],
                                    is_entry_exit_cam: bool) -> None:
+        """Emite person_channel_change cuando la misma persona (global_id conocido) cambia de cámara."""
         payload = self._base_event("person_channel_change", camera_id)
         payload.update({
             "track_id":            track_id,
@@ -517,6 +567,7 @@ class NxApiClient:
     def post_person_exit(self, camera_id: str, track_id: int,
                          dwell_seconds: float, is_entry_exit_cam: bool,
                          global_id: Optional[str] = None) -> None:
+        """Emite person_exit con el tiempo total de permanencia del track en la cámara."""
         payload = self._base_event("person_exit", camera_id)
         payload.update({
             "track_id":            track_id,
@@ -529,18 +580,21 @@ class NxApiClient:
 
     def post_person_classified(self, camera_id: str, track_id: int,
                                bbox: dict, demographics: dict) -> None:
+        """Emite person_classified con el resultado del SGIE de edad/género (tras FACE_VOTES_REQUIRED votos)."""
         payload = self._base_event("person_classified", camera_id)
         payload.update({"track_id": track_id, "bbox": bbox, "demographics": demographics})
         self.enqueue("POST", "/api/events", payload)
 
     def post_person_appearance(self, camera_id: str, track_id: int,
                                appearance_vector: list) -> None:
+        """Emite person_appearance con el vector OSNet 512-dim L2-normalizado para re-ID en el backend."""
         payload = self._base_event("person_appearance", camera_id)
         payload.update({"track_id": track_id, "appearance_vector": appearance_vector})
         self.enqueue("POST", "/api/events", payload)
 
     def post_fall_detected(self, camera_id: str, track_id: int, bbox: dict,
                            fall_score: int, avg_kp_conf: float) -> None:
+        """Emite fall_detected. severity="critical" en sector hogar, "high" en otros."""
         severity = "critical" if _JETSON_SECTOR == "hogar" else "high"
         payload = self._base_event("fall_detected", camera_id, severity)
         payload.update({
@@ -553,6 +607,7 @@ class NxApiClient:
 
     def post_employee_seen(self, camera_id: str, employee_id: str, track_id: int,
                            similarity: float, bbox: dict) -> None:
+        """Emite employee_seen (o known_person_seen en hogar) cuando se identifica un rostro conocido."""
         evt = "known_person_seen" if _JETSON_SECTOR == "hogar" else "employee_seen"
         payload = self._base_event(evt, camera_id)
         payload.update({
@@ -564,6 +619,7 @@ class NxApiClient:
         self.enqueue("POST", "/api/events", payload)
 
     def post_employee_presence(self, camera_id: str, employee_id: str, track_id: int) -> None:
+        """Emite employee_presence periódicamente para empleados que siguen en cámara (heartbeat)."""
         payload = self._base_event("employee_presence", camera_id)
         payload.update({"track_id": track_id,
                         "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id})
@@ -571,6 +627,7 @@ class NxApiClient:
 
     def post_employee_exit(self, camera_id: str, employee_id: str,
                            track_id: int, dwell_seconds: float) -> None:
+        """Emite employee_exit (o known_person_exit en hogar) con tiempo de permanencia del empleado."""
         evt = "known_person_exit" if _JETSON_SECTOR == "hogar" else "employee_exit"
         payload = self._base_event(evt, camera_id)
         payload.update({
@@ -582,6 +639,7 @@ class NxApiClient:
 
     def post_unknown_person_alert(self, camera_id: str, track_id: int,
                                   face_snapshot_b64: str, bbox: dict) -> None:
+        """Emite unknown_person_alert (sector hogar) cuando se detecta un rostro no reconocido."""
         payload = self._base_event("unknown_person_alert", camera_id, "medium")
         payload.update({"track_id": track_id, "bbox": bbox,
                         "face_snapshot_b64": face_snapshot_b64})
@@ -589,6 +647,7 @@ class NxApiClient:
 
     def post_epp_violation(self, camera_id: str, track_id: int, bbox: dict,
                            violations: list, present: list, confidence: float) -> None:
+        """Emite epp_violation con los items de EPP faltantes y los presentes (sector industrial)."""
         payload = self._base_event("epp_violation", camera_id, "high")
         payload.update({"track_id": track_id, "bbox": bbox, "violations": violations,
                         "present": present, "confidence": round(confidence, 3)})
@@ -596,6 +655,7 @@ class NxApiClient:
 
     def post_fire_smoke_alert(self, camera_id: str, detected: list,
                               confidence: float, frame_snapshot_b64: str = "") -> None:
+        """Emite fire_smoke_alert con los elementos detectados (e.g. ["fire", "smoke"])."""
         payload = self._base_event("fire_smoke_alert", camera_id, "critical")
         payload.update({"detected": detected, "confidence": round(confidence, 3),
                         "frame_snapshot_b64": frame_snapshot_b64})
@@ -603,6 +663,7 @@ class NxApiClient:
 
     def post_vehicle_detected(self, camera_id: str, track_id: int, bbox: dict,
                               plate: str, plate_confidence: float) -> None:
+        """Emite vehicle_detected con la placa leída y su confianza (sector industrial)."""
         payload = self._base_event("vehicle_detected", camera_id)
         payload.update({"track_id": track_id, "bbox": bbox,
                         "plate": plate, "plate_confidence": round(plate_confidence, 3)})
@@ -610,12 +671,14 @@ class NxApiClient:
 
     def post_analytics_snapshot(self, camera_id: str, stats: dict,
                                 period_seconds: float = 60.0) -> None:
+        """Emite analytics_snapshot cada ANALYTICS_SEND_INTERVAL_SECS con conteos acumulados del período."""
         payload = self._base_event("analytics_snapshot", camera_id)
         payload.update({"period_seconds": period_seconds, **stats})
         self.enqueue("POST", "/api/analytics", payload)
 
     def post_crop(self, camera_id: str, track_id: int, frame_num: int,
                   crop_b64: str, bbox: dict) -> None:
+        """Envía un crop de persona en base64 al endpoint /api/crops para inspección o re-entrenamiento."""
         payload = {
             "camera_id": camera_id,
             "jetson_id": JETSON_ID,
@@ -629,6 +692,7 @@ class NxApiClient:
 
     def post_reference_frame(self, camera_id: str, frame_num: int,
                              frame_b64: str, width: int, height: int) -> None:
+        """Envía un frame completo de referencia por cámara al backend (usado para calibración/mapa)."""
         payload = {
             "camera_id": camera_id,
             "jetson_id": JETSON_ID,
@@ -775,6 +839,7 @@ class _HandlerResult:
         det_extra: Optional[dict] = None,
         analytics_update: Optional[dict] = None,
     ):
+        """Construye el resultado del handler. event_type vacío = sin evento API adicional este frame."""
         self.osd_text = osd_text
         self.border_color = border_color
         self.event_type = event_type
@@ -789,11 +854,18 @@ class _AgeGenderHandler:
     """
 
     def __init__(self):
-        self._cache: Dict[int, Tuple[str, str, str, float]] = {}
-        self._votes: Dict[int, List[str]] = {}
-        self._vote_last_frame: Dict[int, int] = {}
+        """Inicializa los dicts de caché y votación por track_id. Todo vacío al iniciar."""
+        self._cache: Dict[int, Tuple[str, str, str, float]] = {}  # track_id → resultado final bloqueado
+        self._votes: Dict[int, List[str]] = {}                     # track_id → labels acumulados
+        self._vote_last_frame: Dict[int, int] = {}                 # track_id → frame del último voto
 
     def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
+        """Procesa un objeto detectado, acumula votos del SGIE y devuelve HandlerResult con el label.
+
+        El flujo es: sin resultado SGIE → "Analizando"; con resultado pero sin suficientes votos →
+        "Analizando (n/N)"; con N votos → bloquear resultado en _cache y emitir person_classified.
+        Una vez en _cache, el resultado se devuelve directamente sin más inferencia.
+        """
         p_track_id = int(obj_meta.object_id)
         bbox_w = int(obj_meta.rect_params.width)
         bbox_h = int(obj_meta.rect_params.height)
@@ -934,12 +1006,19 @@ class _FallDetectionHandler:
     """
 
     def __init__(self):
+        """Inicializa el handler sin worker. El worker se asigna en init_handlers() vía set_worker()."""
         self._worker = None
 
     def set_worker(self, worker) -> None:
         self._worker = worker
 
     def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
+        """Encola crop al PoseWorker cada POSE_SAMPLE_INTERVAL frames y lee el resultado más reciente.
+
+        El crop solo se encola si la persona tiene bbox >= POSE_MIN_PERSON_WIDTH (evita crops muy pequeños).
+        El resultado puede ser de un frame anterior — el worker es async y puede ir varios frames atrás.
+        Si el resultado indica caída, usa pop_new_fall() para emitir el evento solo una vez por evento real.
+        """
         if self._worker is None:
             return None
 
@@ -992,15 +1071,18 @@ class _FaceRecognitionHandler:
     PRESENCE_HEARTBEAT_SECS: float = 30.0
 
     def __init__(self, worker):
+        """Configura el handler con el FaceRecognizer worker y los dicts de estado por track.
+
+        _identity_reported evita enviar employee_seen más de una vez por track.
+        _last_heartbeat controla la frecuencia del heartbeat de presencia (PRESENCE_HEARTBEAT_SECS).
+        _unknown_alerted evita alertas repetidas para la misma cara desconocida (sector hogar).
+        """
         self._worker = worker
-        self._last_sample: Dict[int, int] = {}
-        self._cache: Dict[int, Tuple[str, float]] = {}
-        # tracks where we already fired employee_seen / known_person_seen
-        self._identity_reported: Set[int] = set()
-        # last time we sent a presence heartbeat per track
-        self._last_heartbeat: Dict[int, float] = {}
-        # tracks we already alerted as unknown (hogar only)
-        self._unknown_alerted: Set[int] = set()
+        self._last_sample: Dict[int, int] = {}                     # track_id → frame del último sample
+        self._cache: Dict[int, Tuple[str, float]] = {}             # track_id → (nombre, similitud)
+        self._identity_reported: Set[int] = set()                  # tracks con employee_seen ya emitido
+        self._last_heartbeat: Dict[int, float] = {}                # track_id → ts del último heartbeat
+        self._unknown_alerted: Set[int] = set()                    # tracks con unknown_person_alert ya emitido
 
     def process_face(
         self,
@@ -1010,6 +1092,14 @@ class _FaceRecognitionHandler:
         persons_meta: list,
         camera_id: str,
     ) -> None:
+        """Procesa una cara detectada por FaceDetectIR: extrae crop, encola al worker, emite eventos.
+
+        Flujo:
+        1. Filtrar por confianza mínima (FACE_DET_CONFIDENCE_THRESHOLD).
+        2. Encontrar el track de persona padre que contiene esta cara (_find_parent_track).
+        3. Encolar crop de cara al FaceRecognizer worker cada FACE_SAMPLE_INTERVAL frames.
+        4. Leer resultado del worker y, según sector, emitir employee_seen o unknown_person_alert.
+        """
         if self._worker is None or frame_np is None:
             return
         if face_obj_meta.confidence < FACE_DET_CONFIDENCE_THRESHOLD:
@@ -1090,6 +1180,10 @@ class _FaceRecognitionHandler:
         self._unknown_alerted.discard(track_id)
 
     def get_identity(self, track_id: int) -> Optional[Tuple[str, float]]:
+        """Devuelve (nombre, similitud) si el track tiene una identidad reconocida, o None.
+
+        Actualiza el _cache local con el resultado más reciente del worker antes de retornar.
+        """
         result = self._worker.get_result(track_id) if self._worker else None
         if result:
             self._cache[track_id] = result
@@ -1133,6 +1227,18 @@ def init_workers(
     api_key: str = "",
     reid_gallery_size: int = 10,
 ) -> None:
+    """Instancia los workers async según las capacidades activas del pipeline.
+
+    Los workers NO se arrancan aquí — solo se crean. start_workers() los arranca
+    después de pipeline.set_state(PLAYING) para que el contexto CUDA de TensorRT
+    esté inicializado antes de que ONNX Runtime intente usar la GPU.
+
+    Workers creados según capacidades:
+      - AppearanceWorker + ReIdManager: siempre (si existe el modelo OSNet)
+      - PoseWorker: si 'fall_detection' está en pipeline_capabilities
+      - FaceRecognizer: si 'face_recognition' está en pipeline_capabilities
+      - WsPositionClient: si WS_BASE_URL está configurado
+    """
     global _pose_worker, _face_recognizer, _appearance_worker, _reid_manager, _ws_client
 
     # AppearanceWorker + ReIdManager — always active when OSNet model is present.
@@ -1188,10 +1294,16 @@ def start_workers() -> None:
 
 
 def stop_workers() -> None:
+    """Detiene todos los workers async y persiste el estado del ReIdManager a disco.
+
+    Se llama desde el bloque finally de main() para un shutdown limpio.
+    ReIdManager.flush() fuerza la escritura de reid_db.json antes de cerrar
+    para que las identidades persistan entre reinicios del pipeline.
+    """
     if _appearance_worker is not None:
         _appearance_worker.stop()
     if _reid_manager is not None:
-        _reid_manager.flush()
+        _reid_manager.flush()          # persistir DB a reid_db.json antes de salir
     if _pose_worker is not None:
         _pose_worker.stop()
     if _face_recognizer is not None:
@@ -1218,6 +1330,14 @@ _HANDLER_REGISTRY = {
 
 
 def init_handlers(pipeline_capabilities: List[str]) -> None:
+    """Instancia y registra los handlers activos según las capacidades del pipeline.
+
+    _active_handlers es la lista que el probe itera por cada persona detectada.
+    _face_handler se maneja por separado porque procesa objetos SGIE_FACE_DETECT_ID,
+    no objetos PGIE del loop principal de personas.
+
+    Se conecta cada handler con su worker correspondiente (ej. FallDetection → PoseWorker).
+    """
     global _active_handlers, _face_handler
     _active_handlers = []
     _face_handler = None
@@ -1267,7 +1387,13 @@ _FPS_PUBLISH_INTERVAL: float = 5.0
 
 
 def _get_analytics(pad_index: int) -> Dict:
+    """Retorna (creando si no existe) el dict de analytics acumulados para una cámara.
+
+    Acumula conteos durante ANALYTICS_SEND_INTERVAL_SECS (60 s) y luego se reinicia.
+    El dict incluye: person_count, gender_male, gender_female, age_gender_classes (dict).
+    """
     if pad_index not in _analytics:
+        # Inicializar contadores en cero para esta cámara
         _analytics[pad_index] = {
             "person_count": 0, "gender_male": 0,
             "gender_female": 0, "age_gender_classes": {},
@@ -1276,6 +1402,10 @@ def _get_analytics(pad_index: int) -> Dict:
 
 
 def _get_analytics_last_sent(pad_index: int) -> float:
+    """Retorna el timestamp (monotonic) del último envío de analytics para esta cámara.
+
+    Se inicializa al tiempo actual para que el primer envío ocurra después de un intervalo completo.
+    """
     if pad_index not in _analytics_last_sent:
         _analytics_last_sent[pad_index] = time.monotonic()
     return _analytics_last_sent[pad_index]
@@ -1308,11 +1438,19 @@ def _save_and_send_crop(
     frame_num: int,
     bbox: dict,
 ) -> None:
+    """Guarda un crop de persona en disco y lo envía al backend vía API.
+
+    Uso dual: el archivo local sirve como dataset para reentrenamiento futuro,
+    y el POST a /api/crops permite al backend construir un historial visual por persona.
+    Máximo CROP_MAX_PER_PERSON crops por track para no saturar disco ni red.
+    """
+    # Guardar en disco: crops/<camera_id>/<track_id>/frame_NNNNNN.jpg
     person_dir = Path(CROPS_DIR) / camera_id / str(track_id)
     person_dir.mkdir(parents=True, exist_ok=True)
     filepath = person_dir / f"frame_{frame_num:06d}.jpg"
     cv2.imwrite(str(filepath), crop_bgr)
 
+    # Codificar en base64 para el payload JSON de la API
     _, buf = cv2.imencode(".jpg", crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     crop_b64 = base64.b64encode(buf).decode("utf-8")
     api_client.post_crop(camera_id, track_id, frame_num, crop_b64, bbox)

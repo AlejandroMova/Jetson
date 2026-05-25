@@ -57,12 +57,18 @@ EVENT_CHANNEL_CHANGE = "channel_change"
 
 @dataclass
 class _Entry:
+    """Representa una identidad conocida en la base de datos de re-ID.
+
+    gallery: lista de hasta GALLERY_MAX_SIZE embeddings L2-normalizados 512-dim.
+    visit_count solo incrementa en entry/return — no en channel_change (cambio de cámara
+    dentro de la ventana de presencia no cuenta como una nueva visita del cliente).
+    """
     global_id:     str
-    gallery:       List[np.ndarray]  # up to GALLERY_MAX_SIZE L2-normalised 512-dim vecs
-    first_seen_ts: float             # wall clock (time.time()) when first created
-    last_seen_ts:  float             # updated on every match
-    camera_id:     str               # last camera_id where seen
-    visit_count:   int = 1           # increments on each entry/return, NOT on channel_change
+    gallery:       List[np.ndarray]  # hasta GALLERY_MAX_SIZE vectores L2-normalizados
+    first_seen_ts: float             # wall clock (time.time()) cuando se creó por primera vez
+    last_seen_ts:  float             # se actualiza en cada match (entry, return, channel_change)
+    camera_id:     str               # última cámara donde fue visto
+    visit_count:   int = 1           # incrementa solo en entry/return, no en channel_change
 
 
 def _gallery_add(gallery: List[np.ndarray], embedding: np.ndarray, max_size: int = GALLERY_MAX_SIZE) -> bool:
@@ -116,12 +122,18 @@ class ReIdManager:
     """
 
     def __init__(self, db_path: str = "/opt/nx/reid_db.json", gallery_max_size: int = GALLERY_MAX_SIZE):
+        """Carga la DB desde disco y la deja lista para usar. El lock protege todos los accesos al dict _db.
+
+        gallery_max_size es configurable desde config.yaml (reid_gallery_size) para ajustarlo
+        según el número de cámaras: más cámaras = más ángulos distintos = galería más grande.
+        _last_save_ts controla la frecuencia de escritura a disco (máximo cada SAVE_INTERVAL_S).
+        """
         self._path = Path(db_path)
         self._gallery_max_size = gallery_max_size
         self._db: Dict[str, _Entry] = {}
         self._lock = threading.Lock()
         self._last_save_ts: float = 0.0
-        self._load()
+        self._load()  # carga al iniciar, descartando entradas con TTL vencido
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
@@ -205,18 +217,23 @@ class ReIdManager:
     # ── Internal ────────────────────────────────────────────────────────────────
 
     def _find_best_match(self, embedding: np.ndarray) -> Tuple[Optional[str], float]:
+        """Busca la identidad con mayor similitud coseno en la DB usando una sola llamada BLAS.
+
+        Concatena todas las galerías en una sola matriz para evitar loops Python con numpy.
+        Devuelve (global_id, sim) si sim >= SIMILARITY_THRESHOLD, o (None, best_sim) si no hay match.
+        Debe llamarse dentro del lock (_lock).
+        """
         if not self._db:
             return None, -1.0
-        ids      = list(self._db.keys())
+        ids       = list(self._db.keys())
         galleries = [self._db[gid].gallery for gid in ids]
-        sizes    = [len(g) for g in galleries]
+        sizes     = [len(g) for g in galleries]
 
-        # Single BLAS call over all gallery vectors concatenated — O(N×K) with no
-        # per-entry Python loop doing matrix math.
+        # Una sola multiplicación matricial sobre todos los vectores de galería concatenados.
         all_vecs = np.concatenate([np.stack(g) for g in galleries])  # (sum_K, 512)
         all_sims = all_vecs @ embedding                               # (sum_K,)
 
-        # Reduce: max similarity per entry using cumulative offsets.
+        # Reducir: max similarity por entrada usando offsets acumulados.
         best_sim = -1.0
         best_idx = 0
         offset   = 0
@@ -230,6 +247,7 @@ class ReIdManager:
         return (ids[best_idx], best_sim) if best_sim >= SIMILARITY_THRESHOLD else (None, best_sim)
 
     def _expire_stale(self) -> None:
+        """Elimina entradas que no han sido vistas en REID_TTL_S segundos. Llamar dentro del lock."""
         now = time.time()
         stale = [gid for gid, e in self._db.items()
                  if now - e.last_seen_ts > REID_TTL_S]
@@ -243,11 +261,16 @@ class ReIdManager:
             self._save()
 
     def _save(self) -> None:
+        """Persiste la DB en disco de forma atómica (escribe en .tmp y luego rename).
+
+        El rename atómico garantiza que el archivo nunca quede en estado corrupto
+        si el proceso se mata a mitad de escritura — el tmp se descarta automáticamente.
+        """
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 gid: {
-                    "gallery":       [v.tolist() for v in e.gallery],
+                    "gallery":       [v.tolist() for v in e.gallery],  # np.ndarray → lista para JSON
                     "first_seen_ts": e.first_seen_ts,
                     "last_seen_ts":  e.last_seen_ts,
                     "camera_id":     e.camera_id,
@@ -256,14 +279,20 @@ class ReIdManager:
                 for gid, e in self._db.items()
             }
             tmp = self._path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, separators=(",", ":")))
-            tmp.rename(self._path)
+            tmp.write_text(json.dumps(data, separators=(",", ":")))  # sin espacios = menos bytes
+            tmp.rename(self._path)  # rename atómico: archivo siempre consistente en disco
             self._last_save_ts = time.time()
             logger.debug("ReID: saved %d entries → %s", len(data), self._path)
         except Exception as exc:
             logger.warning("ReID: save failed: %s", exc)
 
     def _load(self) -> None:
+        """Carga la DB desde disco al iniciar, descartando entradas con TTL vencido.
+
+        Migración automática de esquema: el formato antiguo guardaba un solo "embedding" (lista).
+        El formato nuevo usa "gallery" (lista de listas). Ambos se leen correctamente.
+        Entradas sin "gallery" ni "embedding" se descartan silenciosamente (datos corruptos).
+        """
         if not self._path.exists():
             logger.info("ReID: no DB at %s — starting fresh", self._path)
             return
@@ -276,17 +305,16 @@ class ReIdManager:
             for gid, v in raw.items():
                 if now - v["last_seen_ts"] > REID_TTL_S:
                     expired += 1
-                    continue
+                    continue  # entrada expirada — no cargar
 
-                # Schema migration: old DB stored a single "embedding" float list.
-                # Convert to gallery format transparently so no manual reset is needed.
+                # Migración de esquema: "embedding" (antiguo, un solo vec) → "gallery" (nuevo, lista)
                 if "gallery" in v:
                     gallery = [np.array(e, dtype=np.float32) for e in v["gallery"]]
                 elif "embedding" in v:
-                    gallery = [np.array(v["embedding"], dtype=np.float32)]
+                    gallery = [np.array(v["embedding"], dtype=np.float32)]  # envolver en lista
                 else:
                     skipped += 1
-                    continue
+                    continue  # formato desconocido — descartar
 
                 if not gallery:
                     skipped += 1

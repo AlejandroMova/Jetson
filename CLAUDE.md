@@ -277,6 +277,7 @@ Checklist para este cambio:
 - [ ] Regla 10: ¿Hay errores que registrar en ErrorHistory.md? → [sí/no]
 - [ ] Regla 11: ¿Hay mejoras futuras que registrar en Future.md? → [sí/no]
 - [ ] Regla 12: ¿Cambia algún payload, endpoint o evento de API? → [sí/no — actualizar APIBackend.md]
+- [ ] Regla 14: ¿El código nuevo/modificado tiene docstrings + comentarios en bloques y líneas importantes? → [verificar antes de dar la tarea por terminada]
 ```
 
 **Las reglas 9 y 2 (post) son obligatorias en todo cambio que modifique comportamiento, constantes, flujos o archivos** — no dependen de juicio del agente. Si el cambio fue pequeño y ninguna descripción en CLAUDE.md ni README.md quedó desactualizada, indicarlo explícitamente ("sin cambios necesarios en documentación porque X").
@@ -525,6 +526,39 @@ Cuando el usuario diga "escribe un Continue.md" (o variantes como "crea el Conti
 - "Archivos modificados sin commitear" es obligatoria — si no hay ninguno, escribir "Ninguno"
 - Los próximos pasos deben ser accionables desde cero: suficiente contexto para que Claude retome sin leer toda la conversación
 - No incluir código extenso — solo referencias a archivos y funciones
+
+### 14. Documentar siempre el código — docstrings y comentarios obligatorios
+
+**Todo código Python en este proyecto debe cumplir los tres niveles de documentación:**
+
+**Nivel 1 — Docstring de módulo (al inicio de cada archivo `.py`):**
+- Qué hace el archivo y cuál es su rol en la arquitectura
+- Relación con otros módulos (quién lo importa, a quién llama)
+- Ejemplo de uso si no es obvio
+
+**Nivel 2 — Docstring en toda función, método y clase:**
+- Qué hace, qué recibe y qué retorna
+- Efectos secundarios relevantes (escritura a disco, Redis, cola, API)
+- Cuándo puede retornar None / lanzar excepción
+- Para clases: invariantes del estado interno que el lector debe conocer
+
+**Nivel 3 — Comentarios inline en bloques y líneas importantes:**
+- Un comentario de sección (`# ── Nombre ─────`) antes de cada bloque lógico dentro de una función larga
+- Comentario en líneas con lógica no obvia: expresiones matemáticas, indexación matricial, flags de estado, decisiones de diseño no evidentes en el nombre de la variable
+- Comentarios en líneas con sintaxis densa (list comprehensions complejas, slicing múltiple, operaciones numpy en una línea)
+- Comentario explicando el **por qué** de una constante o threshold numérico
+
+**Lo que NO requiere comentario:**
+- Líneas donde el nombre de la variable/función ya explica todo (ej. `logger.info(...)`, `result.append(item)`)
+- Bloques de logging, imports, y asignaciones triviales
+- Código que ya tiene un docstring inmediatamente encima
+
+**Al crear o modificar un archivo Python:**
+- Si el archivo no tiene docstring de módulo → agregarlo
+- Si una función no tiene docstring → agregarlo antes de salir
+- Si se agrega código con lógica compleja → agregar comentarios inline en ese momento
+
+**Esta regla aplica tanto al código nuevo como al código modificado.** No es necesario documentar retroactivamente el código que no se tocó en la sesión actual.
 
 ---
 

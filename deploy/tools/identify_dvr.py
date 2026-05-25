@@ -105,6 +105,12 @@ PATTERNS = [
 
 def _build_url(pattern: str, dvr_ip: str, port: int,
                user: str, password: str, ch: int) -> str:
+    """Interpola un patrón de URL RTSP con las credenciales y el número de canal.
+
+    Los placeholders soportados son: {user}, {password}, {dvr_ip}, {port}, {ch:02d}, {ch}.
+    El orden de reemplazo importa: {ch:02d} debe reemplazarse antes que {ch} para evitar
+    que '02d' quede parcialmente en la URL si el patrón usa ambos.
+    """
     return (
         pattern
         .replace("{user}",     user)
@@ -187,6 +193,7 @@ def _rtsp_describe(host: str, port: int, url_path: str,
     url = f"rtsp://{host}:{port}{url_path}"
 
     def _make_request(auth_header: str = "", cseq: int = 1) -> str:
+        """Construye la petición RTSP DESCRIBE en formato texto. auth_header vacío = sin autenticación."""
         req = (f"DESCRIBE {url} RTSP/1.0\r\n"
                f"CSeq: {cseq}\r\n"
                f"User-Agent: NX-identify/1.0\r\n"
@@ -297,6 +304,12 @@ def _load_credentials(client_name: str) -> Tuple[str, str, int, str]:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    """Punto de entrada: prueba patrones RTSP conocidos contra el DVR y opcionalmente actualiza config.yaml.
+
+    Si --update-config se pasa, escribe el patrón detectado, la resolución y el stream_type
+    directamente en clients/<cliente>/config.yaml con ruamel.yaml (preservando comentarios).
+    Útil desde setup.sh para configurar automáticamente el cliente sin intervención manual.
+    """
     ap = argparse.ArgumentParser(description="Auto-identify DVR RTSP URL pattern and stream resolution")
     ap.add_argument("--client",        default=None, help="Client name (default: /etc/nx_client)")
     ap.add_argument("--dvr-ip",        default=None, help="Override DVR IP")

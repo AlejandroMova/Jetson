@@ -42,8 +42,17 @@ TEST_VIDEOS_DIR = "test_videos"
 
 
 def _find_video(path_arg):
+    """Resuelve la ruta del video a usar.
+
+    Si se pasó un path explícito (--input o argumento posicional), lo usa directamente.
+    Si no, busca el primer video (orden alfabético) en TEST_VIDEOS_DIR (test_videos/).
+    Sale con código 1 si el directorio no existe o no hay videos disponibles.
+    """
+    # Path explícito proporcionado por el usuario — usarlo directamente
     if path_arg:
         return path_arg
+
+    # Auto-descubrimiento: buscar en test_videos/ y tomar el primero en orden alfabético
     try:
         videos = sorted(
             os.path.join(TEST_VIDEOS_DIR, f)
@@ -53,13 +62,25 @@ def _find_video(path_arg):
     except FileNotFoundError:
         logger.error("Directory '%s' not found.", TEST_VIDEOS_DIR)
         sys.exit(1)
+
     if not videos:
         logger.error("No videos found in %s", TEST_VIDEOS_DIR)
         sys.exit(1)
+
     return videos[0]
 
 
 def main():
+    """Punto de entrada del pipeline de testing con archivo de video.
+
+    Construye un pipeline GStreamer con filesrc en lugar de rtspsrc.
+    La estructura es idéntica al pipeline de producción en cuanto a modelos,
+    pero el sink es nvrtspoutsinkbin en lugar de fakesink (útil para depuración visual).
+
+    Modos:
+      - loop=True (default): al llegar EOS el video vuelve al inicio (útil para testing continuo)
+      - loop=False (--no-loop): sale al terminar el video (usado en modo playback QA)
+    """
     parser = argparse.ArgumentParser(description="NX video testing pipeline")
     parser.add_argument("video", nargs="?", default=None)
     parser.add_argument("--input", "-i", default=None,
@@ -177,10 +198,15 @@ def main():
 
     # ── Linking ───────────────────────────────────────────────────────────────
     def _on_demux_pad_added(_demux, pad):
+        """Conecta qtdemux al h264parser cuando el pad de video está disponible.
+
+        qtdemux crea pads dinámicamente al demuxar el contenedor MP4.
+        Solo nos interesa el pad de video H.264 — los de audio se ignoran.
+        """
         caps_str = (pad.get_current_caps() or pad.query_caps(None)).to_string()
         if "video/x-h264" in caps_str:
             sink_pad = h264parser.get_static_pad("sink")
-            if not sink_pad.is_linked():
+            if not sink_pad.is_linked():  # evitar doble link si se llama más de una vez
                 pad.link(sink_pad)
 
     source.link(qtdemux)
@@ -212,20 +238,28 @@ def main():
     bus.add_signal_watch()
 
     def _on_bus_message(_bus, message):
+        """Maneja mensajes del bus GStreamer para el pipeline de testing.
+
+        Al recibir EOS, si loop_video=True hace seek al inicio para repetir el video.
+        Si loop_video=False (modo playback QA) detiene el loop y permite que main() termine.
+        """
         t = message.type
         if t == Gst.MessageType.EOS:
             if loop_video:
+                # Volver al inicio del video para testing continuo sin reiniciar el pipeline
                 logger.info("EOS — looping video for testing.")
                 pipeline.seek_simple(
                     Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0
                 )
             else:
+                # Modo playback QA — terminar al completar el video
                 logger.info("EOS — video terminado (modo playback, sin loop).")
                 loop.quit()
         elif t == Gst.MessageType.WARNING:
             err, dbg = message.parse_warning()
             logger.warning("GStreamer WARNING: %s — %s", err, dbg)
         elif t == Gst.MessageType.ERROR:
+            # Error fatal — detener el pipeline
             err, dbg = message.parse_error()
             logger.error("GStreamer ERROR: %s — %s", err, dbg)
             loop.quit()

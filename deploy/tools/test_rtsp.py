@@ -8,6 +8,7 @@ user, password = 'admin', 'S1=me77SL'
 url = f'rtsp://{host}:{port}/cam/realmonitor?channel=1&subtype=0'
 
 def recv(s):
+    """Lee respuesta RTSP del socket hasta encontrar \\r\\n\\r\\n o timeout."""
     data = b''
     try:
         while True:
@@ -20,6 +21,7 @@ def recv(s):
     return data.decode(errors='ignore')
 
 def make_req(auth_header='', cseq=1):
+    """Construye una petición RTSP DESCRIBE en bytes con cabecera de auth opcional."""
     req = (f'DESCRIBE {url} RTSP/1.0\r\n'
            f'CSeq: {cseq}\r\nUser-Agent: test/1.0\r\nAccept: application/sdp\r\n')
     if auth_header:
@@ -27,6 +29,7 @@ def make_req(auth_header='', cseq=1):
     return (req + '\r\n').encode()
 
 def build_digest(user, password, method, uri, realm, nonce):
+    """Construye la cabecera Authorization: Digest RFC 2617 para las credenciales y nonce dados."""
     ha1 = hashlib.md5(f'{user}:{realm}:{password}'.encode()).hexdigest()
     ha2 = hashlib.md5(f'{method}:{uri}'.encode()).hexdigest()
     resp = hashlib.md5(f'{ha1}:{nonce}:{ha2}'.encode()).hexdigest()

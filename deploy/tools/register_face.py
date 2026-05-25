@@ -43,6 +43,12 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 def _load_insightface():
+    """Carga InsightFace buffalo_l con soporte CUDA + CPU fallback.
+
+    Usa det_size=(640, 640) para registro — mayor que en producción (160×160) para
+    mayor precisión al enrolar. El costo computacional es aceptable porque el
+    registro es una operación única offline, no en tiempo real.
+    """
     try:
         from insightface.app import FaceAnalysis
         app = FaceAnalysis(
@@ -50,7 +56,7 @@ def _load_insightface():
             root=_INSIGHTFACE_ROOT,
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
-        app.prepare(ctx_id=0, det_size=(640, 640))
+        app.prepare(ctx_id=0, det_size=(640, 640))  # ctx_id=0 = primera GPU; -1 = solo CPU
         return app
     except ImportError:
         logger.error("insightface not installed. Run: pip install insightface onnxruntime")
@@ -58,67 +64,102 @@ def _load_insightface():
 
 
 def _db_path(client: str) -> Path:
+    """Retorna la ruta del archivo JSON de embeddings para el cliente dado."""
     return _REPO_ROOT / "clients" / client / "known_faces.json"
 
 
 def _load_db(path: Path) -> dict:
+    """Carga known_faces.json como dict {nombre: [lista de embeddings]}.
+
+    Retorna dict vacío si el archivo no existe (primera vez que se registra alguien).
+    """
     if path.exists():
         return json.loads(path.read_text())
     return {}
 
 
 def _save_db(path: Path, db: dict):
+    """Persiste el dict de embeddings a disco en formato JSON indentado.
+
+    Crea los directorios intermedios si no existen (p.ej. clients/nuevo_cliente/).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(db, indent=2))
+    path.write_text(json.dumps(db, indent=2))  # indent=2 para que sea legible con un editor
     logger.info("Saved: %s (%d person(s))", path, len(db))
 
 
 def _extract_embedding(app, img_bgr: np.ndarray) -> np.ndarray:
+    """Extrae el embedding ArcFace normalizado de la cara más prominente en la imagen.
+
+    Retorna el embedding como lista de floats (compatible con JSON) o None si no
+    se detecta ninguna cara. En caso de múltiples caras, usa la primera (mayor bbox).
+    """
     faces = app.get(img_bgr)
     if not faces:
         return None
-    return faces[0].normed_embedding.tolist()
+    return faces[0].normed_embedding.tolist()  # normed_embedding ya está L2-normalizado
 
 
 def cmd_register_image(app, name: str, image_path: str, client: str):
+    """Registra una persona desde una sola imagen.
+
+    Extrae el embedding ArcFace de la imagen y lo agrega a known_faces.json.
+    Si la persona ya tiene embeddings, el nuevo se agrega (múltiples ángulos mejoran el matching).
+    """
     img = cv2.imread(image_path)
     if img is None:
         logger.error("Cannot read image: %s", image_path)
         sys.exit(1)
+
     emb = _extract_embedding(app, img)
     if emb is None:
         logger.error("No face detected in: %s", image_path)
         sys.exit(1)
+
+    # Cargar DB existente, agregar embedding y persistir
     path = _db_path(client)
     db = _load_db(path)
-    db.setdefault(name, []).append(emb)
+    db.setdefault(name, []).append(emb)  # setdefault crea la lista si la persona es nueva
     _save_db(path, db)
     logger.info("Registered '%s' from %s (%d embedding(s) total)", name, image_path, len(db[name]))
 
 
 def cmd_register_video(app, name: str, video_path: str, n: int, client: str):
+    """Registra una persona desde un video extrayendo N frames distribuidos uniformemente.
+
+    Útil cuando no se tienen fotos pero sí un clip de video (ej. grabación de CCTV).
+    Distribuir los frames a lo largo del video captura distintos ángulos y poses,
+    lo que mejora la robustez del matching en producción.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error("Cannot open video: %s", video_path)
         sys.exit(1)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total // n)
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  # total de frames del video
+    step = max(1, total // n)                          # saltar cada step frames para cubrir el video
     embeddings = []
     frame_idx = 0
+
     while len(embeddings) < n:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)  # saltar al frame deseado
         ok, frame = cap.read()
         if not ok:
-            break
+            break  # fin del video o error de lectura
+
         emb = _extract_embedding(app, frame)
         if emb is not None:
             embeddings.append(emb)
             logger.info("  Frame %d: embedding extracted", frame_idx)
-        frame_idx += step
+        frame_idx += step  # avanzar al siguiente frame a muestrear
+
     cap.release()
+
     if not embeddings:
         logger.error("No faces found in video: %s", video_path)
         sys.exit(1)
+
+    # Agregar todos los embeddings extraídos a la DB del cliente
     path = _db_path(client)
     db = _load_db(path)
     db.setdefault(name, []).extend(embeddings)
@@ -127,6 +168,12 @@ def cmd_register_video(app, name: str, video_path: str, n: int, client: str):
 
 
 def cmd_import_dir(app, import_dir: str, client: str):
+    """Importa todos los embeddings desde una estructura de carpetas.
+
+    Estructura esperada: import_dir/<NombrePersona>/imagen1.jpg, imagen2.jpg, ...
+    El nombre de cada subcarpeta se usa como nombre de la persona en la DB.
+    Las imágenes sin cara detectable se omiten con warning.
+    """
     root = Path(import_dir)
     if not root.is_dir():
         logger.error("Directory not found: %s", import_dir)
@@ -163,18 +210,20 @@ def cmd_import_dir(app, import_dir: str, client: str):
 
 
 def cmd_list(client: str):
+    """Lista todas las personas registradas en la DB del cliente con su cantidad de embeddings."""
     path = _db_path(client)
     db = _load_db(path)
     if not db:
         print(f"No persons registered in {path}")
         return
     print(f"\nRegistered persons in {path}:")
-    for name, embeddings in sorted(db.items()):
+    for name, embeddings in sorted(db.items()):  # ordenar alfabéticamente para fácil lectura
         print(f"  {name}: {len(embeddings)} embedding(s)")
     print()
 
 
 def cmd_delete(name: str, client: str):
+    """Elimina a una persona y todos sus embeddings de la DB del cliente."""
     path = _db_path(client)
     db = _load_db(path)
     if name not in db:
@@ -186,6 +235,12 @@ def cmd_delete(name: str, client: str):
 
 
 def main():
+    """CLI principal: parsea args y despacha al subcomando correspondiente.
+
+    --list y --delete no requieren InsightFace (operan solo sobre el JSON).
+    --image, --video y --import-dir cargan InsightFace en el momento de usarlos
+    para no penalizar a quien solo quiera listar o eliminar.
+    """
     parser = argparse.ArgumentParser(description="NX face registration tool")
     parser.add_argument("--client", default="demo",
                         help="Client name (default: demo)")

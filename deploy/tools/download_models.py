@@ -22,24 +22,37 @@ _MODELS_DIR = _REPO_ROOT / "models"
 
 
 def _download(url: str, dest: Path, label: str):
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    """Descarga un archivo desde `url` a `dest`, mostrando progreso en consola.
+
+    Idempotente: si el archivo ya existe, lo omite sin error.
+    Si la descarga falla, elimina el archivo parcial y sale con código 1
+    para que setup.sh detecte el fallo y no continúe con un modelo corrupto.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)  # crear directorios intermedios si no existen
+
+    # Si ya descargamos este modelo antes, no volver a descargar
     if dest.exists():
         logger.info("%s already exists — skipping.", dest.name)
         return
+
     logger.info("Downloading %s ...", label)
     try:
+        # urlretrieve llama a _progress en cada bloque recibido
         urllib.request.urlretrieve(url, dest, reporthook=_progress)
-        print()
+        print()  # nueva línea tras la barra de progreso inline
         logger.info("Saved: %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
     except Exception as e:
         logger.error("Download failed: %s", e)
+        # Eliminar archivo parcial para evitar que el pipeline arranque con un modelo corrupto
         if dest.exists():
             dest.unlink()
         sys.exit(1)
 
 
 def _progress(block, block_size, total):
+    """Callback de progreso para urlretrieve — imprime porcentaje en la misma línea."""
     if total > 0:
+        # Calcular porcentaje sin superar 100% (el último bloque puede exceder ligeramente)
         pct = min(100, block * block_size * 100 // total)
         print(f"\r  {pct}%", end="", flush=True)
 
@@ -109,6 +122,11 @@ def download_movenet(dest_dir: Path):
 
 
 def main():
+    """CLI principal — parsea argumentos y llama a las funciones de descarga correspondientes.
+
+    Ejemplo de uso típico desde setup.sh:
+      python3 tools/download_models.py --all
+    """
     parser = argparse.ArgumentParser(description="Download NX optional model files")
     parser.add_argument("--reid", action="store_true",
                         help="Download OSNet-x0.25 ONNX for cross-camera re-ID")

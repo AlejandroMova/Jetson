@@ -82,6 +82,12 @@ PACKAGE_DEFINITIONS = {
 
 @dataclass
 class ClientConfig:
+    """Configuración completa de un cliente, construida por load_config().
+
+    Agrupa todas las variables necesarias para construir el pipeline GStreamer:
+    credenciales DVR, canales activos, capacidades del pipeline, tracker, resolución, etc.
+    Los campos opcionales tienen defaults seguros para no romper el pipeline si no se especifican en YAML.
+    """
     client_name: str
     dvr_ip: str
     dvr_port: int
@@ -107,6 +113,12 @@ class ClientConfig:
     recording_enabled: bool = False  # grabar video cuando se detectan personas (QA y producción)
 
     def tracker_config_path(self) -> str:
+        """Devuelve la ruta absoluta del YAML de config para el tracker seleccionado.
+
+        Lanza RuntimeError si el valor de `tracker` no está en TRACKER_CONFIGS.
+        NvDCF es el recomendado para ≤6 streams; IOU es más ligero para 16 streams.
+        """
+        # Validar antes de retornar para dar un mensaje claro al operador
         if self.tracker not in TRACKER_CONFIGS:
             raise RuntimeError(
                 f"Unknown tracker '{self.tracker}'. Valid options: {list(TRACKER_CONFIGS)}"
@@ -130,6 +142,12 @@ class ClientConfig:
         return urls
 
     def log_summary(self):
+        """Imprime un resumen de la configuración activa al logger en nivel INFO.
+
+        Se llama desde app.py justo al arrancar, antes de construir el pipeline,
+        para que el técnico pueda verificar que la configuración es correcta.
+        Las URLs RTSP se enmascaran (contraseña → ***) para no filtrar credenciales en logs.
+        """
         logger.info("Client     : %s", self.client_name)
         logger.info("Package    : %s", self.package)
         logger.info("Sector     : %s", self.sector)
@@ -329,6 +347,13 @@ _NVDEC_HARD_MPIX  = 16 * 1920 * 1080   # 16× 1080p — known crash threshold
 
 
 def _warn_decoder_load(cfg: "ClientConfig") -> None:
+    """Emite WARNING/ERROR si la carga de NVDEC supera los límites del Jetson Orin Nano.
+
+    El Orin Nano tiene 1 motor NVDEC con capacidad nominal de 8× 1080p30 H.264.
+    Superar 16× la carga nominal (~16 streams 1080p) causa cudaErrorIllegalAddress.
+    La solución es usar sub-streams (stream_type: sub → 960×544) o distribuir Jetsons.
+    """
+    # Calcular megapíxeles totales decodificados por frame (sin considerar framerate)
     total = len(cfg.channels) * cfg.stream_width * cfg.stream_height
     if total > _NVDEC_HARD_MPIX:
         logger.error(

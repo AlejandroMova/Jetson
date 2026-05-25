@@ -38,9 +38,10 @@ _KP_RIGHT_ANKLE    = 16
 
 @dataclass
 class PoseResult:
-    is_falling: bool
-    fall_score: int
-    avg_conf: float
+    """Resultado de la clasificación de pose para un track. Producido por _run_inference()."""
+    is_falling: bool  # True si ≥ FALL_SCORE_THRESHOLD reglas se cumplen
+    fall_score: int   # número de reglas (0-3) que se cumplieron
+    avg_conf: float   # confianza promedio de los 6 keypoints relevantes
 
 
 class PoseWorker:
@@ -50,18 +51,24 @@ class PoseWorker:
     """
 
     def __init__(self, model_path: str, queue_size: int = 64):
+        """Configura el worker. El modelo se carga en start() por la misma razón que AppearanceWorker.
+
+        _fall_timestamps lleva el tiempo del último evento de caída por track para el cooldown.
+        _new_falls es un set: pop_new_fall() lo consume una vez, evitando alertas repetidas.
+        """
         self._model_path = model_path
         self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
-        self._results: Dict[int, PoseResult] = {}
-        self._fall_timestamps: Dict[int, float] = {}
-        self._new_falls: set = set()
+        self._results: Dict[int, PoseResult] = {}         # track_id → último resultado de pose
+        self._fall_timestamps: Dict[int, float] = {}      # track_id → timestamp último evento fall
+        self._new_falls: set = set()                       # tracks con caída nueva no consumida aún
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._session = None  # loaded in start(), after TRT initializes its CUDA context
+        self._session = None  # se carga en start() después de que TRT inicialice CUDA
 
     def start(self):
-        self._session = self._load_model()  # must run after pipeline.set_state(PLAYING)
+        """Carga MoveNet ONNX y arranca el hilo worker. Llamar después de pipeline.set_state(PLAYING)."""
+        self._session = self._load_model()  # debe correr después de set_state(PLAYING)
         self._running = True
         self._thread = threading.Thread(
             target=self._worker_loop, daemon=True, name="pose-worker"
@@ -70,17 +77,19 @@ class PoseWorker:
         logger.info("PoseWorker started — model: %s", self._model_path)
 
     def stop(self):
+        """Señaliza al worker que pare y espera a que el hilo termine (máximo 5 s)."""
         self._running = False
-        self._queue.put(None)
+        self._queue.put(None)  # sentinel para desbloquear el get() en _worker_loop
         if self._thread:
             self._thread.join(timeout=5)
         logger.info("PoseWorker stopped.")
 
     def enqueue(self, crop_bgr: np.ndarray, track_id: int, frame_num: int, bbox: dict):
+        """Encola un crop para clasificación de caída. No bloqueante — descarta si la cola está llena."""
         try:
             self._queue.put_nowait((crop_bgr.copy(), track_id, frame_num, bbox))
         except queue.Full:
-            pass  # drop silently — next frame will enqueue again
+            pass  # descarte silencioso — el siguiente frame POSE_SAMPLE_INTERVAL lo intentará de nuevo
 
     def get_result(self, track_id: int) -> Optional[PoseResult]:
         with self._lock:
@@ -97,6 +106,12 @@ class PoseWorker:
     # ── Worker thread ─────────────────────────────────────────────────────────
 
     def _worker_loop(self):
+        """Loop principal del hilo worker: consume la cola y actualiza _results y _new_falls.
+
+        Usa get(timeout=1.0) para poder verificar _running periódicamente sin bloqueo indefinido.
+        Al detectar caída: aplica cooldown por track_id antes de añadir a _new_falls, para que
+        pop_new_fall() solo retorne True una vez por evento real (no en cada frame donde sigue cayendo).
+        """
         if self._session is None:
             logger.error("PoseWorker: failed to load model — worker inactive.")
             return
@@ -107,7 +122,7 @@ class PoseWorker:
             except queue.Empty:
                 continue
             if item is None:
-                break
+                break  # sentinel enviado por stop()
             crop_bgr, track_id, frame_num, bbox = item
             try:
                 result = self._run_inference(crop_bgr, bbox)
@@ -116,14 +131,20 @@ class PoseWorker:
                     if result.is_falling:
                         now = time.monotonic()
                         last = self._fall_timestamps.get(track_id, 0.0)
-                        if now - last >= FALL_COOLDOWN_SECS:
+                        if now - last >= FALL_COOLDOWN_SECS:  # solo registrar si pasó el cooldown
                             self._fall_timestamps[track_id] = now
-                            self._new_falls.add(track_id)
+                            self._new_falls.add(track_id)      # marcado para consumo único por pop_new_fall()
             except Exception as e:
                 logger.warning("PoseWorker inference error track=%d: %s", track_id, e)
             self._queue.task_done()
 
     def _load_model(self):
+        """Carga MoveNet Lightning ONNX en CPU. Retorna la sesión ONNX o None si falla.
+
+        Usa solo CPUExecutionProvider para no competir con TensorRT por el contexto CUDA.
+        La importación de onnxruntime es diferida (dentro del método) para que el módulo
+        cargue sin error si onnxruntime no está instalado y fall_detection no está activo.
+        """
         try:
             import onnxruntime as ort
             path = Path(self._model_path)
@@ -140,18 +161,26 @@ class PoseWorker:
             return None
 
     def _run_inference(self, crop_bgr: np.ndarray, bbox: dict) -> PoseResult:
-        # Resize crop to 192×192 and normalize to float32 [0, 1]
-        img = cv2.resize(crop_bgr, (192, 192))
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        inp = np.transpose(img_rgb, (2, 0, 1))[np.newaxis]  # 1×3×192×192
+        """Ejecuta MoveNet sobre el crop de persona y clasifica si está cayendo.
 
+        Preprocesamiento: resize a 192×192, BGR→RGB, normalizar a [0, 1], NCHW.
+        Salida de MoveNet: tensor (1, 1, 17, 3) con 17 keypoints COCO, cada uno (y_norm, x_norm, conf).
+        La clasificación se hace con 3 reglas geométricas sobre los keypoints resultantes.
+        """
+        # ── Preprocesamiento ──────────────────────────────────────────────────
+        img = cv2.resize(crop_bgr, (192, 192))                       # escalar al tamaño de entrada del modelo
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0  # BGR→RGB y normalizar [0,1]
+        inp = np.transpose(img_rgb, (2, 0, 1))[np.newaxis]           # HWC → NCHW: (1, 3, 192, 192)
+
+        # ── Inferencia ONNX ───────────────────────────────────────────────────
         inp_name = self._session.get_inputs()[0].name
-        out = self._session.run(None, {inp_name: inp})[0]  # 1×1×17×3
+        out = self._session.run(None, {inp_name: inp})[0]             # salida: (1, 1, 17, 3)
 
-        keypoints = out[0, 0]  # 17×3: (y_norm, x_norm, conf)
+        # ── Extraer keypoints y clasificar ────────────────────────────────────
+        keypoints = out[0, 0]  # (17, 3): cada fila = (y_norm, x_norm, confidence)
         score, avg_conf = self._classify_fall(keypoints, bbox)
         return PoseResult(
-            is_falling=(score >= FALL_SCORE_THRESHOLD),
+            is_falling=(score >= FALL_SCORE_THRESHOLD),  # caída si ≥2 de 3 reglas se cumplen
             fall_score=score,
             avg_conf=avg_conf,
         )

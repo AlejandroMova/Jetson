@@ -33,10 +33,15 @@ class WsPositionClient:
     _INITIAL_BACKOFF: float = 1.0
 
     def __init__(self, ws_url: str, api_key: str, sector: str = "comercio"):
-        self._ws_url = ws_url.rstrip("/") + "/ws/positions"
+        """Configura el cliente. La conexión WebSocket se establece en start() vía _connect_loop.
+
+        _ws guarda el objeto WebSocket activo; None indica "sin conexión".
+        El lock protege el acceso a _ws desde send_positions() (probe thread) y _connect_loop() (ws thread).
+        """
+        self._ws_url = ws_url.rstrip("/") + "/ws/positions"  # endpoint canónico del backend
         self._api_key = api_key
         self._sector = sector
-        self._ws = None
+        self._ws = None           # None = desconectado; assign bajo _lock
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -44,6 +49,7 @@ class WsPositionClient:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
+        """Arranca el hilo de conexión persistente. La conexión se establece asíncronamente."""
         self._running = True
         self._thread = threading.Thread(
             target=self._connect_loop, daemon=True, name="ws-position-client"
@@ -52,11 +58,12 @@ class WsPositionClient:
         logger.info("WsPositionClient starting → %s", self._ws_url)
 
     def stop(self) -> None:
+        """Señaliza al hilo que pare, cierra el WebSocket activo y espera hasta 5 s."""
         self._running = False
         with self._lock:
             if self._ws is not None:
                 try:
-                    self._ws.close()
+                    self._ws.close()  # fuerza salida del ping loop en _connect_loop
                 except Exception:
                     pass
                 self._ws = None
@@ -93,6 +100,12 @@ class WsPositionClient:
     # ── Internal reconnect loop ───────────────────────────────────────────────
 
     def _connect_loop(self) -> None:
+        """Loop de reconexión con backoff exponencial: 1s → 2s → 4s → ... → 30s.
+
+        Al conectar exitosamente: asigna _ws y entra al ping loop interno (ws.ping() cada 15 s).
+        Si el ping falla o la conexión cae, sale del loop interno y reintenta tras el backoff.
+        El backoff se resetea a _INITIAL_BACKOFF en cada conexión exitosa.
+        """
         try:
             import websocket  # websocket-client library
         except ImportError:
@@ -105,6 +118,7 @@ class WsPositionClient:
         backoff = self._INITIAL_BACKOFF
         while self._running:
             try:
+                # ── Intentar conexión ────────────────────────────────────────────
                 ws = websocket.WebSocket()
                 ws.connect(
                     self._ws_url,
@@ -112,24 +126,24 @@ class WsPositionClient:
                     timeout=10,
                 )
                 with self._lock:
-                    self._ws = ws
+                    self._ws = ws  # disponible para send_positions() inmediatamente
                 logger.info("WS connected → %s", self._ws_url)
-                backoff = self._INITIAL_BACKOFF  # reset on success
+                backoff = self._INITIAL_BACKOFF  # resetear backoff al conectar con éxito
 
-                # Keep connection alive until it drops
+                # ── Mantener conexión viva con ping ──────────────────────────────
                 while self._running:
                     try:
                         ws.ping()
-                        time.sleep(15)
+                        time.sleep(15)  # ping cada 15 s — suficiente para keepalive sin saturar
                     except Exception:
-                        break
+                        break  # conexión caída → salir al loop externo para reconectar
 
             except Exception as e:
                 logger.debug("WS connect failed: %s — retry in %.0fs", e, backoff)
 
             with self._lock:
-                self._ws = None
+                self._ws = None  # marcar como desconectado antes de dormir
 
             if self._running:
                 time.sleep(backoff)
-                backoff = min(backoff * 2, self._MAX_BACKOFF)
+                backoff = min(backoff * 2, self._MAX_BACKOFF)  # duplicar hasta el techo

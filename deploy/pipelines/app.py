@@ -125,16 +125,25 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
     decoder_srcpad.link(streammux_sinkpad)
 
     def _on_pad_added(_src, pad, _pipeline=pipeline, _decoder=decoder):
+        """Callback invocado cuando rtspsrc negocia el codec con el DVR.
+
+        Crea el depayloader y parser correctos según el codec detectado (H.264 o H.265).
+        Se necesita hacer esto dinámicamente porque el codec se conoce solo tras
+        la negociación SDP con el DVR — no antes de conectarse.
+        """
+        # Leer caps del pad recién creado para detectar el codec
         caps = pad.get_current_caps() or pad.query_caps(None)
         caps_str = caps.to_string() if caps else ""
         if "video" not in caps_str:
-            return
+            return  # ignorar pads de audio o control
 
+        # Crear depayloader + parser según codec detectado
         if "H265" in caps_str.upper():
             depay  = Gst.ElementFactory.make("rtph265depay", f"depay-{stream_idx}")
             parser = Gst.ElementFactory.make("h265parse",    f"parser-{stream_idx}")
             logger.info("Stream %d: H.265 codec detected", stream_idx)
         else:
+            # H.264 es el default — la mayoría de DVRs usan H.264 en canales principales
             depay  = Gst.ElementFactory.make("rtph264depay", f"depay-{stream_idx}")
             parser = Gst.ElementFactory.make("h264parse",    f"parser-{stream_idx}")
 
@@ -142,14 +151,17 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
             logger.error("Could not create depay/parser for stream %d", stream_idx)
             return
 
+        # Agregar elementos al pipeline y sincronizar estado con el padre
         _pipeline.add(depay)
         _pipeline.add(parser)
-        depay.sync_state_with_parent()
+        depay.sync_state_with_parent()   # evita que el pipeline quede en estado inconsistente
         parser.sync_state_with_parent()
 
+        # Encadenar: depay → parser → decoder
         depay.link(parser)
         parser.link(_decoder)
 
+        # Conectar el pad de rtspsrc al sink del depayloader (solo si no está ya conectado)
         sink = depay.get_static_pad("sink")
         if not sink.is_linked():
             pad.link(sink)
@@ -164,6 +176,23 @@ def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
 
 
 def main():
+    """Punto de entrada del pipeline de producción.
+
+    Flujo completo:
+      1. Cargar configuración del cliente (config.yaml + env vars + /etc/nx_*)
+      2. Validar que todos los modelos requeridos existen antes de iniciar GStreamer
+      3. Inicializar mapas de canales, sector, handlers y workers async
+      4. Construir el grafo GStreamer: rtspsrc × N → mux → PGIE → tracker → SGIEs
+         → nvvidconv → RGBA capsfilter → [tiler si QA] → fakesink
+      5. Adjuntar probes (analytics en full-res; overlays en tileado si QA)
+      6. Correr el GLib.MainLoop hasta EOS, error, o solicitud de playback (código 42)
+      7. Parar workers, cliente API, pipeline y RecordingManager al salir
+
+    En QA mode (NX_QA_ENABLED=true) también:
+      - Levanta MjpegServer en :8080
+      - Publica nx:qa:status a Redis con toda la configuración del Jetson
+      - Inicia polling cada 5 s para detectar solicitud de modo playback desde Streamlit
+    """
     cfg = load_config()
     cfg.log_summary()
     _validate_pipeline_models(cfg.pipeline)
@@ -410,19 +439,29 @@ def main():
     bus.add_signal_watch()
 
     def _on_bus_message(_bus, message):
+        """Maneja mensajes del bus GStreamer: EOS, WARNING y ERROR.
+
+        Los errores en fuentes RTSP individuales (source-N) no detienen el pipeline —
+        el stream simplemente se pierde pero los demás continúan. Solo los errores
+        en elementos core (mux, PGIE, tracker) detienen el pipeline completo.
+        """
         t = message.type
         if t == Gst.MessageType.EOS:
+            # Fin de stream — ocurre en modo playback o cuando todas las fuentes RTSP se cierran
             logger.info("EOS received — stopping.")
             loop.quit()
         elif t == Gst.MessageType.WARNING:
+            # Advertencias no fatales — loguear para diagnóstico sin detener el pipeline
             err, dbg = message.parse_warning()
             logger.warning("GStreamer WARNING: %s — %s", err, dbg)
         elif t == Gst.MessageType.ERROR:
             err, dbg = message.parse_error()
             src_name = message.src.get_name() if message.src else ""
             if src_name.startswith("source-"):
+                # Error en una cámara RTSP — el resto del pipeline continúa
                 logger.warning("RTSP '%s' failed: %s — pipeline continues.", src_name, err)
             else:
+                # Error en elemento core — detener todo
                 logger.error("GStreamer ERROR: %s — %s", err, dbg)
                 loop.quit()
 
@@ -432,15 +471,22 @@ def main():
     _exit_for_playback = [False]
     if _IS_QA_ENABLED and _redis_qa:
         def _check_playback_mode():
+            """Polling de Redis cada 5 s para detectar solicitud de playback desde Streamlit.
+
+            Cuando el usuario hace clic en "▶ Correr Inferencia" en el dashboard,
+            Streamlit escribe la clave nx:qa:playback_video en Redis con el path del video.
+            Este callback la detecta, envía EOS al pipeline para detenerlo limpiamente,
+            y main() sale con código 42 para que docker-entrypoint.sh arranque el modo playback.
+            """
             try:
                 v = _redis_qa.get("nx:qa:playback_video")
                 if v and not _exit_for_playback[0]:
-                    _exit_for_playback[0] = True
+                    _exit_for_playback[0] = True  # evitar enviar EOS múltiples veces
                     logger.info("[QA] Modo playback solicitado: %s — enviando EOS", v)
                     pipeline.send_event(Gst.Event.new_eos())
             except Exception:
                 pass
-            return True  # mantener el timeout activo
+            return True  # retornar True mantiene el timeout de GLib activo
         GLib.timeout_add(5000, _check_playback_mode)
 
     logger.info("Starting pipeline…")

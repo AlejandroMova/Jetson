@@ -20,7 +20,9 @@ start_time=time.time()
 frame_count=0
 
 class GETFPS:
+    """Medidor de FPS con ventana de 5 segundos por stream. Tomado de ejemplos NVIDIA DeepStream."""
     def __init__(self,stream_id):
+        """Inicializa el contador para el stream dado, tomando el tiempo global de referencia."""
         global start_time
         self.start_time=start_time
         self.is_first=True
@@ -28,6 +30,7 @@ class GETFPS:
         self.frame_count=frame_count
         self.stream_id=stream_id
     def get_fps(self):
+        """Calcula e imprime el FPS cada 5 segundos. Resetea el contador tras cada impresión."""
         end_time=time.time()
         if(self.is_first):
             self.start_time=end_time

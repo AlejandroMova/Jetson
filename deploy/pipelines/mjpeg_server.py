@@ -43,14 +43,21 @@ class MjpegServer(threading.Thread):
         quality: int = 72,
         recorder: "RecordingManager | None" = None,
     ):
+        """Configura el servidor. El thread de encoding y el HTTP se arrancan en start().
+
+        tiled_frame_queue: frames 640×360 del tiler (clave "all" en _jpegs).
+        camera_queues: frames full-res recortados por cámara (clave = camera_id en _jpegs).
+        recorder: si no es None, cada frame tileado se pasa a push_tiled_frame() para grabar.
+        _jpegs es el buffer compartido: _encode_loop escribe, el HTTP handler lee.
+        """
         super().__init__(daemon=True, name="MjpegServer")
         self._port = port
         self._quality = quality
         self._tiled_queue = tiled_frame_queue
         self._cam_queues = camera_queues        # {"jetson-nx-001-ch01": Queue, ...}
-        self._recorder = recorder               # RecordingManager (QA recording, optional)
+        self._recorder = recorder               # RecordingManager (QA recording, opcional)
         self._lock = threading.Lock()
-        self._jpegs: dict = {}                  # "all" | camera_id → bytes
+        self._jpegs: dict = {}                  # "all" | camera_id → bytes JPEG más reciente
         self._enc_thread = threading.Thread(
             target=self._encode_loop, daemon=True, name="MjpegEncoder"
         )
@@ -101,16 +108,37 @@ class MjpegServer(threading.Thread):
 
     # ------------------------------------------------------------------
     def run(self):
+        """Hilo principal: levanta el servidor HTTP y sirve requests hasta que el proceso termina.
+
+        Usa ThreadingMixIn para manejar cada conexión MJPEG en su propio hilo,
+        permitiendo múltiples clientes simultáneos (ej. un técnico en la laptop + uno en el celular).
+        """
         class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-            daemon_threads = True  # no esperar threads de cliente al shutdown
+            daemon_threads = True  # no esperar threads de cliente al shutdown — proceso termina limpio
         server = _ThreadingHTTPServer(("0.0.0.0", self._port), self._make_handler())
         server.serve_forever()
 
     def _make_handler(self):
+        """Construye la clase handler HTTP con una referencia cerrada al servidor MJPEG.
+
+        Se usa un closure en lugar de pasar `self` directamente para que BaseHTTPRequestHandler
+        pueda acceder a los JEPGs sin herencia múltiple problemática.
+        """
         srv = self
 
         class _Handler(BaseHTTPRequestHandler):
+            """Handler HTTP para los endpoints /viewer/<key> y /stream/<key>.
+
+            Instanciada por ThreadingHTTPServer en un hilo propio por cada conexión cliente.
+            Usa el closure `srv` para leer los JPEGs del MjpegServer sin herencia múltiple.
+            """
             def do_GET(self):
+                """Rutea GET según prefijo: /viewer/<key> → HTML viewer, /stream/<key> → MJPEG loop.
+
+                El MJPEG loop es un bucle infinito que envía el último JPEG disponible cada ~40 ms
+                (25 fps) usando multipart/x-mixed-replace. El loop termina cuando el cliente
+                cierra la conexión (BrokenPipeError, ConnectionResetError, OSError).
+                """
                 path = self.path.strip("/")
                 parts = path.split("/", 1)
                 if len(parts) != 2:
