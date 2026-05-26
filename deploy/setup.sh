@@ -586,6 +586,53 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════
+# 6d. DVR Watchdog — auto-recuperación de IP cuando cambia por DHCP
+# ════════════════════════════════════════════════════════════
+# Instala dvr_watchdog.sh como servicio systemd en el host.
+# El watchdog monitorea los logs del container deepstream; cuando detecta
+# que TODOS los streams RTSP fallaron, corre nmap para encontrar la nueva
+# IP del DVR, actualiza /etc/nx_dvr_ip y reinicia el container.
+WATCHDOG_SRC="${WORK_DIR}/tools/dvr_watchdog.sh"
+WATCHDOG_DST="/usr/local/bin/nx_dvr_watchdog.sh"
+
+if ! command -v docker &>/dev/null; then
+  warn "Docker no disponible — watchdog DVR omitido"
+elif [[ ! -f "$WATCHDOG_SRC" ]]; then
+  warn "No se encontró ${WATCHDOG_SRC} — watchdog DVR omitido"
+else
+  log "Instalando watchdog de IP del DVR..."
+
+  # Sustituir el placeholder @@WORK_DIR@@ por la ruta real del repo
+  sed "s|@@WORK_DIR@@|${WORK_DIR}|g" "$WATCHDOG_SRC" > "$WATCHDOG_DST"
+  chmod +x "$WATCHDOG_DST"
+
+  # Crear unidad systemd
+  cat > /etc/systemd/system/nx-dvr-watchdog.service << 'SVCEOF'
+[Unit]
+Description=NX Computing — DVR IP Auto-Recovery Watchdog
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nx_dvr_watchdog.sh
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nx-dvr-watchdog
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+  systemctl daemon-reload
+  systemctl enable nx-dvr-watchdog
+  systemctl restart nx-dvr-watchdog
+  ok "DVR watchdog activo — logs: journalctl -u nx-dvr-watchdog -f"
+fi
+
+# ════════════════════════════════════════════════════════════
 # 7. Resumen final
 # ════════════════════════════════════════════════════════════
 echo ""
