@@ -76,6 +76,10 @@ sudo bash setup.sh \
 > **First run**: TensorRT builds engines for active models (~5 min each).  
 > Subsequent starts take ~30 seconds.
 
+> **DVR IP auto-recovery**: `setup.sh` installs a systemd service (`nx-dvr-watchdog`) that monitors  
+> Docker logs and automatically updates `/etc/nx_dvr_ip` + restarts the pipeline if the DVR changes  
+> IP via DHCP. Check its status with `journalctl -u nx-dvr-watchdog -f`.
+
 ### Manual mode (if you need to run steps individually)
 
 ```bash

@@ -58,7 +58,7 @@ VALID_CAPABILITIES = {
     "fire_smoke",        # Frame-level classifier: fire and smoke detection
     "license_plate",     # LPD + LPR: detect and read vehicle license plates
     "fall_detection",    # MoveNet ONNX Python worker: detects person fall events
-    "face_recognition",  # FaceDetectIR SGIE + InsightFace ArcFace: identifies known persons
+    "face_recognition",  # PeopleNet class 2 (face) + InsightFace ArcFace: identifies known persons
 }
 
 # Package → pipeline capabilities + sector.

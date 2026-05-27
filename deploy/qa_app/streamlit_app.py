@@ -388,7 +388,7 @@ with st.sidebar:
             ("Probe analytics",    comp.get("probe_a_frame")),
             ("PGIE PeopleNet",     comp.get("pgie_input", "960x544")),
             ("SGIE Edad/Género",   comp.get("age_gender_input", "224x224")),
-            ("SGIE FaceDetectIR",  comp.get("facedetect_input", "240x136")),
+            ("PeopleNet faces",     comp.get("facedetect_input")),
             ("MoveNet caídas",     comp.get("movenet_input", "192x192")),
             ("OSNet re-ID",        comp.get("osnet_input", "128x256")),
             ("Tiler QA display",   comp.get("probe_b_frame", "640x360")),

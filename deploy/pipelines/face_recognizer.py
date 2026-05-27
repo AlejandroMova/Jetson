@@ -1,6 +1,6 @@
 """
 face_recognizer.py — NX Computing AI | ArcFace Identity Matching
-Async worker: receives face crops from the FaceDetectIR SGIE, extracts 512-dim
+Async worker: receives face crops from PeopleNet class_id=2 (face) detections, extracts 512-dim
 ArcFace embeddings via InsightFace buffalo_l, and matches against known_faces.json.
 
 Architecture: same non-blocking queue pattern as NxApiClient / PoseWorker.

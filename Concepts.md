@@ -16,7 +16,7 @@ El video pasa por estos pasos en orden:
 | 2 | `nvv4l2decoder` | Decodifica el video en GPU (muy eficiente) |
 | 3 | `PeopleNet PGIE` | Detecta personas (y bolsas/caras) en cada frame — corre en GPU |
 | 4 | `NvTracker` | Asigna un `track_id` a cada persona y lo mantiene entre frames |
-| 5 | SGIEs opcionales | Clasifican sobre cada persona: edad/género (`gie-id=2`), cara (`gie-id=3`) |
+| 5 | SGIEs opcionales | Clasifican sobre cada persona: edad/género (`gie-id=2`). Las caras las detecta PeopleNet directamente (class 2) |
 | 6 | `nvvideoconvert` | Convierte el frame a formato RGBA para que Python pueda leerlo |
 | 7 | **Probe** | Aquí entra todo el código Python de analytics |
 
@@ -229,14 +229,14 @@ El `PoseWorker` aplica 3 reglas geométricas:
 
 ### Handler: Reconocimiento Facial
 
-Usa el **SGIE FaceDetectIR** (`gie-unique-id=3`) para detectar caras con alta precisión,
-luego `FaceRecognizer` (InsightFace ArcFace en Python) para identificarlas.
+Usa **PeopleNet class_id=2** (caras, detectadas por el mismo PGIE) — no hay SGIE adicional para caras.
+Luego `FaceRecognizer` (InsightFace ArcFace en Python) identifica a la persona.
 
-El flujo es más complejo porque opera sobre objetos del SGIE (caras), no del PGIE (personas):
+El probe recoge los objetos de cara directamente del PGIE y los pasa al handler:
 
 ```
-FaceDetectIR detecta una cara (bbox)
-  → _find_parent_track() → busca la persona que contiene esa cara
+PeopleNet emite un objeto con class_id=2 (cara)
+  → _find_parent_track() → busca la persona (class_id=0) que contiene esa cara
   → recortar crop de cara del frame full-res
   → enqueue al FaceRecognizer worker
   → (próximo frame) get_result → (nombre, similitud) o None
@@ -247,7 +247,7 @@ Los eventos son distintos por sector:
 - `comercio/industrial` → `employee_seen`, `employee_presence`, `employee_exit`
 - `hogar` → `known_person_seen`, `unknown_person_alert`, `known_person_exit`
 
-- Handler: [probes.py línea 1058](deploy/pipelines/probes.py#L1058)
+- Handler: [probes.py línea 1039](deploy/pipelines/probes.py#L1039)
 - Worker: [face_recognizer.py](deploy/pipelines/face_recognizer.py)
 - DB de caras: `deploy/known_faces.json` (generada con `register_face.py`)
 

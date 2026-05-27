@@ -190,7 +190,7 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
-## Auto-redescubrimiento de IP del DVR cuando cambia por DHCP
+## ~~Auto-redescubrimiento de IP del DVR cuando cambia por DHCP~~ ✅ IMPLEMENTADO (2026-05-26)
 
 **Descripción:** El DVR usa DHCP y cambia de IP cada vez que se reinicia o el router renueva el lease. Actualmente el técnico debe correr `nmap -p 554 192.168.10.0/24 --open` manualmente, actualizar `/etc/nx_dvr_ip` y reiniciar deepstream. Esto ocurrió el 2026-05-13 y el 2026-05-19. La solución automática haría que el pipeline detecte el fallo de todas las fuentes RTSP y reintente con la IP actualizada sin intervención humana.
 
@@ -290,6 +290,25 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 - **docker-entrypoint.sh:** la compilación de `custom_softmax_parser.so` ya no es necesaria si age_gender usa PAR worker en lugar de SGIE — hacerla condicional.
 - **Rollback:** `use_par_reid_filter=false` en config.yaml desactiva el filtro PAR sin tocar el OSNet ReID. El branch `feat/par-reid` no afecta `main`.
 - Esfuerzo estimado: 1 día de training/export en máquina dev + 2-3 días de integración en el pipeline.
+
+---
+
+## ~~Auto-recuperación cuando el DVR cambia de IP~~ ✅ IMPLEMENTADO (2026-05-26)
+
+**Descripción:** Cuando todos los streams RTSP fallan al arrancar (o todos mueren dentro de los primeros 30 s), `app.py` lanza automáticamente un ping sweep del subnet configurado para encontrar la nueva IP del DVR. Si la encuentra, actualiza `/etc/nx_dvr_ip` y reinicia el pipeline con la nueva dirección — sin intervención manual.
+
+**Por qué sería mejor:** En instalaciones de campo la IP del DVR puede cambiar por DHCP, cambio de router, o re-configuración del cliente. Hoy el pipeline queda corriendo vacío hasta que alguien lo detecta y actualiza `/etc/nx_dvr_ip` manualmente.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/app.py`
+- Sección / función: bus handler `_on_bus_message` + nueva función `_try_rediscover_dvr()`
+- Descripción: agregar lógica que cuente streams fallidos en los primeros 30 s; si todos fallan, llamar `identify_dvr.py` con el subnet derivado del IP actual del Jetson (via `ip route get 1`). Si se encuentra una nueva IP, escribir `/etc/nx_dvr_ip` y hacer `sys.exit(1)` para que el entrypoint reinicie el pipeline.
+
+**Tech stack propuesto:**
+- `identify_dvr.py` ya existente en `deploy/tools/`
+- Alternativa más rápida: `subprocess.run(["nmap", "-p", "554", subnet, "--open"])` — solo busca el host sin probar patrones RTSP (asume que el patrón del DVR no cambia, solo la IP)
+
+**Consideraciones:** `identify_dvr.py` tarda 2-5 min; la versión solo-nmap tarda ~15 s. Para runtime, preferir la versión rápida. Activar solo si el 100% de los streams fallan en los primeros 30 s (no activar por fallo de cámaras individuales). El subnet se puede derivar del `ip route` del Jetson sin configuración adicional.
 
 ---
 

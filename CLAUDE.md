@@ -136,8 +136,8 @@ Detecta cuando una persona cae al suelo mediante estimación de pose. Aplica 3 r
 - **Descarga:** automática vía `download_models.py` durante `setup.sh`
 
 ### Reconocimiento Facial (`face_recognition`) — ✅ Activo
-Identifica personas conocidas (empleados, residentes) a partir de una base de datos de embeddings faciales. Usa dos modelos en cadena: uno SGIE para detectar rostros con alta precisión, y un worker Python para extraer el embedding y compararlo con la DB. Requiere 3 coincidencias antes de bloquear la identidad por persona.
-- **Detección:** FaceDetect IR (TLT FP16, SGIE gie-id=3, opera sobre class=0 del PGIE)
+Identifica personas conocidas (empleados, residentes) a partir de una base de datos de embeddings faciales. Usa PeopleNet class 2 (face) para detectar rostros, luego un worker Python extrae el embedding y lo compara con la DB. Requiere 3 coincidencias antes de bloquear la identidad por persona. No hay SGIE dedicado para caras — el SGIE FaceDetectIR fue eliminado.
+- **Detección:** PeopleNet class_id=2 (face) — mismo PGIE que detecta personas, sin SGIE adicional
 - **Embedding:** InsightFace buffalo_l — ArcFace 512-dim, threshold similitud coseno ≥ 0.50
 - **Worker:** `FaceRecognizer` (Python thread)
 - **DB:** `known_faces.json` (nombre → lista de embeddings). Se genera con `register_face.py`
@@ -228,9 +228,8 @@ Herramienta de inspección remota para el equipo NX. Permite que cualquier miemb
 ### Modelos de inferencia
 | Modelo | Framework | Tarea | Activación |
 |--------|-----------|-------|------------|
-| **PeopleNet v2.3.4** | ONNX → TRT INT8 | Detección de personas, bolsas, rostros (PGIE) | Siempre activo |
+| **PeopleNet v2.3.4** | ONNX → TRT INT8 | Detección de personas, bolsas, rostros class 2 (PGIE) | Siempre activo |
 | **ResNet-18 Pedestrian Attributes** | ONNX → TRT FP16 | Clasificación edad/género (SGIE) | `age_gender` |
-| **FaceDetect IR** | TLT ETLT → TRT FP16 | Detección de rostros de alta precisión (SGIE) | `face_recognition` |
 | **InsightFace buffalo_l (ArcFace)** | ONNX (CPU/GPU) | Embeddings faciales 512-dim para re-ID | `face_recognition` |
 | **MoveNet SinglePose Lightning** | ONNX | Estimación de pose 17 keypoints, detección de caídas | `fall_detection` |
 | **OSNet-x0.25** | ONNX | Appearance vectors 512-dim para re-ID entre cámaras | Siempre activo (si existe) |
@@ -378,7 +377,7 @@ Criterios para evaluar nuevas tecnologías:
 Antes de implementar cualquier cambio, revisar:
 - **GPU memory**: ¿El nuevo modelo cabe junto con PeopleNet + tracker + SGIEs activos? (Orin Nano tiene 8GB unificados)
 - **NVDEC load**: ¿La resolución y cantidad de streams sigue dentro del límite documentado en `config_loader.py`?
-- **GIE unique IDs**: Cada nvinfer necesita un `gie-unique-id` único (1=PeopleNet, 2=AgeGender, 3=FaceDetectIR)
+- **GIE unique IDs**: Cada nvinfer necesita un `gie-unique-id` único (1=PeopleNet, 2=AgeGender; el 3 está reservado para uso futuro — FaceDetectIR fue eliminado)
 - **Track ID namespace**: Los `track_id` son locales por cámara; el triplete `(jetson_id, camera_id, track_id)` es el key global
 - **Queue sizes**: Los workers tienen queues con límite; agregar más workers reduce throughput disponible
 - **Docker image size**: Agregar dependencias pesadas al `Dockerfile.jetson` aumenta tiempo de rebuild en campo
@@ -600,7 +599,7 @@ El motor central de analytics. Contiene tres probes y sus helpers:
 - `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea). Con `NX_QA_ENABLED`: además publica a `nx:qa:apicalls` antes del POST.
 - `_AgeGenderHandler`: acumula 10 votes del SGIE antes de confirmar clasificación
 - `_FallDetectionHandler`: despacha crops al `PoseWorker`, aplica 3 reglas geométricas
-- `_FaceRecognitionHandler`: cruza detecciones del SGIE FaceDetectIR con el `FaceRecognizer`
+- `_FaceRecognitionHandler`: cruza detecciones de cara de PeopleNet (class_id=2) con el `FaceRecognizer`
 - `pre_tiler_analytics_probe`: **Probe A** (QA mode). Se conecta al src-pad de `caps_rgba` (RGBA full-res, batched). Gestiona todo el ciclo de vida de tracks, despacha handlers, llama `_update_fps_stats()`, escribe `_track_labels[track_id]` para Probe B. Lectura lazy del frame (solo cuando hay detecciones Y pixel workers activos).
 - `osd_sink_pad_buffer_probe`: dispatcher. En QA mode delega a `_qa_overlay_probe`; en producción delega a `_production_analytics_probe`.
 - `_qa_overlay_probe`: **Probe B** (QA mode, post-tiler). Lee frame tileado 640×360, dibuja bboxes de personas con labels de `_track_labels`, empuja frames a queues MJPEG, publica `nx:qa:detections`.
@@ -705,8 +704,7 @@ Script daemon instalado por `setup.sh` como servicio systemd `nx-dvr-watchdog` e
 - `config_infer.txt`: Config para SGIE de edad/género. `gie-unique-id=2`, FP16, opera sobre `class-ids=0` (personas) del PGIE.
 - `custom_softmax_parser.so`: Plugin C++ compilado por `docker-entrypoint.sh` para parsear salida softmax del clasificador.
 
-**`facedetect_ir/`**
-- `config_infer.txt`: Config para SGIE de detección de rostros de alta precisión. `gie-unique-id=3`, FP16, opera sobre class=0 del PGIE.
+**`facedetect_ir/`** — ⚠️ No usado actualmente. El SGIE FaceDetectIR fue eliminado; la detección de rostros usa PeopleNet class_id=2 directamente. El directorio y su `config_infer.txt` se conservan como referencia pero no se cargan en `app.py`.
 
 ---
 

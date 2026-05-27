@@ -818,7 +818,7 @@ These two systems are **independent** and **complementary**:
   - Typical threshold for positive ID: 0.45–0.50 (InsightFace default)
   - This value is **not comparable** to the OSNet similarity — different model, different distribution
 - **Does not run on strangers** in comercio/industrial — only in hogar (`unknown_person_alert`)
-- Requires face to be reasonably visible and ≥ 20×20 px after FaceDetectIR crops it
+- Requires face to be reasonably visible and ≥ 20×20 px (PeopleNet class 2 detection)
 
 ### OSNet — is this the same BODY I saw before?
 

@@ -18,9 +18,7 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 import pyds
-import dataclasses
 import json
-import math
 import queue
 import logging
 import threading
@@ -29,7 +27,7 @@ import uuid
 import base64
 import os
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -178,7 +176,6 @@ def _camera_id_for(pad_index: int) -> str:
 # ── GIE unique-ids ────────────────────────────────────────────────────────────
 PGIE_UNIQUE_ID: int      = 1   # PeopleNet
 SGIE_AGE_GENDER_ID: int  = 2   # ResNet-18 Pedestrian Attr
-SGIE_FACE_DETECT_ID: int = 3   # FaceDetectIR SGIE
 
 # ── PGIE class ids ────────────────────────────────────────────────────────────
 PGIE_CLASS_PERSON: int = 0
@@ -777,22 +774,6 @@ def _parse_age_gender(classifier_meta) -> Tuple[str, str, str, float]:
     return "", "", "", 0.0
 
 
-def _build_detection_dict(obj_meta) -> dict:
-    """Serializa un NvDsObjectMeta a un dict listo para JSON."""
-    r = obj_meta.rect_params
-    return {
-        "track_id": int(obj_meta.object_id),
-        "class_id": int(obj_meta.class_id),
-        "confidence": round(float(obj_meta.confidence), 3),
-        "bbox": {
-            "left":   int(r.left),
-            "top":    int(r.top),
-            "width":  int(r.width),
-            "height": int(r.height),
-        },
-    }
-
-
 def _set_osd_text(
     obj_meta,
     text: str,
@@ -1058,7 +1039,7 @@ class _FallDetectionHandler:
 class _FaceRecognitionHandler:
     """
     Face recognition via async FaceRecognizer (InsightFace ArcFace).
-    Receives face detections from FaceDetectIR SGIE (gie-id=3), crops face from
+    Receives face detections from PeopleNet class 2 (face), crops face from
     the full frame, enqueues for embedding extraction, and caches results per track.
 
     Emits sector-aware API events:
@@ -1066,7 +1047,7 @@ class _FaceRecognitionHandler:
       hogar               → known_person_seen / known_person_exit / unknown_person_alert
 
     This handler is NOT in _HANDLER_REGISTRY — it is dispatched separately via
-    _face_handler because it processes SGIE_FACE_DETECT_ID objects, not PGIE objects.
+    _face_handler because it processes PeopleNet face objects (class_id=2), not person objects.
     """
     PRESENCE_HEARTBEAT_SECS: float = 30.0
 
@@ -1092,7 +1073,7 @@ class _FaceRecognitionHandler:
         persons_meta: list,
         camera_id: str,
     ) -> None:
-        """Procesa una cara detectada por FaceDetectIR: extrae crop, encola al worker, emite eventos.
+        """Procesa una cara detectada por PeopleNet (class_id=2): extrae crop, encola al worker, emite eventos.
 
         Flujo:
         1. Filtrar por confianza mínima (FACE_DET_CONFIDENCE_THRESHOLD).
@@ -1333,8 +1314,8 @@ def init_handlers(pipeline_capabilities: List[str]) -> None:
     """Instancia y registra los handlers activos según las capacidades del pipeline.
 
     _active_handlers es la lista que el probe itera por cada persona detectada.
-    _face_handler se maneja por separado porque procesa objetos SGIE_FACE_DETECT_ID,
-    no objetos PGIE del loop principal de personas.
+    _face_handler se maneja por separado porque procesa detecciones de cara de PeopleNet
+    (class_id=2), no objetos de persona del loop principal.
 
     Se conecta cada handler con su worker correspondiente (ej. FallDetection → PoseWorker).
     """
@@ -2284,265 +2265,5 @@ def _production_analytics_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
                 "gender_female": 0, "age_gender_classes": {},
             }
             _analytics_last_sent[pad_index] = now
-
-    return Gst.PadProbeReturn.OK
-
-    for frame_meta in _iter_pyds_list(
-        batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
-    ):
-        frame_num = frame_meta.frame_num
-        pad_index = frame_meta.pad_index
-        camera_id = _camera_id_for(pad_index)
-        is_entry_exit_cam = pad_index in _entry_exit_pads
-
-        frame_np = None
-        try:
-            n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
-            frame_np = np.array(n_frame, copy=True, order='C')
-            frame_np = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGR)
-        except Exception as e:
-            if frame_num % 30 == 0:
-                logger.warning("get_nvds_buf_surface falló frame=%d: %s", frame_num, e)
-
-        # QA: guardar el primer frame válido como referencia del tiled frame
-        if _IS_QA_ENABLED and frame_np is not None and _qa_frame_bgr is None:
-            _qa_frame_bgr = frame_np.copy()
-
-        # ── First pass: collect persons and face detections ───────────────────
-        persons_meta: List = []
-        face_metas: List   = []
-        for obj_meta in _iter_pyds_list(
-            frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast
-        ):
-            uid = obj_meta.unique_component_id
-            if (uid == PGIE_UNIQUE_ID
-                    and obj_meta.confidence >= OSD_CONFIDENCE_THRESHOLD
-                    and int(obj_meta.class_id) == PGIE_CLASS_PERSON):
-                persons_meta.append(obj_meta)
-            elif (uid == PGIE_UNIQUE_ID
-                    and int(obj_meta.class_id) == PGIE_CLASS_FACE):
-                face_metas.append(obj_meta)
-
-        # ── Face recognition: process PeopleNet face detections (class 2) ────
-        if _face_handler and face_metas and frame_np is not None:
-            if _is_capability_active("face_recognition"):
-                for face_obj_meta in face_metas:
-                    _face_handler.process_face(
-                        face_obj_meta, frame_num, frame_np, persons_meta, camera_id
-                    )
-
-        # ── Second pass: process each person ─────────────────────────────────
-        visible_ids: Set[int] = set()
-        for obj_meta in persons_meta:
-            p_track_id = int(obj_meta.object_id)
-            visible_ids.add(p_track_id)
-            r = obj_meta.rect_params
-            bbox = {
-                "left":   max(0, int(r.left)),
-                "top":    max(0, int(r.top)),
-                "width":  int(r.width),
-                "height": int(r.height),
-            }
-
-            track_key = (pad_index, p_track_id)
-            now = time.monotonic()
-
-            # ── Track entry ───────────────────────────────────────────────────
-            if track_key not in _active_tracks:
-                _active_tracks[track_key] = _TrackState(
-                    first_frame=frame_num,
-                    last_frame=frame_num,
-                    first_ts=now,
-                    camera_id=camera_id,
-                    is_entry_exit_cam=is_entry_exit_cam,
-                )
-                api_client.post_person_entry(
-                    camera_id, p_track_id, bbox,
-                    float(obj_meta.confidence), is_entry_exit_cam,
-                )
-                _get_analytics(pad_index)["person_count"] += 1
-            else:
-                _active_tracks[track_key].last_frame = frame_num
-
-            # ── AppearanceWorker: send appearance vector when ready ────────────
-            if _appearance_worker is not None:
-                state = _active_tracks[track_key]
-                if not state.appearance_sent:
-                    vec = _appearance_worker.get_result(p_track_id)
-                    if vec is not None:
-                        api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
-                        state.appearance_sent = True
-                # Enqueue crop for appearance extraction every 15 frames
-                if (frame_np is not None
-                        and frame_num % 15 == 0
-                        and not state.appearance_sent
-                        and bbox["width"] >= CROP_MIN_WIDTH
-                        and bbox["height"] >= CROP_MIN_HEIGHT):
-                    crop = frame_np[
-                        bbox["top"]:bbox["top"] + bbox["height"],
-                        bbox["left"]:bbox["left"] + bbox["width"],
-                    ]
-                    if crop.size > 0:
-                        _appearance_worker.enqueue(crop, p_track_id, frame_num)
-
-            _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
-
-            # ── Active handlers ───────────────────────────────────────────────
-            _qa_fall = False
-            for handler in _active_handlers:
-                # QA capability toggle: skip handler si está apagado en la UI
-                if not _is_capability_active(getattr(handler, "_cap_name", "")):
-                    continue
-                result = handler.process(obj_meta, frame_num, frame_np=frame_np)
-                if result is None:
-                    continue
-                if result.osd_text:
-                    _set_osd_text(obj_meta, result.osd_text, border_color=result.border_color)
-                if result.event_type == "person_classified":
-                    api_client.post_person_classified(
-                        camera_id, p_track_id, bbox, result.det_extra.get("demographics", {})
-                    )
-                    an = _get_analytics(pad_index)
-                    au = result.analytics_update
-                    if "age_gender_classes" in au:
-                        lbl = au["age_gender_classes"]
-                        an["age_gender_classes"][lbl] = an["age_gender_classes"].get(lbl, 0) + 1
-                    if "gender_key" in au:
-                        an[au["gender_key"]] += 1
-                elif result.event_type == "fall_detected":
-                    _qa_fall = True
-                    api_client.post_fall_detected(
-                        camera_id, p_track_id, bbox,
-                        result.det_extra.get("fall_score", 0),
-                        result.det_extra.get("avg_kp_conf", 0.0),
-                    )
-
-            # ── Face identity OSD overlay ─────────────────────────────────────
-            if _face_handler:
-                identity = _face_handler.get_identity(p_track_id)
-                if identity:
-                    name, conf = identity
-                    if name != "Desconocido":
-                        cur = obj_meta.text_params.display_text or f"P#{p_track_id}"
-                        _set_osd_text(
-                            obj_meta,
-                            f"{cur} | {name} {conf:.0%}",
-                            border_color=(0.2, 1.0, 0.4, 1.0),
-                        )
-
-            # ── QA: registrar track con label final (después de todos los handlers) ──
-            if _IS_QA_ENABLED:
-                _qa_all_tracks.append({
-                    "pad_index": pad_index,
-                    "channel_id": camera_id,
-                    "track_id": p_track_id,
-                    "confidence": round(float(obj_meta.confidence), 3),
-                    "bbox_tiled": (bbox["left"], bbox["top"], bbox["width"], bbox["height"]),
-                    "label": str(obj_meta.text_params.display_text or f"P#{p_track_id}"),
-                    "fall": _qa_fall,
-                })
-
-            # ── Crop capture for dataset (always active) ──────────────────────
-            if frame_np is not None:
-                last_crop = _crop_last_frame.get(p_track_id, -CROP_SAMPLE_INTERVAL)
-                count = _crop_counts.get(p_track_id, 0)
-                if (count < CROP_MAX_PER_PERSON
-                        and (frame_num - last_crop) >= CROP_SAMPLE_INTERVAL
-                        and bbox["height"] >= CROP_MIN_HEIGHT
-                        and bbox["width"] >= CROP_MIN_WIDTH):
-                    crop = frame_np[
-                        bbox["top"]:bbox["top"] + bbox["height"],
-                        bbox["left"]:bbox["left"] + bbox["width"],
-                    ]
-                    if crop.size > 0:
-                        _save_and_send_crop(
-                            crop, camera_id, p_track_id, frame_num, bbox,
-                        )
-                        _crop_counts[p_track_id] = count + 1
-                        _crop_last_frame[p_track_id] = frame_num
-
-        # ── Expire lost tracks ────────────────────────────────────────────────
-        _expire_lost_tracks(pad_index, frame_num, visible_ids)
-
-        # ── Reference frame for heatmap ───────────────────────────────────────
-        if (not _reference_frame_sent.get(pad_index, False)
-                and frame_np is not None
-                and len(visible_ids) == 0
-                and frame_meta.num_obj_meta == 0):
-            h, w = frame_np.shape[:2]
-            _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            frame_b64 = base64.b64encode(buf).decode("utf-8")
-            api_client.post_reference_frame(camera_id, frame_num, frame_b64, w, h)
-            _reference_frame_sent[pad_index] = True
-            logger.info("Frame de referencia enviado camera=%s (frame=%d, %dx%d)",
-                        camera_id, frame_num, w, h)
-
-        # ── Position snapshot (WebSocket) ─────────────────────────────────────
-        if _ws_client is not None and visible_ids and frame_np is not None:
-            fh, fw = frame_np.shape[:2]
-            _accumulate_positions(pad_index, camera_id, persons_meta, fw, fh, frame_num)
-
-        # ── Analytics snapshot ────────────────────────────────────────────────
-        now = time.monotonic()
-        if now - _get_analytics_last_sent(pad_index) >= ANALYTICS_SEND_INTERVAL_SECS:
-            an = _get_analytics(pad_index)
-            api_client.post_analytics_snapshot(camera_id, {
-                "people_count":       an["person_count"],
-                "gender_male":        an["gender_male"],
-                "gender_female":      an["gender_female"],
-                "age_gender_classes": an["age_gender_classes"],
-            }, period_seconds=ANALYTICS_SEND_INTERVAL_SECS)
-            _analytics[pad_index] = {
-                "person_count": 0, "gender_male": 0,
-                "gender_female": 0, "age_gender_classes": {},
-            }
-            _analytics_last_sent[pad_index] = now
-
-    # ── QA: overlays + MJPEG frames + Redis detections ───────────────────────
-    if _IS_QA_ENABLED and _qa_frame_bgr is not None:
-        # Dibujar bboxes y labels sobre el frame tileado
-        try:
-            _draw_qa_overlays(_qa_frame_bgr, _qa_all_tracks)
-        except Exception as _e:
-            logger.debug("[QA] overlay error: %s", _e)
-
-        # Tiled frame completo → /stream/all
-        try:
-            tiled_frame_queue.put_nowait(_qa_frame_bgr.copy())
-        except queue.Full:
-            pass
-
-        # Crops por cámara → /stream/<camera_id> (todas, con o sin detecciones)
-        for pad_idx, _ch_num in _channel_map.items():
-            cam_id = _camera_id_for(pad_idx)
-            q = camera_frame_queues.get(cam_id)
-            if q is None:
-                continue
-            ox = (pad_idx % _qa_tiler_cols) * _qa_cell_w
-            oy = (pad_idx // _qa_tiler_cols) * _qa_cell_h
-            if (oy + _qa_cell_h <= _qa_frame_bgr.shape[0]
-                    and ox + _qa_cell_w <= _qa_frame_bgr.shape[1]):
-                crop = _qa_frame_bgr[oy:oy + _qa_cell_h, ox:ox + _qa_cell_w].copy()
-                try:
-                    q.put_nowait(crop)
-                except queue.Full:
-                    pass
-
-        # Publicar detecciones a Redis (agrupadas por cámara)
-        if _qa_all_tracks:
-            by_cam: Dict[str, List] = {}
-            for t in _qa_all_tracks:
-                by_cam.setdefault(t["channel_id"], []).append({
-                    "track_id": t["track_id"],
-                    "confidence": t["confidence"],
-                    "label": t["label"],
-                    "fall": t["fall"],
-                })
-            for cam_id, tracks in by_cam.items():
-                _qa_publish("nx:qa:detections", {
-                    "cam": cam_id,
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "tracks": tracks,
-                })
 
     return Gst.PadProbeReturn.OK

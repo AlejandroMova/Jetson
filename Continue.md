@@ -1,100 +1,82 @@
-# Continue — Sesión 2026-05-18
+# Continue.md — 2026-05-25
 
-Documento de continuidad para la próxima sesión de Claude. Resume el trabajo realizado, el estado actual, y lo que falta verificar.
-
----
-
-## Qué se hizo en esta sesión
-
-### 1. Diagnóstico del QA Visual — output mal interpretado
-
-El usuario veía en la QA app números como `419481+0 · ch09` y pensaba que eran track IDs cambiando. **Diagnóstico:** esos números son los microsegundos del timestamp (`datetime.isoformat()[-12:-4]`), no track IDs. Los track IDs reales son `P#0`, `P#1`, etc. (locales por cámara). No había ningún bug.
-
-### 2. Implementación del ReID Manager local
-
-Se decidió mover el cross-camera re-ID del backend al Jetson para:
-- Detectar si una persona es nueva vs. regresó vs. cambió de cámara
-- Persistir identidades 1 hora (TTL)
-- Evitar double-counting sin depender de latencia de red
-
-**Archivos creados:**
-- `deploy/pipelines/reid_manager.py` — nuevo. DB en memoria + JSON persistente (`deploy/reid_db.json`). `match_or_create(embedding, camera_id)` retorna `(global_id, event_type, prev_camera_id)`.
-
-**Archivos modificados:**
-- `deploy/pipelines/probes.py`:
-  - `_TrackState`: 5 campos nuevos (`entry_emitted`, `entry_deadline`, `global_id`, `pending_bbox`, `pending_conf`)
-  - `post_person_entry`: agrega `global_id` y `entry_type: "new"/"return"`
-  - `post_person_channel_change`: método nuevo
-  - `post_person_exit`: agrega `global_id`
-  - `init_workers` / `stop_workers`: crea/flush ReIdManager
-  - `_expire_lost_tracks`: maneja entries diferidas
-  - `_handle_appearance_reid`: helper nuevo, unifica lógica de AppearanceWorker + ReID para ambos probes
-  - Ambos probes (QA + producción): entry diferida hasta que embedding esté listo (deadline 90 frames)
-  - Probe B: muestra `global_id` en label QA (`P#4·a3f2b1`)
-  - Probe A: escribe `global_id` a `_track_labels`
-
-**Lógica de eventos:**
-| Caso | Evento |
-|---|---|
-| Primera vez visto | `person_entry` + `entry_type: "new"` |
-| Mismo global_id, ausente > 5 min | `person_entry` + `entry_type: "return"` |
-| Mismo global_id, ausente ≤ 5 min | `person_channel_change` + `prev_camera_id` |
-| Sin OSNet model | comportamiento anterior: entry inmediato, `post_person_appearance` al backend |
-
-### 3. Ajustes de parámetros (ReID no funcionaba visualmente)
-
-**Problemas encontrados y corregidos:**
-
-| Problema | Antes | Después |
-|---|---|---|
-| Threshold demasiado alto para CCTV real | `SIMILARITY_THRESHOLD=0.65` | `0.55` en `reid_manager.py` |
-| Crop mínimo muy grande para sub-streams | `CROP_MIN_HEIGHT=128` | `96` en `probes.py` |
-| Crop mínimo ancho | `CROP_MIN_WIDTH=64` | `48` en `probes.py` |
-| Sin feedback visual en QA | label `P#4` | label `P#4·a3f2b1` (global_id[:6]) |
-| Sin diagnóstico en logs | — | `logger.info("ReID track=%d cam=%s → %s gid=%s", ...)` |
-
----
+## Qué estábamos haciendo exactamente
+- Implementar el sistema de grabación QA + biblioteca de clips + modo playback (plan completo en `/home/alex/.claude/plans/hola-claude-este-es-mellow-hinton.md`)
+- Al final de la sesión: descubierto que el DVR en `192.168.10.17` no responde (cambió de IP o está apagado). El pipeline arranca bien pero sin video.
+- Pendiente implementar: auto-recuperación cuando el DVR cambia de IP (documentado en Future.md).
 
 ## Estado actual
+**Qué funciona:**
+- `recording_manager.py` — grabación automática de clips cuando se detectan personas (IDLE → RECORDING → IDLE)
+- `mjpeg_server.py` — pasa frames al RecordingManager vía `push_tiled_frame()`
+- `probes.py` — Probe A y production probe llaman `notify_detection()` y `push_camera_frame()` al RecordingManager
+- `app.py` — instancia RecordingManager cuando `cfg.recording_enabled or _IS_QA_ENABLED`; detecta modo playback via GLib.timeout cada 5 s; sale con código 42 para señalizar cambio a playback
+- `docker-entrypoint.sh` — loop live/playback en QA mode; playback corre `app_video_testing.py --input <path> --no-loop`
+- `app_video_testing.py` — acepta `--input` y `--no-loop`
+- `docker-compose.qa.yml` — YAML correcto (un solo bloque `deepstream` con `environment` + `volumes`)
+- `docker-compose.yml` — volumen `./recordings:/nx_tech/recordings` agregado al servicio `deepstream` de producción
+- `config_loader.py` — campo `recording_enabled: bool = False` en `ClientConfig`
+- `streamlit_app.py` — tab "📹 Grabaciones" con lista de clips, preview, inferencia, eliminar; toggle `recording_enabled` en sidebar config editor; sidebar muestra estado de grabación/playback
+- `recordings/.gitkeep` — directorio trackeado en git
 
-### Código — listo para prueba
-- `reid_manager.py`: sintaxis OK, lógica completa
-- `probes.py`: sintaxis OK, ambos probes actualizados
+**Qué no funciona / está roto:**
+- DVR en `192.168.10.17` no responde (ping falla). El Jetson está en `192.168.10.183`, subnet `192.168.10.0/24`. Sin video en el MJPEG porque no entran frames RTSP.
+- No hay auto-recuperación de IP del DVR — pendiente implementar (ver Future.md y próximos pasos).
 
-### Pendiente — verificar en Jetson
-El pipeline **no se levantó en esta sesión**. Hay que:
+## Decisiones tomadas y por qué
+- **RecordingManager NO usa Redis pub/sub como trigger:** los probes llaman `notify_detection()` directamente, lo que funciona tanto en QA como en producción (en producción no hay Redis QA).
+- **`tiled.mp4` solo en QA:** el tiler no existe en producción, así que en producción solo se graban los `<cam_id>.mp4` full-res.
+- **`recording_enabled` en config.yaml, no en docker-compose:** el usuario no quiere editar docker-compose en campo porque puede romper cosas. La config es editable desde el QA dashboard sin reiniciar containers.
+- **`recording_enabled` publicado en `nx:qa:status`:** para que el dashboard Streamlit pueda inicializar el toggle con el valor actual del pipeline.
 
-1. Desplegar los cambios al Jetson
-2. Confirmar en logs que el ReID está activo:
-   ```
-   ReIdManager active — DB: /app/reid_db.json   ← bueno
-   OSNet model not found at ...                  ← problema
-   ```
-3. El modelo OSNet **existe** en el Jetson (`models/osnet/osnet_x0_25_market1501.onnx`, 830KB + 765KB).
-4. En el QA visual, buscar sufijos `·xxxxxx` en los labels de bounding boxes.
-5. En logs, buscar líneas `ReID track=X cam=chYY → channel_change gid=... prev=...` al moverse entre cámaras.
+## Qué intentamos que NO funcionó
+- **Doble bloque `deepstream` en docker-compose.qa.yml:** agregamos el volumen en un segundo bloque `deepstream` separado, lo que causó error YAML "mapping key already defined". Solución: fusionar ambos en un solo bloque.
 
-### Si el ReID aún no matchea tras los ajustes
-- Bajar threshold a `0.45` en `reid_manager.py` (`SIMILARITY_THRESHOLD`)
-- Revisar si las cámaras tienen ángulos muy distintos (el modelo fue entrenado en vistas laterales/frontales)
-- Considerar reemplazar OSNet-x0.25 por OSNet-x1.0 (más grande, mejor accuracy) — ver `Future.md`
+## Próximos pasos concretos
+1. **Implementar auto-recuperación DVR** (está en Future.md — el usuario confirmó que quiere esto):
+   - En `deploy/pipelines/app.py`: llevar la cuenta de streams RTSP fallidos en `_on_bus_message`. Si todos fallan dentro de los primeros 30 s de pipeline en PLAYING → ejecutar `nmap -p 554 <subnet> --open` (subnet derivado de IP del Jetson con `ip route get 8.8.8.8`). Si encuentra una IP diferente a la actual → escribir en `/etc/nx_dvr_ip` → `sys.exit(1)` para que el entrypoint reinicie el pipeline.
+   - No activar por fallas individuales — solo si el 100% de los streams falla.
+2. **Encontrar el DVR manualmente en lo que se implementa el punto 1:**
+   - Dentro del Jetson: `nmap -p 554 192.168.10.0/24 --open -oG - | grep "/open"`
+   - Actualizar: `echo "192.168.10.XX" | sudo tee /etc/nx_dvr_ip && ./qa.sh stop && ./qa.sh`
+3. **Probar el flujo de grabación end-to-end** cuando el DVR esté disponible: verificar que se creen clips en `/nx_tech/recordings/`, que aparezcan en la tab Grabaciones con thumbnail y metadata, y que el botón "▶ Correr Inferencia" reinicie el pipeline en modo playback.
 
----
+## Parámetros y valores concretos en juego
+- DVR IP configurada: `192.168.10.17` (en `/etc/nx_dvr_ip` y `config.yaml`)
+- Jetson IP: `192.168.10.183`
+- Subnet correcto para scan: `192.168.10.0/24`
+- Directorio de grabaciones: `/nx_tech/recordings` (bind mount `./recordings:/nx_tech/recordings`)
+- Cooldown grabación: 10 s sin detecciones → cierra clip
+- Duración mínima: 5 s (clips más cortos se descartan)
+- Duración máxima: 5 min
+- Auto-prune: elimina clips más antiguos cuando total > 10 GB
+- Exit code 42: señal de `app.py` al entrypoint para cambiar a modo playback
 
-## Archivos clave tocados en esta sesión
+## Error / síntoma actual
+```
+RTSP 'source-0' failed: gst-resource-error-quark: Could not open resource for reading and writing. (7) — pipeline continues.
+[... mismo error para source-0 a source-15 ...]
+```
+El pipeline arranca, el MjpegServer levanta en :8080, pero sin frames porque el DVR no responde.
 
-| Archivo | Qué cambió |
-|---|---|
-| `deploy/pipelines/reid_manager.py` | **Nuevo** — ReID DB local |
-| `deploy/pipelines/probes.py` | `_TrackState`, API methods, workers, ambos probes, helper |
-| `CLAUDE.md` | Actualizado: sección Re-ID, archivo `reid_manager.py` en descripción |
+## Archivos modificados sin commitear
+- `deploy/pipelines/recording_manager.py` — nuevo archivo (completo)
+- `deploy/pipelines/mjpeg_server.py` — agrega `recorder` parameter + `push_tiled_frame()` en encode loop
+- `deploy/pipelines/probes.py` — agrega `_recording_manager` global + `notify_detection()` + `push_camera_frame()` en Probe A y production probe
+- `deploy/pipelines/app.py` — instancia RecordingManager, lo pasa a MjpegServer, agrega GLib.timeout para playback mode, publica `recording_enabled` en nx:qa:status
+- `deploy/pipelines/config_loader.py` — agrega `recording_enabled: bool = False` a ClientConfig
+- `deploy/pipelines/app_video_testing.py` — agrega `--input` y `--no-loop` args
+- `deploy/docker-entrypoint.sh` — loop live/playback en QA mode
+- `deploy/docker-compose.yml` — volumen recordings en deepstream
+- `deploy/docker-compose.qa.yml` — YAML corregido, volumen recordings en deepstream
+- `deploy/qa_app/streamlit_app.py` — tab Grabaciones + toggle recording_enabled en config editor + indicador estado sidebar
+- `deploy/recordings/.gitkeep` — nuevo (directorio trackeado)
+- `CLAUDE.md` — actualizado (RecordingManager, config_loader, streamlit_app, docker-compose.qa)
+- `Future.md` — entrada auto-recuperación DVR agregada
 
----
-
-## Contexto de conversación relevante
-
-- El usuario usa el Jetson en `~/dev/NX-JETSON/deploy` (no `NX_tech/deploy`)
-- El pipeline corre con sub-streams DVR (960×544) en configuración multi-cámara
-- La QA app está activa vía `./qa.sh` y accede vía Tailscale
-- El modelo OSNet está descargado y presente en el Jetson
-- El container se llama `deepstream` (docker compose)
+## Archivos y secciones que estábamos modificando
+| Archivo | Función / sección | Qué se estaba cambiando |
+|---------|-------------------|-------------------------|
+| `deploy/pipelines/app.py` | bloque QA setup (~líneas 292–320) | RecordingManager + publicar recording_enabled en nx:qa:status |
+| `deploy/qa_app/streamlit_app.py` | config editor sidebar (~líneas 460–520) | toggle recording_enabled + reset list |
+| `Future.md` | nueva entrada | auto-recuperación DVR |
