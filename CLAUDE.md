@@ -278,6 +278,7 @@ Checklist para este cambio:
 - [ ] Regla 11: ¿Hay mejoras futuras que registrar en Future.md? → [sí/no]
 - [ ] Regla 12: ¿Cambia algún payload, endpoint o evento de API? → [sí/no — actualizar APIBackend.md]
 - [ ] Regla 14: ¿El código nuevo/modificado tiene docstrings + comentarios en bloques y líneas importantes? → [verificar antes de dar la tarea por terminada]
+- [ ] Regla 15: ¿Cambia el flujo general, un handler, un worker, o el pipeline? → [actualizar Concepts.md]
 ```
 
 **Las reglas 9 y 2 (post) son obligatorias en todo cambio que modifique comportamiento, constantes, flujos o archivos** — no dependen de juicio del agente. Si el cambio fue pequeño y ninguna descripción en CLAUDE.md ni README.md quedó desactualizada, indicarlo explícitamente ("sin cambios necesarios en documentación porque X").
@@ -560,6 +561,28 @@ Cuando el usuario diga "escribe un Continue.md" (o variantes como "crea el Conti
 
 **Esta regla aplica tanto al código nuevo como al código modificado.** No es necesario documentar retroactivamente el código que no se tocó en la sesión actual.
 
+### 15. Mantener `Concepts.md` actualizado cuando cambia la estructura general
+
+`Concepts.md` (en la raíz del repo) es la guía de lectura del código — explica el flujo de datos,
+el ciclo de vida de los tracks, el patrón worker, y cómo funciona cada detección.
+
+**Actualizar `Concepts.md` cuando ocurra cualquiera de estos cambios:**
+- Se agrega o elimina un handler (`_AgeGenderHandler`, `_FallDetectionHandler`, etc.)
+- Se agrega o elimina un worker async (`PoseWorker`, `AppearanceWorker`, etc.)
+- Cambia el flujo del pipeline GStreamer (nuevo elemento, cambio de probe, QA mode)
+- Cambia cómo se emiten eventos al backend (nuevo tipo de evento, nueva lógica de ReID)
+- Cambia el sistema de paquetes/capacidades (nuevo paquete, nueva capacidad)
+- Cambia cómo funciona Redis en QA mode (nueva key, nuevo canal pub/sub)
+- Cambia el flujo de instalación en campo (setup.sh, identify_dvr.py, probe_cameras.py)
+
+**Lo que NO requiere actualizar `Concepts.md`:**
+- Cambios en umbrales o constantes (eso va en CLAUDE.md y README.md)
+- Cambios internos de implementación que no afectan el flujo visible desde afuera
+- Fixes de bugs que no cambian el comportamiento descrito
+
+**Formato:** mantener el mismo estilo — explicación conceptual en prosa + links a archivos con
+`[nombre](ruta#Llinea)` para que sean clickables desde el IDE.
+
 ---
 
 ## Descripción Detallada de Archivos
@@ -665,6 +688,9 @@ CLI para enrolamiento de rostros en la DB local. Acepta imágenes individuales, 
 
 **`test_rtsp.py`** (~2 KB)
 Test rápido de conectividad RTSP. Útil para verificar credenciales DVR antes de despliegue completo.
+
+**`dvr_watchdog.sh`** (~80 líneas)
+Script daemon instalado por `setup.sh` como servicio systemd `nx-dvr-watchdog` en el host del Jetson (fuera de Docker). Cada 10 s revisa `docker logs --since 30s deepstream` buscando el patrón `RTSP 'source-N' failed`. Cuando todos los streams configurados fallan dentro de esa ventana de 30 s, ejecuta `nmap -p 554 <subred>/24 --open -T4` para encontrar el DVR en su nueva IP. Si la encuentra: escribe la nueva IP en `/etc/nx_dvr_ip` y corre `docker restart deepstream`. Si no encuentra nada: espera 300 s (COOLDOWN) y reintenta. Al instalar, `setup.sh` sustituye el placeholder `@@WORK_DIR@@` con la ruta real del repo. Logs: `journalctl -u nx-dvr-watchdog -f`.
 
 ---
 
