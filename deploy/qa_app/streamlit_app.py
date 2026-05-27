@@ -524,11 +524,11 @@ with st.sidebar:
 
         # ── Actions ───────────────────────────────────────────────────────────
         st.caption("🔄 Paquete, Stream, Tracker, Canales, PGIE/SGIE y DVR requieren reinicio.")
-        if st.button("💾 Guardar en config.yaml", use_container_width=True,
+        if st.button("💾 Guardar en config.yaml", width="stretch",
                      type="primary", key="btn_save_config", disabled=(_r is None)):
             _ok, _msg = _save_config_yaml()
             st.session_state["_save_result"] = (_ok, _msg)
-        if st.button("↺ Recargar del pipeline", use_container_width=True,
+        if st.button("↺ Recargar del pipeline", width="stretch",
                      key="btn_reset_config", disabled=not status,
                      help="Descarta cambios y recarga los valores actuales del pipeline"):
             if _r:
@@ -698,7 +698,7 @@ with tab_recordings:
 
                 with col_thumb:
                     if thumb_path.exists():
-                        st.image(str(thumb_path), use_container_width=True)
+                        st.image(str(thumb_path), width="stretch")
                     else:
                         st.caption("Sin thumbnail")
 
