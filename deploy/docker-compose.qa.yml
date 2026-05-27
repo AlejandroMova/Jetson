@@ -20,6 +20,7 @@ services:
     ports:
       - "8501:8501"
     volumes:
+      - ./qa_app:/app          # hot-reload: cambios en qa_app/ no requieren rebuild
       - ./clients:/nx_tech/clients
       - ./recordings:/nx_tech/recordings
     environment:
