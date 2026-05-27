@@ -82,10 +82,8 @@ class FaceRecognizer:
     # ── Worker thread ─────────────────────────────────────────────────────────
 
     def _worker_loop(self):
-        """Loop principal del hilo worker: consume la cola y acumula votos de identidad.
-
-        Usa get(timeout=1.0) para no bloquearse indefinidamente y poder detectar _running=False.
-        Cada item procesado llama a _process(), que internamente aplica el sistema de votos.
+        """Main worker loop: consumes the queue and accumulates identity votes.
+        Uses get(timeout=1.0) to remain responsive to _running=False without blocking indefinitely.
         """
         if self._app is None:
             logger.error("FaceRecognizer: failed to load InsightFace — worker inactive.")
@@ -97,8 +95,9 @@ class FaceRecognizer:
             except queue.Empty:
                 continue
             if item is None:
-                break  # sentinel enviado por stop()
-            face_crop, track_id, frame_num, camera_id = item
+                break  # sentinel sent by stop()
+            # NOTE: _camera_id reserved for future per-camera routing — not yet wired to _process.
+            face_crop, track_id, frame_num, _camera_id = item
             try:
                 self._process(face_crop, track_id)
             except Exception as e:
@@ -170,7 +169,7 @@ class FaceRecognizer:
         # Comparar con la DB y obtener el mejor match
         name, sim = self._match(emb)
         if name is None:
-            name = "Desconocido"  # por debajo del threshold → cara desconocida
+            name = "Unknown"  # below threshold — unrecognised face
 
         with self._lock:
             if track_id in self._locked:

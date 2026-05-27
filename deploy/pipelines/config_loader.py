@@ -196,6 +196,13 @@ def _read_etc_file(path: str, env_var: str, label: str) -> str:
         )
 
 
+def _parse_channel_list(value) -> List[int]:
+    """Normalise a channel list from config.yaml — accepts a Python list or a comma-separated string."""
+    if isinstance(value, str):
+        return [int(x.strip()) for x in value.split(",") if x.strip()]
+    return list(value)
+
+
 def load_config() -> ClientConfig:
     """
     Load and merge all config sources for the active client.
@@ -291,13 +298,8 @@ def load_config() -> ClientConfig:
     else:
         sector = cfg.get("sector", "comercio")
 
-    entry_exit_channels = cfg.get("entry_exit_channels", [])
-    if isinstance(entry_exit_channels, str):
-        entry_exit_channels = [int(x.strip()) for x in entry_exit_channels.split(",") if x.strip()]
-
-    external_channels = cfg.get("external_channels", [])
-    if isinstance(external_channels, str):
-        external_channels = [int(x.strip()) for x in external_channels.split(",") if x.strip()]
+    entry_exit_channels = _parse_channel_list(cfg.get("entry_exit_channels", []))
+    external_channels   = _parse_channel_list(cfg.get("external_channels",   []))
     count_internal = bool(cfg.get("count_internal", True))
     count_external = bool(cfg.get("count_external", True))
 
