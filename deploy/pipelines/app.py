@@ -96,6 +96,92 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _apply_pgie_overrides(original_path: str, cfg) -> str:
+    """Return a path to a (possibly modified) nvinfer config for the PGIE.
+
+    DeepStream reads the nvinfer config from a file — there is no GStreamer property
+    to override per-class-attrs at runtime. To support per-client tuning from config.yaml
+    without modifying the shared nvinfer_config.txt, this function generates a
+    temporary copy with the overridden values substituted in [class-attrs-all].
+
+    If no overrides are set in config.yaml, the original file path is returned as-is
+    and no file is written (zero overhead for the common case).
+
+    The temp file at /tmp/ persists for the lifetime of the process — it is NOT cleaned
+    up on exit because DeepStream holds an open reference to it while the pipeline runs.
+
+    Overridable parameters (set in config.yaml as pgie_topk / pgie_nms_iou_threshold /
+    pgie_pre_cluster_threshold):
+      - topk: max detections per inference frame. Raise if >20 people in scene.
+      - nms-iou-threshold: two boxes with IoU > this are merged into one.
+                           Lower it (e.g. 0.3) so adjacent people aren't collapsed.
+      - pre-cluster-threshold: minimum confidence a box must have before NMS.
+                               Lower it (e.g. 0.2) to catch occluded / low-confidence people.
+    """
+    # Determine if there are any overrides to apply
+    has_overrides = (
+        cfg.pgie_topk > 0
+        or cfg.pgie_nms_iou_threshold >= 0.0
+        or cfg.pgie_pre_cluster_threshold >= 0.0
+    )
+    if not has_overrides:
+        # No overrides → use the original file directly; nothing to write
+        return original_path
+
+    import tempfile
+
+    # ── Parse the original config line by line ────────────────────────────────
+    # We can't use configparser because it doesn't preserve comments and nvinfer
+    # is picky about the exact format of its config file.
+    lines = Path(original_path).read_text().splitlines()
+    in_class_attrs = False  # flag: are we inside [class-attrs-all] right now?
+    result = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Detect section headers like [property] or [class-attrs-all]
+        if stripped.startswith("["):
+            in_class_attrs = stripped == "[class-attrs-all]"
+            result.append(line)
+            continue
+
+        # Only substitute non-comment key=value lines inside [class-attrs-all]
+        if in_class_attrs and "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0].strip()
+
+            if key == "topk" and cfg.pgie_topk > 0:
+                # Limit max detections per frame — raise if crowded scenes miss people
+                result.append(f"topk={cfg.pgie_topk}")
+                logger.info("PGIE override: topk=%d (was %s)", cfg.pgie_topk, stripped)
+                continue
+
+            if key == "nms-iou-threshold" and cfg.pgie_nms_iou_threshold >= 0.0:
+                # Lower this if adjacent people are being merged into one bbox
+                result.append(f"nms-iou-threshold={cfg.pgie_nms_iou_threshold}")
+                logger.info("PGIE override: nms-iou-threshold=%.3f (was %s)",
+                            cfg.pgie_nms_iou_threshold, stripped)
+                continue
+
+            if key == "pre-cluster-threshold" and cfg.pgie_pre_cluster_threshold >= 0.0:
+                # Lower this to detect occluded / partially visible people (more noise too)
+                result.append(f"pre-cluster-threshold={cfg.pgie_pre_cluster_threshold}")
+                logger.info("PGIE override: pre-cluster-threshold=%.3f (was %s)",
+                            cfg.pgie_pre_cluster_threshold, stripped)
+                continue
+
+        result.append(line)
+
+    # ── Write the modified config to a temp file ──────────────────────────────
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, prefix="nx_pgie_runtime_"
+    )
+    tmp.write("\n".join(result))
+    tmp.close()
+    logger.info("PGIE runtime config written to %s", tmp.name)
+    return tmp.name
+
+
 def _add_rtsp_source(pipeline, streammux, rtsp_url: str, stream_idx: int):
     """Add one RTSP source branch and link it to streammux sink_{stream_idx}.
 
@@ -238,8 +324,12 @@ def main():
 
     # ── PGIE — PeopleNet (always active) ─────────────────────────────────────
     pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
-    pgie.set_property("config-file-path",
-                      "models/peoplenet_vpruned_quantized_decrypted_v2.3.4/nvinfer_config.txt")
+    # _apply_pgie_overrides writes a temp config if config.yaml has threshold overrides;
+    # otherwise returns the original path unchanged (no I/O cost).
+    _pgie_config_path = _apply_pgie_overrides(
+        "models/peoplenet_vpruned_quantized_decrypted_v2.3.4/nvinfer_config.txt", cfg
+    )
+    pgie.set_property("config-file-path", _pgie_config_path)
     if cfg.pgie_batch_size > 0:
         pgie.set_property("batch-size", cfg.pgie_batch_size)
         logger.info("PGIE batch-size overridden to %d from config.yaml", cfg.pgie_batch_size)

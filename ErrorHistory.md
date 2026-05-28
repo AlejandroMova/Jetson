@@ -6,6 +6,27 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-05-27 — QA app inunda logs con warnings de deprecación `use_container_width`
+
+**Contexto:** `deploy/qa_app/streamlit_app.py` — visible al correr `./qa.sh` con Streamlit ≥ 1.46
+
+**Error en consola:**
+```
+`use_container_width` will be removed after 2025-12-31.
+For `use_container_width=True`, use `width='stretch'`.
+For `use_container_width=False`, use `width='content'`.
+```
+(se repite decenas de veces por segundo porque el auto-refresh de 500 ms re-renderiza la página en cada ciclo)
+
+**Causa raíz:** Streamlit deprecó el parámetro `use_container_width` en favor de `width`. El auto-refresh de `st_autorefresh` a 500 ms multiplica el warning por cada render.
+
+**Solución:** Reemplazar `use_container_width=True` → `width="stretch"` en los 3 usos del archivo:
+- Línea ~527: `st.button("💾 Guardar en config.yaml", ...)`
+- Línea ~531: `st.button("↺ Recargar del pipeline", ...)`
+- Línea ~701: `st.image(str(thumb_path), ...)`
+
+---
+
 ## 2026-05-18 — ReID cross-cámara no matcheaba: clave de AppearanceWorker sin pad_index
 
 **Contexto:** `deploy/pipelines/appearance_worker.py` + `deploy/pipelines/probes.py` — subsistema de Re-ID cross-cámara.

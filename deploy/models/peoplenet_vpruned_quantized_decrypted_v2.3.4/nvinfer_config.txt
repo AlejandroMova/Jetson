@@ -25,7 +25,12 @@ output-blob-names=output_bbox/BiasAdd:0;output_cov/Sigmoid:0
 cluster-mode=2
 
 # Umbral general para todas las clases (person, bag, face)
+# topk: máximo de detecciones por inferencia — aumentar si hay >20 personas en cámara
+# nms-iou-threshold: 0.35 separa personas juntas mejor que 0.5 (multitudes, cámaras pequeñas)
+# pre-cluster-threshold: confianza mínima antes del NMS — bajar a 0.2 mejora recall en multitudes
+# Estos tres valores se pueden sobreescribir desde config.yaml (pgie_topk, pgie_nms_iou_threshold,
+# pgie_pre_cluster_threshold) sin tocar este archivo.
 [class-attrs-all]
 topk=20
-nms-iou-threshold=0.5
+nms-iou-threshold=0.35
 pre-cluster-threshold=0.3

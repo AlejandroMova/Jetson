@@ -106,9 +106,12 @@ class ClientConfig:
     external_channels:   List[int] = field(default_factory=list)
     count_internal:      bool      = True
     count_external:      bool      = True
-    pgie_batch_size: int = 0   # >0 = override nvinfer_config.txt at runtime; 0 = use file value
-    pgie_interval: int = -1    # ≥0 = override nvinfer_config.txt at runtime; -1 = use file value
-    sgie_interval: int = -1    # ≥0 = override all SGIE nvinfer configs at runtime; -1 = use file value
+    pgie_batch_size: int = 0           # >0 = override nvinfer_config.txt at runtime; 0 = use file value
+    pgie_interval: int = -1            # ≥0 = override nvinfer_config.txt at runtime; -1 = use file value
+    sgie_interval: int = -1            # ≥0 = override all SGIE nvinfer configs at runtime; -1 = use file value
+    pgie_topk: int = -1                # >0 = max detections per inference; -1 = use file value (20)
+    pgie_nms_iou_threshold: float = -1.0   # ≥0 = NMS IoU threshold; -1 = use file value (0.35)
+    pgie_pre_cluster_threshold: float = -1.0  # ≥0 = min confidence before NMS; -1 = use file value (0.3)
     reid_gallery_size: int = 10  # max embeddings per global_id in ReIdManager (1 per distinct angle/camera)
     recording_enabled: bool = False  # grabar video cuando se detectan personas (QA y producción)
 
@@ -159,6 +162,9 @@ class ClientConfig:
         logger.info("PGIE batch : %s", self.pgie_batch_size or "(from nvinfer_config.txt)")
         logger.info("PGIE interval: %s", self.pgie_interval if self.pgie_interval >= 0 else "(from nvinfer_config.txt)")
         logger.info("SGIE interval: %s", self.sgie_interval if self.sgie_interval >= 0 else "(from config_infer.txt)")
+        logger.info("PGIE topk  : %s", self.pgie_topk if self.pgie_topk > 0 else "(from nvinfer_config.txt)")
+        logger.info("PGIE NMS IoU : %s", self.pgie_nms_iou_threshold if self.pgie_nms_iou_threshold >= 0 else "(from nvinfer_config.txt)")
+        logger.info("PGIE pre-cluster: %s", self.pgie_pre_cluster_threshold if self.pgie_pre_cluster_threshold >= 0 else "(from nvinfer_config.txt)")
         for url in self.rtsp_urls():
             masked = url.replace(self.dvr_pass, "***") if self.dvr_pass else url
             logger.info("RTSP URL   : %s", masked)
@@ -335,6 +341,9 @@ def load_config() -> ClientConfig:
         pgie_batch_size=int(cfg.get("pgie_batch_size", 0)),
         pgie_interval=int(cfg.get("pgie_interval", -1)),
         sgie_interval=int(cfg.get("sgie_interval", -1)),
+        pgie_topk=int(cfg.get("pgie_topk", -1)),
+        pgie_nms_iou_threshold=float(cfg.get("pgie_nms_iou_threshold", -1.0)),
+        pgie_pre_cluster_threshold=float(cfg.get("pgie_pre_cluster_threshold", -1.0)),
         reid_gallery_size=int(cfg.get("reid_gallery_size", 10)),
         recording_enabled=bool(cfg.get("recording_enabled", False)),
     )
