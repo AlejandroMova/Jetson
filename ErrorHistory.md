@@ -33,6 +33,26 @@ Efecto secundario positivo: `model-engine-file` ahora apunta al directorio de mo
 
 ---
 
+## 2026-05-28 — QA mode no muestra label de age/gender sobre los bboxes
+
+**Contexto:** `deploy/pipelines/probes.py` — `_qa_overlay_probe` (Probe B, post-tiler).
+
+**Síntoma:** Al habilitar age/gender desde el toggle del QA dashboard, los bboxes muestran solo `P#N` sin ningún label de género o edad.
+
+**Causa raíz:** Probe B tenía dos bugs relacionados:
+
+1. **`_track_labels["age_gender"]` nunca se leía.** Probe A escribe el resultado votado (estable, 10 muestras) en `_track_labels[track_id]["age_gender"]`, pero Probe B construía `label_parts` usando solo `age_gender_text` (leído directamente de `classifier_meta_list` del frame tileado). El campo `labels.get("age_gender")` se obtenía pero nunca se añadía a `label_parts`.
+
+2. **El texto guardado en `_track_labels["age_gender"]` incluía el prefijo `P#N | `.** Probe A asignaba `qa_age_gender = result.osd_text` que tiene formato `"P#1 | Hombre | Adulto 85%"`. Si se hubiera añadido directo al label, el resultado habría sido `"P#1 | P#1 | Hombre | Adulto 85%"` (track duplicado).
+
+**Solución:** En `deploy/pipelines/probes.py`:
+
+- **Probe A** (línea ~1792): cambiar `qa_age_gender = result.osd_text` por `qa_age_gender = osd.split(" | ", 1)[1] if " | " in osd else osd` — almacena solo la parte de display sin el prefijo.
+
+- **Probe B** (línea ~1987): reemplazar `if age_gender_text: label_parts.append(age_gender_text)` por `ag_display = labels.get("age_gender") or age_gender_text; if ag_display: label_parts.append(ag_display)` — usa el resultado votado de Probe A como fuente primaria, y el raw del classifier_meta solo como fallback.
+
+---
+
 ## 2026-05-28 — DVR watchdog nunca detecta fallos RTSP: container name incorrecto
 
 **Contexto:** `deploy/tools/dvr_watchdog.sh` — servicio systemd instalado en el host del Jetson.

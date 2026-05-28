@@ -1789,7 +1789,9 @@ def pre_tiler_analytics_probe(_pad, info):
                 if result.osd_text:
                     _set_osd_text(obj_meta, result.osd_text, border_color=result.border_color)
                     if isinstance(handler, _AgeGenderHandler):
-                        qa_age_gender = result.osd_text
+                        # Strip "P#N | " prefix — Probe B ya construye base_label separado
+                        osd = result.osd_text
+                        qa_age_gender = osd.split(" | ", 1)[1] if " | " in osd else osd
                 if result.event_type == "person_classified":
                     api_client.post_person_classified(
                         camera_id, p_track_id, bbox, result.det_extra.get("demographics", {})
@@ -1982,8 +1984,11 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
             gid = labels.get("global_id")
             base_label = f"P#{p_track_id}" + (f"·{gid[:6]}" if gid else "")
             label_parts = [base_label]
-            if age_gender_text:
-                label_parts.append(age_gender_text)
+            # Preferir el resultado votado de Probe A (_track_labels); el raw del
+            # classifier_meta solo sirve de fallback cuando Probe A aún no procesó el track.
+            ag_display = labels.get("age_gender") or age_gender_text
+            if ag_display:
+                label_parts.append(ag_display)
             if labels.get("face_name"):
                 label_parts.append(labels["face_name"])
 
