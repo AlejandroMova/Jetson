@@ -44,6 +44,14 @@ from probes import (
 # Maps each pipeline capability to its nvinfer config file (relative to deploy/).
 # None = Python worker (no SGIE element created for that capability).
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+
+# nvinfer config keys whose values are file paths. When the config is copied to a
+# temp file in /tmp/, DeepStream resolves relative paths relative to /tmp/ — which
+# breaks all model references. These keys must be rewritten as absolute paths.
+_NVINFER_PATH_KEYS = frozenset({
+    "onnx-file", "model-engine-file", "labelfile-path",
+    "int8-calib-file", "tlt-encoded-model", "custom-lib-path",
+})
 SGIE_CONFIGS = {
     "age_gender":      str(_MODELS_DIR / "resnet_age_gender_FB2/config_infer.txt"),
     "epp_detection":   str(_MODELS_DIR / "epp/config_infer.txt"),
@@ -133,6 +141,8 @@ def _apply_pgie_overrides(original_path: str, cfg) -> str:
     # ── Parse the original config line by line ────────────────────────────────
     # We can't use configparser because it doesn't preserve comments and nvinfer
     # is picky about the exact format of its config file.
+    # Resolve to absolute so relative path keys can be rewritten correctly.
+    model_dir = Path(original_path).resolve().parent
     lines = Path(original_path).read_text().splitlines()
     in_class_attrs = False  # flag: are we inside [class-attrs-all] right now?
     result = []
@@ -146,29 +156,38 @@ def _apply_pgie_overrides(original_path: str, cfg) -> str:
             result.append(line)
             continue
 
-        # Only substitute non-comment key=value lines inside [class-attrs-all]
-        if in_class_attrs and "=" in stripped and not stripped.startswith("#"):
-            key = stripped.split("=", 1)[0].strip()
+        if "=" in stripped and not stripped.startswith("#"):
+            key, val = stripped.split("=", 1)
+            key = key.strip()
+            val = val.strip()
 
-            if key == "topk" and cfg.pgie_topk > 0:
-                # Limit max detections per frame — raise if crowded scenes miss people
-                result.append(f"topk={cfg.pgie_topk}")
-                logger.info("PGIE override: topk=%d (was %s)", cfg.pgie_topk, stripped)
+            # Rewrite relative file paths as absolute — nvinfer resolves paths relative
+            # to the config file location, so a temp file in /tmp/ would break them all.
+            if key in _NVINFER_PATH_KEYS and val and not Path(val).is_absolute():
+                result.append(f"{key}={model_dir / val}")
                 continue
 
-            if key == "nms-iou-threshold" and cfg.pgie_nms_iou_threshold >= 0.0:
-                # Lower this if adjacent people are being merged into one bbox
-                result.append(f"nms-iou-threshold={cfg.pgie_nms_iou_threshold}")
-                logger.info("PGIE override: nms-iou-threshold=%.3f (was %s)",
-                            cfg.pgie_nms_iou_threshold, stripped)
-                continue
+            # Threshold overrides — only inside [class-attrs-all]
+            if in_class_attrs:
+                if key == "topk" and cfg.pgie_topk > 0:
+                    # Limit max detections per frame — raise if crowded scenes miss people
+                    result.append(f"topk={cfg.pgie_topk}")
+                    logger.info("PGIE override: topk=%d (was %s)", cfg.pgie_topk, stripped)
+                    continue
 
-            if key == "pre-cluster-threshold" and cfg.pgie_pre_cluster_threshold >= 0.0:
-                # Lower this to detect occluded / partially visible people (more noise too)
-                result.append(f"pre-cluster-threshold={cfg.pgie_pre_cluster_threshold}")
-                logger.info("PGIE override: pre-cluster-threshold=%.3f (was %s)",
-                            cfg.pgie_pre_cluster_threshold, stripped)
-                continue
+                if key == "nms-iou-threshold" and cfg.pgie_nms_iou_threshold >= 0.0:
+                    # Lower this if adjacent people are being merged into one bbox
+                    result.append(f"nms-iou-threshold={cfg.pgie_nms_iou_threshold}")
+                    logger.info("PGIE override: nms-iou-threshold=%.3f (was %s)",
+                                cfg.pgie_nms_iou_threshold, stripped)
+                    continue
+
+                if key == "pre-cluster-threshold" and cfg.pgie_pre_cluster_threshold >= 0.0:
+                    # Lower this to detect occluded / partially visible people (more noise too)
+                    result.append(f"pre-cluster-threshold={cfg.pgie_pre_cluster_threshold}")
+                    logger.info("PGIE override: pre-cluster-threshold=%.3f (was %s)",
+                                cfg.pgie_pre_cluster_threshold, stripped)
+                    continue
 
         result.append(line)
 

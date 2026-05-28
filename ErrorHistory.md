@@ -6,6 +6,48 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-05-28 — Container deepstream en crash loop: `Cannot access ONNX file '/tmp/resnet34_peoplenet_int8.onnx'`
+
+**Contexto:** `deploy/pipelines/app.py` — función `_apply_pgie_overrides()`. Ocurre cuando el cliente tiene `pgie_topk`, `pgie_nms_iou_threshold` o `pgie_pre_cluster_threshold` seteados en `config.yaml`.
+
+**Error en consola:**
+```
+ERROR: Cannot access ONNX file '/tmp/resnet34_peoplenet_int8.onnx'
+ERROR: failed to build network since parsing model errors.
+NvDsInferContext[UID 1]: Error in NvDsInferContextImpl::buildModel(): build engine file failed
+NVDSINFER_CONFIG_FAILED
+GStreamer ERROR: Failed to create NvDsInferContext instance
+[entrypoint] Pipeline terminó con error (código 1) — saliendo
+```
+(el entrypoint reinicia el container → crash loop infinito)
+
+**Causa raíz:** `_apply_pgie_overrides()` escribe una copia del `nvinfer_config.txt` a `/tmp/nx_pgie_runtime_*.txt` con los overrides aplicados. Las rutas en el config original son relativas (`onnx-file=resnet34_peoplenet_int8.onnx`). DeepStream resuelve rutas relativas **relativas al directorio del config file** — cuando el config está en `/tmp/`, busca el ONNX en `/tmp/`, donde no existe.
+
+**Solución:** En `_apply_pgie_overrides()` ([app.py](deploy/pipelines/app.py)):
+- Calcular `model_dir = Path(original_path).resolve().parent` antes del loop
+- Agregar la constante `_NVINFER_PATH_KEYS` con las claves que contienen rutas de archivos: `onnx-file`, `model-engine-file`, `labelfile-path`, `int8-calib-file`, `tlt-encoded-model`, `custom-lib-path`
+- En el loop, reescribir cualquier valor relativo en esas claves como `model_dir / val` (ruta absoluta)
+- Extraer `key, val = stripped.split("=", 1)` al inicio del bloque `if "=" in stripped` para no repetir el split
+
+Efecto secundario positivo: `model-engine-file` ahora apunta al directorio de modelos (volumen montado), así el engine TRT compilado **sobrevive reinicios** en vez de reconstruirse desde cero (~5 min) en cada restart.
+
+---
+
+## 2026-05-28 — DVR watchdog nunca detecta fallos RTSP: container name incorrecto
+
+**Contexto:** `deploy/tools/dvr_watchdog.sh` — servicio systemd instalado en el host del Jetson.
+
+**Síntoma:** El watchdog corre pero nunca actúa aunque el pipeline crashee, porque `docker inspect deepstream` siempre falla con `Error response from daemon: No such container: deepstream`.
+
+**Causa raíz:** Docker Compose prefija el nombre del container con el directorio del proyecto. El container real se llama `deploy-deepstream-1`, no `deepstream`. El watchdog usaba `CONTAINER="deepstream"` hardcodeado.
+
+**Solución:** Reemplazar la variable estática con detección dinámica en cada iteración del loop:
+- Agregar función `get_container()` que ejecuta `docker ps --filter "name=deepstream" --format "{{.Names}}" | head -1`
+- Al inicio del `while true; do`, asignar `CONTAINER=$(get_container)`
+- Si `$CONTAINER` está vacío, `sleep` y `continue` (container no está corriendo aún)
+
+---
+
 ## 2026-05-27 — QA app inunda logs con warnings de deprecación `use_container_width`
 
 **Contexto:** `deploy/qa_app/streamlit_app.py` — visible al correr `./qa.sh` con Streamlit ≥ 1.46

@@ -17,13 +17,22 @@ set -euo pipefail
 # @@WORK_DIR@@ es sustituido por setup.sh con la ruta real del repo (deploy/).
 WORK_DIR="@@WORK_DIR@@"
 DVR_IP_FILE="/etc/nx_dvr_ip"
-CONTAINER="deepstream"
+# Container name includes the Docker Compose project prefix (e.g. "deploy-deepstream-1").
+# Detect dynamically each iteration — don't hardcode the prefix.
+CONTAINER_PATTERN="deepstream"
 POLL_INTERVAL=10     # segundos entre revisiones de logs
 FAILURE_WINDOW=30    # ventana de tiempo (s) sobre la que se cuentan fallos RTSP
 COOLDOWN=300         # segundos de espera tras un intento de redescubrimiento
 
 log()  { echo "[nx-dvr-watchdog $(date '+%H:%M:%S')] $*"; }
 warn() { log "WARN: $*"; }
+
+# Resolves the actual running container name that matches CONTAINER_PATTERN.
+# Docker Compose prepends the project directory name (e.g. "deploy-deepstream-1").
+# Returns empty string if no matching container is currently running.
+get_container() {
+    docker ps --filter "name=${CONTAINER_PATTERN}" --format "{{.Names}}" | head -1
+}
 
 # ── Devuelve el número de canales RTSP configurados para el cliente activo ────
 # Lee /etc/nx_client para saber el nombre del cliente y luego parsea channels[]
@@ -69,12 +78,16 @@ print(ipaddress.ip_network('${current}/24', strict=False))
 }
 
 # ── Bucle principal ───────────────────────────────────────────────────────────
-log "Iniciado. Container: '${CONTAINER}' | poll: ${POLL_INTERVAL}s | ventana: ${FAILURE_WINDOW}s"
+log "Iniciado. Buscando container con patrón '${CONTAINER_PATTERN}' | poll: ${POLL_INTERVAL}s | ventana: ${FAILURE_WINDOW}s"
 
 while true; do
 
+    # Detectar el nombre real del container en cada iteración — el prefijo del proyecto
+    # Compose puede variar (e.g. "deploy-deepstream-1" vs "nx-deepstream-1").
+    CONTAINER=$(get_container)
+
     # Saltar si el container no está corriendo
-    if ! docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
+    if [[ -z "$CONTAINER" ]] || ! docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
         sleep "$POLL_INTERVAL"
         continue
     fi
