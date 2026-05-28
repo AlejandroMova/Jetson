@@ -278,6 +278,7 @@ Checklist para este cambio:
 - [ ] Regla 12: ¿Cambia algún payload, endpoint o evento de API? → [sí/no — actualizar APIBackend.md]
 - [ ] Regla 14: ¿El código nuevo/modificado tiene docstrings + comentarios en bloques y líneas importantes? → [verificar antes de dar la tarea por terminada]
 - [ ] Regla 15: ¿Cambia el flujo general, un handler, un worker, o el pipeline? → [actualizar Concepts.md]
+- [ ] Regla 16: ¿Se agrega/modifica/elimina un campo configurable? → [ClientConfig + load_config() + log_summary() + config.yaml sincronizados]
 ```
 
 **Las reglas 9 y 2 (post) son obligatorias en todo cambio que modifique comportamiento, constantes, flujos o archivos** — no dependen de juicio del agente. Si el cambio fue pequeño y ninguna descripción en CLAUDE.md ni README.md quedó desactualizada, indicarlo explícitamente ("sin cambios necesarios en documentación porque X").
@@ -581,6 +582,36 @@ el ciclo de vida de los tracks, el patrón worker, y cómo funciona cada detecci
 
 **Formato:** mantener el mismo estilo — explicación conceptual en prosa + links a archivos con
 `[nombre](ruta#Llinea)` para que sean clickables desde el IDE.
+
+### 16. Mantener `config.yaml` y `config_loader.py` sincronizados
+
+Cada vez que se agrega, elimina o cambia un campo configurable en `config_loader.py`, hay que mantener tres cosas en sincronía:
+
+**a) `ClientConfig` dataclass** (`config_loader.py`):
+- El campo existe con su tipo y valor por defecto correcto
+- Está anotado con un comentario que indica el rango válido y el comportamiento del default
+
+**b) `load_config()`** (`config_loader.py`):
+- El campo se lee con `cfg.get("nombre_campo", default)` usando el mismo default que en el dataclass
+- Si el campo afecta algo al arrancar, se loguea en `log_summary()`
+
+**c) `clients/demo/config.yaml`**:
+- El campo aparece en el archivo, ya sea activo o comentado
+- Tiene un comentario que explica qué hace, cuál es el default, y un rango útil de valores
+- Los campos opcionales van comentados con `# campo: valor_ejemplo` para que el técnico pueda activarlos sin buscar en el código
+- El archivo `demo/config.yaml` es la plantilla de referencia — si se agrega un campo aquí, también hay que agregarlo a cualquier otro `clients/*/config.yaml` que exista
+
+**Qué NO va en `config.yaml`:**
+- Credenciales (`DVR_USER`, `DVR_PASS` → `.env`)
+- IP del DVR (`dvr_ip` → `/etc/nx_dvr_ip`, escrita por `setup.sh`)
+- Nombre del cliente (`client_name` → `/etc/nx_client`, escrita por `setup.sh`; se documenta en el yaml solo como referencia visual)
+
+**Checklist al agregar un campo nuevo:**
+- [ ] Campo en `ClientConfig` con tipo + default + comentario
+- [ ] `cfg.get(...)` en `load_config()` con el mismo default
+- [ ] Entrada en `log_summary()` si es relevante para diagnóstico
+- [ ] Entrada comentada en `clients/demo/config.yaml` con descripción y rango
+- [ ] Actualizar descripción de `config_loader.py` en CLAUDE.md (esta sección)
 
 ---
 

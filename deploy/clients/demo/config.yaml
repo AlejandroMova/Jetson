@@ -1,3 +1,5 @@
+# NOTA: client_name aquí es solo referencia visual — el código lo lee de /etc/nx_client
+# (escrito por setup.sh). Cambiar este valor no tiene efecto en el pipeline.
 client_name: demo
 
 # DVR connection
@@ -71,7 +73,10 @@ package: comercio_basico
 #          SGIEs (age/gender, face) see smaller crops; people far from camera may be
 #          skipped by minimum-size filters (same as they would be at long range anyway).
 #
-# stream_width / stream_height override the resolution set by stream_type if specified.
+# stream_width / stream_height sobreescriben la resolución de stream_type si se especifican.
+# Ejemplo para forzar resolución no estándar de un DVR:
+# stream_width: 1280
+# stream_height: 720
 stream_type: main
 
 # Tracker algorithm:
@@ -139,3 +144,31 @@ pgie_interval: 2
 # pgie_nms_iou_threshold: 0.3
 # pgie_pre_cluster_threshold: 0.25
 # pgie_topk: 20
+
+# ── Ajuste de SGIEs (clasificadores secundarios: age_gender, epp, etc.) ──
+#
+# sgie_interval — aplica el mismo interval a todos los SGIEs activos.
+#   Mayor = menos carga GPU; el tracker mantiene la clasificación entre frames.
+#   -1 (default) = usa el valor de cada config_infer.txt individual.
+#   Guía: 4 (conservador) / 2 (más fresco) / 0 (cada frame)
+#
+# sgie_interval: -1
+
+# ── Re-ID entre cámaras ───────────────────────────────────────────────────
+#
+# reid_gallery_size — máximo de embeddings almacenados por persona conocida.
+#   Más embeddings = mejor reconocimiento desde distintos ángulos, más memoria RAM.
+#   Default: 10. Bajar a 5 en deployments con muchas personas; subir a 15 si hay
+#   problemas de reconocimiento en entornos con iluminación cambiante.
+#
+# reid_gallery_size: 10
+
+# ── Grabación automática de clips ─────────────────────────────────────────
+#
+# recording_enabled — graba clips MP4 cuando se detectan personas.
+#   En QA mode (./qa.sh) siempre graba, independientemente de este valor.
+#   En producción solo graba si está en true. Los clips se guardan en
+#   /nx_tech/recordings/ y se auto-eliminan cuando superan 10 GB.
+#   false (default) = sin grabación en producción.
+#
+# recording_enabled: false
