@@ -2,4 +2,3 @@ streamlit>=1.32
 redis>=5.0
 streamlit-autorefresh>=1.0.0
 ruamel.yaml>=0.18
-websockets>=12.0
