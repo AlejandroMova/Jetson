@@ -119,3 +119,23 @@ count_external: true
 #   1-6  cameras → 2  (detects every 3rd frame — faster first bbox, more GPU load)
 #   7-16 cameras → 4  (detects every 5th frame — conservative, stable)
 pgie_interval: 2
+
+# ── Umbrales de detección PeopleNet (opcional) ────────────────────────────
+#
+# pgie_nms_iou_threshold — dos bboxes con IoU > este valor se colapsan en uno.
+#   Bajar si personas paradas juntas aparecen como una sola detección.
+#   -1 (default) = usa el valor del nvinfer_config.txt (actualmente 0.35).
+#   Rango útil: 0.25 (multitudes muy densas) → 0.4 (escenas normales)
+#
+# pgie_pre_cluster_threshold — confianza mínima que debe tener un bbox antes del NMS.
+#   Bajar mejora recall en personas ocluidas, de espaldas o lejanas.
+#   -1 (default) = usa el valor del nvinfer_config.txt (actualmente 0.3).
+#   Rango útil: 0.2 (máximo recall, más falsos positivos) → 0.35 (más limpio)
+#
+# pgie_topk — máximo de detecciones que sobreviven el NMS por frame de inferencia.
+#   Subir si en escenas con muchas personas el sistema deja de detectar a partir de N.
+#   -1 (default) = usa el valor del nvinfer_config.txt (actualmente 20).
+#
+# pgie_nms_iou_threshold: 0.3
+# pgie_pre_cluster_threshold: 0.25
+# pgie_topk: 20
