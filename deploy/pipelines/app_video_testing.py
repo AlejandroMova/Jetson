@@ -20,6 +20,7 @@ os.environ.setdefault("QT_X11_NO_MITSHM", "1")
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib
 
+import cv2
 import pyds
 from app import SGIE_CONFIGS
 from probes import (
@@ -114,6 +115,13 @@ def main():
     logger.info("Capabilities: %s", pipeline_caps)
     logger.info("Client      : %s", client_name)
 
+    # Detectar dimensiones reales del clip para evitar distorsión en streammux
+    _probe = cv2.VideoCapture(video_path)
+    video_width  = int(_probe.get(cv2.CAP_PROP_FRAME_WIDTH))  or 1920
+    video_height = int(_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    _probe.release()
+    logger.info("Video dims  : %dx%d", video_width, video_height)
+
     init_channel_map([1])
     init_workers(pipeline_caps, model_dir=str(_MODELS_DIR), face_db_path=face_db_path)
     init_handlers(pipeline_caps)
@@ -122,17 +130,21 @@ def main():
     pipeline = Gst.Pipeline()
 
     # ── Source ────────────────────────────────────────────────────────────────
-    source     = Gst.ElementFactory.make("filesrc",        "file-source")
-    qtdemux    = Gst.ElementFactory.make("qtdemux",        "demuxer")
-    h264parser = Gst.ElementFactory.make("h264parse",      "h264-parser")
-    decoder    = Gst.ElementFactory.make("nvv4l2decoder",  "nvv4l2-decoder")
+    # decodebin detecta el codec automáticamente (mp4v, h264, h265, etc.),
+    # eliminando la dependencia de h264parse que bloqueaba clips grabados con mp4v.
+    # nvvidconv_src + caps_nvmm trasladan los frames al NVMM que requiere nvstreammux,
+    # independientemente de si decodebin usó hardware (NVMM) o software (CPU) decode.
+    source        = Gst.ElementFactory.make("filesrc",        "file-source")
+    decodebin     = Gst.ElementFactory.make("decodebin",      "decoder")
+    nvvidconv_src = Gst.ElementFactory.make("nvvideoconvert", "pre-mux-convert")
+    caps_nvmm     = Gst.ElementFactory.make("capsfilter",     "capsfilter-nvmm")
+    caps_nvmm.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12"))
     source.set_property("location", video_path)
-    decoder.set_property("drop-frame-interval", 0)
 
     # ── Streammux ─────────────────────────────────────────────────────────────
     streammux = Gst.ElementFactory.make("nvstreammux", "Stream-muxer")
-    streammux.set_property("width",                1920)
-    streammux.set_property("height",               1080)
+    streammux.set_property("width",                video_width)
+    streammux.set_property("height",               video_height)
     streammux.set_property("batch-size",           1)
     streammux.set_property("batched-push-timeout", 33333)
 
@@ -185,7 +197,7 @@ def main():
     sink.set_property("sync",      False)
 
     all_elements = (
-        [source, qtdemux, h264parser, decoder, streammux, pgie, tracker]
+        [source, decodebin, nvvidconv_src, caps_nvmm, streammux, pgie, tracker]
         + sgie_elements
         + [nvvidconv1, caps_rgba, nvosd, nvvidconv2, sink]
     )
@@ -197,22 +209,25 @@ def main():
         pipeline.add(el)
 
     # ── Linking ───────────────────────────────────────────────────────────────
-    def _on_demux_pad_added(_demux, pad):
-        """Conecta qtdemux al h264parser cuando el pad de video está disponible.
+    def _on_decode_pad_added(_decodebin, pad):
+        """Conecta decodebin al conversor NVMM cuando el pad de video está listo.
 
-        qtdemux crea pads dinámicamente al demuxar el contenedor MP4.
-        Solo nos interesa el pad de video H.264 — los de audio se ignoran.
+        decodebin crea pads dinámicamente al detectar el codec del archivo.
+        Solo nos interesa el pad de video — el de audio se ignora.
+        Compatible con mp4v (MPEG-4 Part 2), h264, h265, vp9, etc.
         """
         caps_str = (pad.get_current_caps() or pad.query_caps(None)).to_string()
-        if "video/x-h264" in caps_str:
-            sink_pad = h264parser.get_static_pad("sink")
-            if not sink_pad.is_linked():  # evitar doble link si se llama más de una vez
-                pad.link(sink_pad)
+        if not caps_str.startswith("video"):
+            return
+        sink_pad = nvvidconv_src.get_static_pad("sink")
+        if not sink_pad.is_linked():  # evitar doble link si hay múltiples pads de video
+            pad.link(sink_pad)
 
-    source.link(qtdemux)
-    qtdemux.connect("pad-added", _on_demux_pad_added)
-    h264parser.link(decoder)
-    decoder.get_static_pad("src").link(streammux.get_request_pad("sink_0"))
+    source.link(decodebin)
+    decodebin.connect("pad-added", _on_decode_pad_added)
+    # nvvidconv_src convierte CPU frames (o NVMM) → NVMM NV12 para nvstreammux
+    nvvidconv_src.link(caps_nvmm)
+    caps_nvmm.get_static_pad("src").link(streammux.get_request_pad("sink_0"))
     streammux.link(pgie)
     pgie.link(tracker)
 

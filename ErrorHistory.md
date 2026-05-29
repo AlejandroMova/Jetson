@@ -6,6 +6,29 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-05-29 — Playback QA falla con `Unable to create video pipeline` al correr inferencia sobre clips grabados
+
+**Contexto:** `deploy/pipelines/app_video_testing.py` — invocado desde `docker-entrypoint.sh` cuando `nx:qa:playback_video` tiene un path en Redis (botón "▶ Correr Inferencia" del dashboard Streamlit).
+
+**Error en consola:**
+```
+deepstream-1  | 2026-05-29 00:49:33,083 [INFO] probes: Active handlers: ['_AgeGenderHandler']
+deepstream-1  | Unable to create video pipeline
+deepstream-1  | 2026-05-29 00:49:33,308 [INFO] probes: NxApiClient iniciado → https://...
+deepstream-1  | 2026-05-29 00:49:33,498 [INFO] probes: NxApiClient detenido.
+```
+
+**Causa raíz:** `RecordingManager` grababa los clips con `cv2.VideoWriter_fourcc(*"mp4v")` (MPEG-4 Part 2). El pipeline de playback usaba `qtdemux → h264parse`, y el callback `_on_demux_pad_added` solo linkaba si `"video/x-h264" in caps_str`. Con `mp4v`, qtdemux reporta `video/x-mpeg4` — el pad nunca se linkea, el pipeline queda incompleto y GStreamer falla al transicionar a PLAYING.
+
+**Solución:** En `deploy/pipelines/app_video_testing.py`:
+- Reemplazar `qtdemux + h264parse + nvv4l2decoder` con `decodebin + nvvideoconvert + capsfilter(NVMM, NV12)`
+- `decodebin` detecta el codec automáticamente y hace parsing + decoding internamente
+- `_on_demux_pad_added` reemplazada por `_on_decode_pad_added` que acepta cualquier pad `video/*`
+- `nvvideoconvert + capsfilter` garantizan NVMM NV12 a la entrada de `nvstreammux`, independientemente de si decodebin usó hardware o software decode
+- También se corrigió el streammux hardcodeado a 1920×1080: ahora lee las dimensiones reales del clip con `cv2.VideoCapture` antes de construir el pipeline
+
+---
+
 ## 2026-05-28 — Container deepstream en crash loop: `Cannot access ONNX file '/tmp/resnet34_peoplenet_int8.onnx'`
 
 **Contexto:** `deploy/pipelines/app.py` — función `_apply_pgie_overrides()`. Ocurre cuando el cliente tiene `pgie_topk`, `pgie_nms_iou_threshold` o `pgie_pre_cluster_threshold` seteados en `config.yaml`.
