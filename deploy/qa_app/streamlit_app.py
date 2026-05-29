@@ -1,17 +1,18 @@
 """
 streamlit_app.py — NX Computing AI | QA Visual Dashboard
 
-Dashboard de inspección remota para Jetsons desplegados.
-Accesible vía Tailscale en http://<jetson-tailscale-ip>:8501
+Remote inspection dashboard for deployed Jetsons.
+Accessible via Tailscale at http://<jetson-tailscale-ip>:8501
 
 Panels:
-  - Video en vivo con bboxes (MJPEG leído por Python desde deepstream:8080)
-  - Detecciones en tiempo real (Redis pub/sub nx:qa:detections)
-  - API Calls log (Redis pub/sub nx:qa:apicalls)
-  - Toggles de capacidades (Redis hash nx:qa:capabilities)
-  - Selector de cámara (todas / individual)
+  - Live video with bounding boxes (MJPEG from deepstream:8080 via st.iframe)
+  - Real-time detections (Redis pub/sub nx:qa:detections)
+  - API calls log (Redis pub/sub nx:qa:apicalls)
+  - Capability toggles (Redis hash nx:qa:capabilities)
+  - Camera selector (all / individual)
+  - Recordings tab: clip gallery, preview, and inference playback
 
-Arrancar con: ./qa.sh  (desde deploy/)
+Start with: ./qa.sh  (from deploy/)
 """
 
 import json
@@ -30,8 +31,8 @@ from streamlit_autorefresh import st_autorefresh
 REDIS_HOST  = os.getenv("REDIS_HOST", "redis")
 MJPEG_PORT  = int(os.getenv("MJPEG_PORT", "8080"))
 
-# Hostname del Jetson tal como lo ve el browser (Tailscale IP o LAN IP).
-# st.context.headers["host"] = "100.67.192.58:8501" → extraemos solo la IP.
+# Extract just the IP from the Host header so the browser can reach the MJPEG server
+# directly. st.context.headers["host"] = "100.67.192.58:8501" — strip the port.
 try:
     _host_hdr = st.context.headers.get("host", "")
     MJPEG_HOST = _host_hdr.split(":")[0] if _host_hdr else "localhost"
@@ -48,17 +49,20 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Autorefresh solo para detecciones y API calls — el video lo maneja el browser
-st_autorefresh(interval=500, limit=None, key="qa_tick")
+# Autorefresh para detecciones y API calls — el video lo maneja el browser directamente.
+# 2000 ms en vez de 500 ms: la tab Grabaciones lee muchos archivos por rerun y con 500 ms
+# el overlay gris de Streamlit era constante. El stream MJPEG no se ve afectado (va por HTTP
+# directo al browser). Las detecciones se actualizan desde el buffer del subscriber thread.
+st_autorefresh(interval=2000, limit=None, key="qa_tick")
 
 
 # ── Redis helpers ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def _get_redis():
-    """Crea y cachea la conexión Redis por proceso. Retorna None si Redis no está disponible.
+    """Create and cache a single Redis connection per Streamlit process.
 
-    cache_resource garantiza que solo se crea una conexión por proceso Streamlit,
-    evitando reconexiones en cada rerender del dashboard.
+    cache_resource ensures one connection per process — avoids a new connection on
+    every 2 s autorefresh cycle. Returns None if Redis is unreachable.
     """
     try:
         r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True,
@@ -70,7 +74,7 @@ def _get_redis():
 
 
 def _redis_ok() -> bool:
-    """Verifica si la conexión Redis está viva. Retorna False si está caída o no disponible."""
+    """Return True if Redis is reachable, False if it is down or unavailable."""
     r = _get_redis()
     if r is None:
         return False
@@ -81,15 +85,15 @@ def _redis_ok() -> bool:
         return False
 
 
-# ── Buffers de proceso — compartidos entre rerenders, sin ScriptRunContext ────
-# cache_resource crea un singleton a nivel de proceso: el subscriber escribe
-# aquí y el script lo lee en cada rerender sin problemas de thread safety.
+# ── Process-level buffers — shared across rerenders, no ScriptRunContext needed ──
+# cache_resource creates a process singleton: the subscriber thread writes here and
+# the main script reads on every rerender without threading issues.
 @st.cache_resource
 def _get_buffers():
-    """Crea y cachea los buffers circulares de detecciones y API calls por proceso.
+    """Create and cache circular detection and API-call buffers for the process.
 
-    Los buffers son compartidos entre el hilo subscriber (que escribe) y el script principal
-    (que lee en cada rerender). cache_resource garantiza que son singletons por proceso.
+    Shared between the subscriber thread (writer) and the main script (reader on each
+    rerender). cache_resource guarantees one instance per process.
     """
     return {
         "detections": deque(maxlen=MAX_DETECTIONS),
@@ -98,15 +102,14 @@ def _get_buffers():
 
 @st.cache_resource
 def _ensure_subscriber(_host=REDIS_HOST):
-    """Arranca el subscriber UNA VEZ por proceso. Auto-reconecta si Redis cae."""
+    """Start the Redis pub/sub subscriber thread once per process.
+
+    Auto-reconnects if Redis goes down — the 2 s sleep prevents a tight
+    reconnect loop from flooding logs during an outage.
+    """
     bufs = _get_buffers()
 
     def _loop():
-        """Loop del hilo subscriber: suscribe a Redis pub/sub y llena los buffers compartidos.
-
-        Se reconecta automáticamente tras cualquier error (Redis caído, red, etc.) con 2 s de espera.
-        Los mensajes se deserializan de JSON y se añaden al deque correspondiente por canal.
-        """
         while True:
             try:
                 r = redis.Redis(host=_host, port=6379, decode_responses=True)
@@ -125,7 +128,7 @@ def _ensure_subscriber(_host=REDIS_HOST):
                     elif "apicalls" in ch:
                         bufs["apicalls"].appendleft(data)
             except Exception:
-                time.sleep(2)   # reconectar tras error
+                time.sleep(2)  # avoid tight reconnect loop during Redis outage
 
     threading.Thread(target=_loop, daemon=True, name="qa-subscriber").start()
     return True
@@ -159,8 +162,17 @@ _PACKAGES = [
 ]
 
 
-def _save_config_yaml() -> tuple:
-    """Write all QA config overrides + live Redis values to the client's config.yaml."""
+def _save_config_yaml() -> tuple[bool, str]:
+    """Persist all current config overrides and live Redis values to the client's config.yaml.
+
+    Reads nx:qa:config_overrides (restart-required fields) and nx:qa:entry_exit /
+    nx:qa:external_channels / nx:qa:count_* (hot-reloadable fields) from Redis,
+    merges them into the existing YAML, and writes it back using ruamel.yaml so
+    inline comments in the file are preserved.
+
+    Returns:
+        (True, success_message) on success, (False, error_message) on failure.
+    """
     client = status.get("client", "")
     if not client:
         return False, "No hay cliente activo en el pipeline"
@@ -172,10 +184,10 @@ def _save_config_yaml() -> tuple:
         from ruamel.yaml.comments import CommentedSeq
 
         def _flist(items):
-            """Convierte una lista Python a CommentedSeq con flow style para ruamel.yaml.
+            """Wrap a list in ruamel.yaml's flow style so it serializes on one line.
 
-            Flow style serializa la lista en una línea: [1, 2, 3] en lugar de formato block YAML.
-            Necesario para que `channels` quede legible en una sola línea en config.yaml.
+            Without this, `channels: [1, 2, 3]` becomes a multi-line block sequence,
+            which is harder to read and edit directly in config.yaml.
             """
             seq = CommentedSeq(items)
             seq.fa.set_flow_style()
@@ -186,14 +198,14 @@ def _save_config_yaml() -> tuple:
         with open(config_path) as f:
             cfg_data = yml.load(f)
 
-        # Apply restart-required overrides from Redis
+        # Restart-required fields (package, tracker, channels, PGIE/SGIE, DVR)
         if _r:
             raw_ov = _r.get("nx:qa:config_overrides")
             if raw_ov:
                 for key, val in json.loads(raw_ov).items():
                     cfg_data[key] = _flist(val) if key == "channels" else val
 
-        # Apply live hot-reloadable values from Redis
+        # Hot-reloadable fields — applied without restarting the pipeline
         if _r:
             raw_ee = _r.get("nx:qa:entry_exit")
             if raw_ee is not None:
@@ -240,7 +252,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Selector de cámara
+    # Camera selector
     cam_label_map: dict = {"Todas las cámaras": "all"}
     jetson_id = status.get("jetson_id", "")
     for ch in channels:
@@ -256,12 +268,12 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Toggles entrada / salida ──────────────────────────────────────────────
+    # ── Entry / Exit toggles ──────────────────────────────────────────────────
     if channels:
         st.markdown("**📍 Entrada / Salida**")
         st.caption("Cámaras que cubren la puerta de entrada")
 
-        # Leer lista actual desde Redis; fallback a lo que publicó el pipeline
+        # Read current list from Redis; fall back to what the pipeline published
         ee_channels: set = set()
         if _r:
             try:
@@ -293,7 +305,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Tipo de cámara ────────────────────────────────────────────────────────
+    # ── Camera type ───────────────────────────────────────────────────────────
     if channels:
         st.markdown("**🏠 Tipo de Cámara**")
         st.caption("Sin marcar = interna (default). Marcar = externa")
@@ -346,19 +358,20 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Toggles de capacidades
+    # Capability toggles
     IMPLEMENTED = [
         "people_counting", "age_gender", "fall_detection", "face_recognition",
     ]
     UNIMPLEMENTED = ["epp_detection", "fire_smoke", "license_plate"]
 
     st.markdown("**🔧 Capacidades**")
-    # people_counting siempre activo
+    # people_counting is always on — the pipeline has no code path without it
     st.checkbox("people_counting", value=True, disabled=True,
                 help="Siempre activo — no se puede apagar", key="cap_people_counting")
 
-    # Capacidades implementadas — todas toggleables (las no activas en pipeline
-    # aplican solo a workers Python que chequean Redis; SGIEs requieren reinicio)
+    # Implemented capabilities — all toggleable at runtime.
+    # Caps not active in the pipeline apply only to Python workers that check Redis;
+    # SGIEs (age_gender) require a pipeline restart to take effect.
     for cap in IMPLEMENTED[1:]:
         in_pipeline = cap in active_caps
         help_text = None if in_pipeline else "No activo en este paquete — activar reinicia el pipeline"
@@ -379,7 +392,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Resoluciones del Pipeline ─────────────────────────────────────────────
+    # ── Pipeline resolutions ──────────────────────────────────────────────────
     st.markdown("**🔬 Resoluciones**")
     comp = status.get("component_resolutions", {})
     if comp:
@@ -401,7 +414,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── FPS del Pipeline ──────────────────────────────────────────────────────
+    # ── Pipeline FPS ─────────────────────────────────────────────────────────
     st.markdown("**⚡ FPS del Pipeline**")
     if pipeline_stats:
         fps_per_cam = pipeline_stats.get("fps_per_camera", {})
@@ -457,7 +470,7 @@ with st.sidebar:
                 "cfg_recording_enabled": bool(status.get("recording_enabled", False)),
             })
 
-        # Read persisted overrides from Redis (only used for the Save button / comparison)
+        # Persisted overrides from Redis — used only for comparison and the Save button
         _cfg_ov: dict = {}
         if _r:
             try:
@@ -467,7 +480,7 @@ with st.sidebar:
             except Exception:
                 pass
 
-        # ── Widgets — NO value=/index= to avoid double-render flicker ─────────
+        # ── Widgets — no value=/index= to avoid double-render flicker ──────────
         _new_pkg    = st.selectbox("Paquete", _PACKAGES, key="cfg_package")
         _new_st     = st.selectbox("Stream type", ["main", "sub"], key="cfg_stream_type")
         _new_tr     = st.selectbox("Tracker", ["nvdcf", "iou"], key="cfg_tracker")
@@ -502,7 +515,7 @@ with st.sidebar:
                                     step=1, key="cfg_dvr_port")
         _new_pat  = st.text_input("RTSP URL pattern", key="cfg_rtsp_pattern")
 
-        # Persist to Redis only when values actually changed (avoids 500ms write loop)
+        # Persist to Redis only when values changed — avoids a write on every 2 s rerun
         _new_ov = {
             "package":            _new_pkg,
             "stream_type":        _new_st,
@@ -523,7 +536,7 @@ with st.sidebar:
                 pass
 
         # ── Actions ───────────────────────────────────────────────────────────
-        st.caption("🔄 Paquete, Stream, Tracker, Canales, PGIE/SGIE y DVR requieren reinicio.")
+        st.caption("🔄 Package, stream type, tracker, channels, PGIE/SGIE, and DVR require a pipeline restart.")
         if st.button("💾 Guardar en config.yaml", width="stretch",
                      type="primary", key="btn_save_config", disabled=(_r is None)):
             _ok, _msg = _save_config_yaml()
@@ -541,7 +554,7 @@ with st.sidebar:
                        "cfg_sgie_interval", "cfg_reid_gallery", "cfg_recording_enabled",
                        "cfg_dvr_port", "cfg_rtsp_pattern"]:
                 st.session_state.pop(_k, None)
-            # No st.rerun() — el click del botón ya dispara un rerun automáticamente
+            # No st.rerun() — the button click already triggers a rerun automatically
 
         if "_save_result" in st.session_state:
             _ok_r, _msg_r = st.session_state["_save_result"]
@@ -549,7 +562,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Estado de grabación
+    # Recording / playback state indicator
     if _r:
         try:
             _sb_rec = (_r.get("nx:qa:recording_active") or "0") == "1"
@@ -570,11 +583,11 @@ with st.sidebar:
         st.caption("Verifica que el pipeline esté corriendo con `./qa.sh`")
 
 
-# ── Helper: lista de clips grabados ───────────────────────────────────────────
+# ── Helper: clip gallery ──────────────────────────────────────────────────────
 def _render_clips_list() -> None:
-    """Render the saved clips list with thumbnail, metadata, and action buttons.
+    """Render the saved clip gallery with thumbnail, metadata, and action buttons.
 
-    Used in both the normal view and the collapsed expander inside playback mode.
+    Used in both the default recordings view and the expander inside playback mode.
     """
     clips: list = []
     if RECORDINGS_DIR.exists():
@@ -584,7 +597,7 @@ def _render_clips_list() -> None:
         )
 
     if not clips:
-        st.info("No hay grabaciones aún. Se crean automáticamente cuando se detectan personas con el pipeline QA activo.")
+        st.info("No recordings yet. They are created automatically when people are detected with the QA pipeline active.")
         return
 
     st.markdown(f"**{len(clips)} clip(s) guardados** · máx 10 GB (auto-rotativo)")
@@ -598,8 +611,7 @@ def _render_clips_list() -> None:
         try:
             meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
         except Exception:
-            # Corrupted or unreadable metadata — show the clip with blank fields.
-            meta = {}
+            meta = {}  # corrupted metadata — render the clip with blank fields
 
         ts_label = meta.get("timestamp", clip_dir.name)
         duration = meta.get("duration_s", 0)

@@ -6,6 +6,36 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-05-29 — Tab Grabaciones muestra pantalla gris persistente, clips con 0 personas máx, y playback no aparece tras "Correr Inferencia"
+
+**Contexto:** `deploy/qa_app/streamlit_app.py`, `deploy/pipelines/recording_manager.py`, `deploy/pipelines/mjpeg_server.py` — tres bugs independientes en el QA Visual App.
+
+**Error en consola:**
+```
+(sin error en consola — comportamiento visual incorrecto en el dashboard Streamlit)
+1. Tab Grabaciones: overlay gris constante al entrar/navegar por los clips
+2. metadata.json de clips: "max_people": 0 aunque la detección triggereó la grabación
+3. Botón "▶ Correr Inferencia": el iframe MJPEG queda vacío tras el reinicio del pipeline
+```
+
+**Causa raíz:**
+
+1. **Pantalla gris:** `st_autorefresh(interval=500)` en `streamlit_app.py` re-ejecutaba el script cada 500 ms. La tab Grabaciones lee directorios, metadata.json y thumbnails de disco por cada rerun; con 10+ clips ese render supera los 500 ms → el overlay "rerunning" de Streamlit era constante.
+
+2. **0 personas máx:** En `recording_manager.py._start()` había `self._max_people = 0`. La secuencia: `notify_detection(N)` setea `_max_people=N` → `_record_loop` llama `_start()` → `_start()` resetea a 0 → si no llegan más detecciones antes del cooldown, `_finish()` guarda `max_people: 0`.
+
+3. **Playback sin video:** El viewer HTML en `mjpeg_server.py` era `<img src='/stream/key'>` sin JavaScript. Cuando `app.py` enviaba EOS y apagaba el MJPEG server (para hacer la transición a playback), la `<img>` mostraba estado roto y no reintentaba al volver a subir el servidor (~30–60 s después con `app_video_testing.py`).
+
+**Solución:**
+
+1. `streamlit_app.py` línea 52: `st_autorefresh(interval=500)` → `st_autorefresh(interval=2000)`.
+
+2. `recording_manager.py._start()`: eliminada la línea `self._max_people = 0`. Agregada en `_reset_writers()` (llamado después de `_finish()` / `_cancel()`), donde corresponde para limpiar el estado al terminar el clip.
+
+3. `mjpeg_server.py` viewer HTML: agregado JS inline que escucha `img.onerror` y reintenta `img.src` con cache-buster (`?t=Date.now()`) cada 2 s hasta que el stream vuelve a estar disponible.
+
+---
+
 ## 2026-05-29 — Playback QA falla con `Unable to create video pipeline` al correr inferencia sobre clips grabados
 
 **Contexto:** `deploy/pipelines/app_video_testing.py` — invocado desde `docker-entrypoint.sh` cuando `nx:qa:playback_video` tiene un path en Redis (botón "▶ Correr Inferencia" del dashboard Streamlit).

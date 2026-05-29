@@ -1,84 +1,88 @@
 """
 mjpeg_server.py — NX Computing AI | QA Visual
 
-Servidor HTTP MJPEG que sirve:
-  /stream/all      → frame tileado completo (640×360) con todos los bboxes dibujados
-  /stream/<cam_id> → crop individual de esa cámara (e.g. /stream/jetson-nx-001-ch01)
+HTTP MJPEG server for the QA dashboard. Exposes:
+  /stream/all      — 640×360 tiled view with bounding boxes for all cameras
+  /stream/<cam_id> — full-resolution crop for a single camera
+  /viewer/<key>    — minimal HTML page that embeds the stream and auto-reconnects
 
-Solo se instancia cuando NX_QA_ENABLED=true (arrancado desde app.py).
-Cero impacto en producción cuando NX_QA_ENABLED no está activo.
+Only instantiated when NX_QA_ENABLED=true. Zero impact in production.
 """
 
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from queue import Empty, Queue
+from socketserver import ThreadingMixIn
+from typing import TYPE_CHECKING
+
 import cv2
 import numpy as np
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from queue import Queue, Empty
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from recording_manager import RecordingManager
 
 
 class MjpegServer(threading.Thread):
-    """
-    Hilo daemon que expone streams MJPEG por HTTP.
+    """Daemon thread that serves MJPEG video streams over HTTP.
 
-    Arquitectura de dos hilos:
-      - _enc_thread: consume las queues de frames, encoda a JPEG y guarda en _jpegs dict.
-      - run() (este hilo): sirve HTTP. Cada cliente que pide /stream/<key> recibe el
-        latest_jpeg para esa key en un bucle multipart/x-mixed-replace.
+    Two-thread architecture:
+      - MjpegEncoder thread: drains frame queues, encodes to JPEG, stores in _jpegs dict.
+      - MjpegServer thread (run()): handles HTTP. Each /stream/<key> client gets the
+        latest JPEG for that key in a multipart/x-mixed-replace loop.
 
-    El encoding es siempre en background; el HTTP handler solo lee el último JPEG
-    disponible (lock mínimo, sin bloquear el pipeline).
+    Encoding always runs in the background; the HTTP handler only reads the most recent
+    JPEG (minimal lock contention — the pipeline is never blocked by HTTP clients).
     """
 
     def __init__(
         self,
         tiled_frame_queue: Queue,
-        camera_queues: dict,        # camera_id (str) → Queue
+        camera_queues: dict,
         port: int = 8080,
         quality: int = 72,
         recorder: "RecordingManager | None" = None,
     ):
-        """Configura el servidor. El thread de encoding y el HTTP se arrancan en start().
-
-        tiled_frame_queue: frames 640×360 del tiler (clave "all" en _jpegs).
-        camera_queues: frames full-res recortados por cámara (clave = camera_id en _jpegs).
-        recorder: si no es None, cada frame tileado se pasa a push_tiled_frame() para grabar.
-        _jpegs es el buffer compartido: _encode_loop escribe, el HTTP handler lee.
+        """
+        Args:
+            tiled_frame_queue: 640×360 frames from the tiler (served as "all" stream).
+            camera_queues: camera_id → Queue of full-res crops (one stream per camera).
+            port: HTTP port to bind. Must match the port exposed in docker-compose.qa.yml.
+            quality: JPEG encoding quality (1–100). 72 balances bandwidth and clarity.
+            recorder: if provided, each tiled frame is forwarded to push_tiled_frame()
+                      so the RecordingManager can write tiled.mp4.
         """
         super().__init__(daemon=True, name="MjpegServer")
         self._port = port
         self._quality = quality
         self._tiled_queue = tiled_frame_queue
-        self._cam_queues = camera_queues        # {"jetson-nx-001-ch01": Queue, ...}
-        self._recorder = recorder               # RecordingManager (QA recording, opcional)
+        self._cam_queues = camera_queues
+        self._recorder = recorder
         self._lock = threading.Lock()
-        self._jpegs: dict = {}                  # "all" | camera_id → bytes JPEG más reciente
+        self._jpegs: dict = {}  # "all" | camera_id → most recent JPEG bytes
         self._enc_thread = threading.Thread(
             target=self._encode_loop, daemon=True, name="MjpegEncoder"
         )
 
-    # ------------------------------------------------------------------
-    def start(self):
+    def start(self) -> None:
         self._enc_thread.start()
         super().start()
 
-    # ------------------------------------------------------------------
     def _to_jpeg(self, frame: np.ndarray) -> bytes:
-        """Convert BGR or RGBA numpy frame to JPEG bytes."""
+        """Convert a BGR or RGBA numpy frame to JPEG bytes."""
         if frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
         _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self._quality])
         return buf.tobytes()
 
-    def _encode_loop(self):
-        """Background thread: drains frame queues and updates _jpegs."""
+    def _encode_loop(self) -> None:
+        """Background thread: drain frame queues and keep _jpegs up to date.
+
+        Processes the tiled queue first (with a 40 ms timeout to pace at ~25 fps),
+        then drains per-camera queues without blocking.
+        """
         while True:
-            # Tiled frame → "all"
+            # Tiled frame → stored under "all" key
             try:
                 frame = self._tiled_queue.get(timeout=0.04)
                 try:
@@ -86,8 +90,11 @@ class MjpegServer(threading.Thread):
                     with self._lock:
                         self._jpegs["all"] = jpeg
                 except Exception:
+                    # Corrupt or incompatible frame — skip silently rather than crashing
+                    # the MJPEG server. The next frame will replace it.
                     pass
-                # Pasar al recorder si está grabando (no copia extra: el frame ya es copia del probe)
+                # Forward to RecordingManager without making an extra copy —
+                # the frame is already a copy from the probe.
                 if self._recorder is not None:
                     self._recorder.push_tiled_frame(frame)
             except Empty:
@@ -102,71 +109,96 @@ class MjpegServer(threading.Thread):
                         with self._lock:
                             self._jpegs[cam_id] = jpeg
                     except Exception:
-                        pass
+                        pass  # same rationale as tiled frame above
                 except Empty:
                     pass
 
-    # ------------------------------------------------------------------
-    def run(self):
-        """Hilo principal: levanta el servidor HTTP y sirve requests hasta que el proceso termina.
+    def run(self) -> None:
+        """Start the HTTP server and serve requests until the process exits.
 
-        Usa ThreadingMixIn para manejar cada conexión MJPEG en su propio hilo,
-        permitiendo múltiples clientes simultáneos (ej. un técnico en la laptop + uno en el celular).
+        Uses ThreadingMixIn so each MJPEG connection runs in its own thread,
+        allowing multiple simultaneous clients (e.g. laptop + phone on the same network).
         """
         class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-            daemon_threads = True  # no esperar threads de cliente al shutdown — proceso termina limpio
+            # daemon_threads=True: client threads don't block process shutdown
+            daemon_threads = True
+
         server = _ThreadingHTTPServer(("0.0.0.0", self._port), self._make_handler())
         server.serve_forever()
 
     def _make_handler(self):
-        """Construye la clase handler HTTP con una referencia cerrada al servidor MJPEG.
+        """Build the HTTP handler class with a closure reference to this server.
 
-        Se usa un closure en lugar de pasar `self` directamente para que BaseHTTPRequestHandler
-        pueda acceder a los JEPGs sin herencia múltiple problemática.
+        A closure is used instead of passing self directly because BaseHTTPRequestHandler
+        instantiates a new object per request — there's no clean way to inject a
+        dependency without inheritance or a closure.
         """
         srv = self
 
         class _Handler(BaseHTTPRequestHandler):
-            """Handler HTTP para los endpoints /viewer/<key> y /stream/<key>.
+            """HTTP handler for /viewer/<key> and /stream/<key> endpoints.
 
-            Instanciada por ThreadingHTTPServer en un hilo propio por cada conexión cliente.
-            Usa el closure `srv` para leer los JPEGs del MjpegServer sin herencia múltiple.
+            One instance is created per connection by ThreadingHTTPServer.
+            Reads JPEG frames from the enclosing MjpegServer via the `srv` closure.
             """
-            def do_GET(self):
-                """Rutea GET según prefijo: /viewer/<key> → HTML viewer, /stream/<key> → MJPEG loop.
 
-                El MJPEG loop es un bucle infinito que envía el último JPEG disponible cada ~40 ms
-                (25 fps) usando multipart/x-mixed-replace. El loop termina cuando el cliente
-                cierra la conexión (BrokenPipeError, ConnectionResetError, OSError).
+            def do_GET(self) -> None:
+                """Route GET requests by URL prefix.
+
+                /viewer/<key> → Serve an HTML page that embeds the stream.
+                /stream/<key> → Stream MJPEG via multipart/x-mixed-replace at ~25 fps.
+
+                The MJPEG loop runs until the client disconnects (BrokenPipeError,
+                ConnectionResetError, or OSError on wfile.write).
                 """
                 path = self.path.strip("/")
                 parts = path.split("/", 1)
                 if len(parts) != 2:
-                    self.send_response(404); self.end_headers(); return
+                    self.send_response(404)
+                    self.end_headers()
+                    return
 
                 prefix, key = parts[0], parts[1]
 
-                # /viewer/<key> → HTML page con <img> que apunta al stream
-                # (mismo origen → sin CORS; el browser maneja MJPEG nativamente)
                 if prefix == "viewer":
-                    html = (
-                        "<!DOCTYPE html><html><head>"
-                        "<style>*{margin:0;padding:0;box-sizing:border-box}"
-                        "body{background:#111}"
-                        "img{width:100%;display:block}</style></head>"
-                        f"<body><img src='/stream/{key}'></body></html>"
-                    ).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(html)))
-                    self.end_headers()
-                    self.wfile.write(html)
+                    self._serve_viewer(key)
                     return
 
                 if prefix != "stream":
-                    self.send_response(404); self.end_headers(); return
+                    self.send_response(404)
+                    self.end_headers()
+                    return
 
-                # /stream/<key> → MJPEG multipart
+                self._serve_stream(key)
+
+            def _serve_viewer(self, key: str) -> None:
+                """Serve an HTML page with an auto-reconnecting MJPEG image.
+
+                The JavaScript onerror handler retries the image src every 2 s with a
+                cache-buster (?t=timestamp) so the stream resumes automatically after
+                the pipeline restarts for playback mode — without requiring a page reload.
+                """
+                html = (
+                    "<!DOCTYPE html><html><head>"
+                    "<style>*{margin:0;padding:0;box-sizing:border-box}"
+                    "body{background:#111}"
+                    "img{width:100%;display:block}</style></head>"
+                    f"<body><img id='s' src='/stream/{key}'>"
+                    "<script>(function(){"
+                    "var img=document.getElementById('s');"
+                    f"function retry(){{setTimeout(function(){{img.src='/stream/{key}?t='+Date.now();}},2000);}}"
+                    "img.onerror=retry;"
+                    "})();</script>"
+                    "</body></html>"
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+
+            def _serve_stream(self, key: str) -> None:
+                """Stream MJPEG frames for the given key until the client disconnects."""
                 self.send_response(200)
                 self.send_header(
                     "Content-Type", "multipart/x-mixed-replace; boundary=nxframe"
@@ -174,7 +206,6 @@ class MjpegServer(threading.Thread):
                 self.send_header("Cache-Control", "no-cache, no-store")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-
                 try:
                     while True:
                         with srv._lock:
@@ -187,11 +218,11 @@ class MjpegServer(threading.Thread):
                                 + b"\r\n"
                             )
                             self.wfile.flush()
-                        time.sleep(1 / 25)    # cap at ~25 fps
+                        time.sleep(1 / 25)  # cap at 25 fps
                 except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
+                    pass  # client disconnected — normal end of stream
 
-            def log_message(self, *_):
-                pass    # silenciar access logs del HTTP server
+            def log_message(self, *_) -> None:
+                pass  # silence per-request access logs to keep container output clean
 
         return _Handler
