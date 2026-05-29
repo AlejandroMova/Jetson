@@ -44,8 +44,10 @@ echo ""
 echo "  Iniciando NX QA Visual..."
 echo ""
 
-# Detener el pipeline de producción si está corriendo (para liberar GPU)
-docker compose stop deepstream 2>/dev/null || true
+# Eliminar el container de deepstream para que Docker lo recree con los env vars
+# del override (NX_QA_ENABLED). Un simple stop no es suficiente — Docker reutiliza
+# el container existente y no aplica los cambios de entorno del override file.
+docker compose rm -sf deepstream 2>/dev/null || true
 
 # Construir qa_app si cambió, luego arrancar en background
 docker compose \
