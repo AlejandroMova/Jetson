@@ -570,6 +570,101 @@ with st.sidebar:
         st.caption("Verifica que el pipeline esté corriendo con `./qa.sh`")
 
 
+# ── Helper: lista de clips grabados ───────────────────────────────────────────
+def _render_clips_list() -> None:
+    """Render the saved clips list with thumbnail, metadata, and action buttons.
+
+    Used in both the normal view and the collapsed expander inside playback mode.
+    """
+    clips: list = []
+    if RECORDINGS_DIR.exists():
+        clips = sorted(
+            [d for d in RECORDINGS_DIR.iterdir() if d.is_dir()],
+            reverse=True,
+        )
+
+    if not clips:
+        st.info("No hay grabaciones aún. Se crean automáticamente cuando se detectan personas con el pipeline QA activo.")
+        return
+
+    st.markdown(f"**{len(clips)} clip(s) guardados** · máx 10 GB (auto-rotativo)")
+    st.markdown("")
+
+    for clip_dir in clips:
+        meta_path  = clip_dir / "metadata.json"
+        thumb_path = clip_dir / "thumbnail.jpg"
+        tiled_path = clip_dir / "tiled.mp4"
+
+        try:
+            meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        except Exception:
+            # Corrupted or unreadable metadata — show the clip with blank fields.
+            meta = {}
+
+        ts_label = meta.get("timestamp", clip_dir.name)
+        duration = meta.get("duration_s", 0)
+        max_ppl  = meta.get("max_people", 0)
+        n_frames = meta.get("frame_count", 0)
+        cam_ids  = meta.get("channels", [])
+
+        with st.expander(f"📹 {ts_label}  ·  {duration:.0f}s  ·  {max_ppl} pers. máx"):
+            col_thumb, col_info, col_act = st.columns([3, 4, 3])
+
+            with col_thumb:
+                if thumb_path.exists():
+                    st.image(str(thumb_path), width="stretch")
+                else:
+                    st.caption("Sin thumbnail")
+
+            with col_info:
+                st.caption(f"Duración: {duration:.1f} s")
+                st.caption(f"Frames tileados: {n_frames}")
+                st.caption(f"Personas máx: {max_ppl}")
+                st.caption(f"Cámaras: {len(cam_ids)}")
+                if tiled_path.exists():
+                    st.caption("✅ tiled.mp4 (640×360)")
+                for cam_id in cam_ids:
+                    if (clip_dir / f"{cam_id}.mp4").exists():
+                        st.caption(f"✅ {cam_id}.mp4 (full-res)")
+
+            with col_act:
+                if tiled_path.exists():
+                    if st.button("▶ Preview tiled", key=f"prev_{clip_dir.name}"):
+                        st.session_state["_preview_path"] = str(tiled_path)
+                        st.session_state["_preview_label"] = ts_label
+
+                video_options = []
+                if tiled_path.exists():
+                    video_options.append(("tiled.mp4", str(tiled_path)))
+                for cam_id in cam_ids:
+                    cam_file = clip_dir / f"{cam_id}.mp4"
+                    if cam_file.exists():
+                        video_options.append((f"{cam_id}.mp4", str(cam_file)))
+
+                if video_options and _r:
+                    selected_idx = st.selectbox(
+                        "Inferencia en:",
+                        options=range(len(video_options)),
+                        # Default-arg capture: `vo=video_options` binds this iteration's
+                        # list value into the lambda. Without it, all lambdas in this loop
+                        # would share the same reference and always use the last value.
+                        format_func=lambda i, vo=video_options: vo[i][0],
+                        key=f"inf_sel_{clip_dir.name}",
+                    )
+                    if st.button("▶ Correr Inferencia", key=f"inf_{clip_dir.name}",
+                                 type="primary"):
+                        try:
+                            _r.set("nx:qa:playback_video", video_options[selected_idx][1])
+                            st.success("Pipeline reiniciando con el video seleccionado (~30–60 s)...")
+                        except Exception as exc:
+                            st.error(f"Error al iniciar playback: {exc}")
+
+                if st.button("🗑 Eliminar", key=f"del_{clip_dir.name}"):
+                    shutil.rmtree(clip_dir, ignore_errors=True)
+                    st.toast(f"Clip {ts_label} eliminado.")
+                    st.rerun()
+
+
 # ── MAIN — Tabs: En Vivo | Grabaciones ────────────────────────────────────────
 tab_live, tab_recordings = st.tabs(["🔴 En Vivo", "📹 Grabaciones"])
 
@@ -662,95 +757,68 @@ with tab_recordings:
 
     st.markdown("---")
 
-    # Lista de clips
-    clips: list = []
-    if RECORDINGS_DIR.exists():
-        clips = sorted(
-            [d for d in RECORDINGS_DIR.iterdir() if d.is_dir()],
-            reverse=True,
-        )
+    # When playback is active, show the MJPEG stream full-width so the user can
+    # inspect inference results the same way they would in the live tab.
+    if playback_video:
+        st.markdown(f"### Inferencia en curso: `{Path(playback_video).name}`")
+        col_pb_video, col_pb_det = st.columns([55, 45])
 
-    if not clips:
-        st.info("No hay grabaciones aún. Se crean automáticamente cuando se detectan personas con el pipeline QA activo.")
+        with col_pb_video:
+            # Playback always has a single stream so we always use /stream/all.
+            # The sidebar capability toggles apply in real time during playback.
+            viewer_url = f"http://{MJPEG_HOST}:{MJPEG_PORT}/viewer/all"
+            st.iframe(viewer_url, height=560)
+            st.caption("Playback con inferencia · 640×360 · MJPEG")
+
+        with col_pb_det:
+            st.markdown("### Detecciones")
+            # NOTE: this detection log block is duplicated from tab_live.
+            # Extracting a shared helper would require restructuring the module-level
+            # rendering flow — left as-is to avoid scope creep in this change.
+            det_items = list(_bufs["detections"])
+            if not det_items:
+                st.info("Esperando detecciones... El pipeline puede tardar ~30–60 s en reiniciar.")
+            else:
+                with st.container(height=360):
+                    for d in det_items[:60]:
+                        ts     = (d.get("ts") or "")[-12:-4]
+                        cam    = d.get("cam", "")
+                        tracks = d.get("tracks", [])
+                        if not tracks:
+                            continue
+                        cam_short = cam.split("-ch")[-1] if "-ch" in cam else cam
+                        st.markdown(f"**{ts}** · `ch{cam_short}`")
+                        for t in tracks:
+                            icon  = "⚠️" if t.get("fall") else "👤"
+                            label = t.get("label", f"P#{t.get('track_id', '?')}")
+                            conf  = t.get("confidence", 0)
+                            st.markdown(
+                                f"&nbsp;&nbsp;{icon} `{label}` &nbsp;·&nbsp;`ch{cam_short}` &nbsp;conf={conf:.2f}",
+                                unsafe_allow_html=True,
+                            )
+
+        st.markdown("---")
+        st.markdown("### API Calls")
+        api_items = list(_bufs["apicalls"])
+        if not api_items:
+            st.info("Sin API calls aún.")
+        else:
+            for call in api_items[:15]:
+                ts      = (call.get("ts") or "")[-12:-4]
+                ep      = call.get("endpoint", "/api/?")
+                payload = call.get("payload", {})
+                evt     = payload.get("event_type") or ep.rsplit("/", 1)[-1]
+                cam_raw = payload.get("camera_id", "")
+                cam_lbl = f"  ·  `{cam_raw}`" if cam_raw else ""
+                with st.expander(f"`{ts}`  POST `{ep}`  **{evt}**{cam_lbl}"):
+                    st.json(payload)
+
+        st.markdown("---")
+        with st.expander("Ver grabaciones anteriores"):
+            _render_clips_list()
+
     else:
-        st.markdown(f"**{len(clips)} clip(s) guardados** · máx 10 GB (auto-rotativo)")
-        st.markdown("")
-
-        for clip_dir in clips:
-            meta_path  = clip_dir / "metadata.json"
-            thumb_path = clip_dir / "thumbnail.jpg"
-            tiled_path = clip_dir / "tiled.mp4"
-
-            try:
-                meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-            except Exception:
-                meta = {}
-
-            ts_label  = meta.get("timestamp", clip_dir.name)
-            duration  = meta.get("duration_s", 0)
-            max_ppl   = meta.get("max_people", 0)
-            n_frames  = meta.get("frame_count", 0)
-            cam_ids   = meta.get("channels", [])
-
-            expander_label = f"📹 {ts_label}  ·  {duration:.0f}s  ·  {max_ppl} pers. máx"
-            with st.expander(expander_label):
-                col_thumb, col_info, col_act = st.columns([3, 4, 3])
-
-                with col_thumb:
-                    if thumb_path.exists():
-                        st.image(str(thumb_path), width="stretch")
-                    else:
-                        st.caption("Sin thumbnail")
-
-                with col_info:
-                    st.caption(f"Duración: {duration:.1f} s")
-                    st.caption(f"Frames tileados: {n_frames}")
-                    st.caption(f"Personas máx: {max_ppl}")
-                    st.caption(f"Cámaras: {len(cam_ids)}")
-                    if tiled_path.exists():
-                        st.caption("✅ tiled.mp4 (640×360)")
-                    for cam_id in cam_ids:
-                        cam_file = clip_dir / f"{cam_id}.mp4"
-                        if cam_file.exists():
-                            st.caption(f"✅ {cam_id}.mp4 (full-res)")
-
-                with col_act:
-                    # Preview del video tileado
-                    if tiled_path.exists():
-                        if st.button("▶ Preview tiled", key=f"prev_{clip_dir.name}"):
-                            st.session_state["_preview_path"] = str(tiled_path)
-                            st.session_state["_preview_label"] = ts_label
-
-                    # Correr inferencia sobre un clip (requiere reinicio del pipeline ~30-60 s)
-                    video_options = []
-                    if tiled_path.exists():
-                        video_options.append(("tiled.mp4", str(tiled_path)))
-                    for cam_id in cam_ids:
-                        cam_file = clip_dir / f"{cam_id}.mp4"
-                        if cam_file.exists():
-                            video_options.append((f"{cam_id}.mp4", str(cam_file)))
-
-                    if video_options and _r:
-                        selected_idx = st.selectbox(
-                            "Inferencia en:",
-                            options=range(len(video_options)),
-                            format_func=lambda i: video_options[i][0],
-                            key=f"inf_sel_{clip_dir.name}",
-                        )
-                        if st.button("▶ Correr Inferencia", key=f"inf_{clip_dir.name}",
-                                     type="primary"):
-                            video_path = video_options[selected_idx][1]
-                            try:
-                                _r.set("nx:qa:playback_video", video_path)
-                                st.success("Pipeline reiniciando con el video seleccionado (~30–60 s)...")
-                            except Exception as exc:
-                                st.error(f"Error: {exc}")
-
-                    # Eliminar clip
-                    if st.button("🗑 Eliminar", key=f"del_{clip_dir.name}"):
-                        shutil.rmtree(clip_dir, ignore_errors=True)
-                        st.toast(f"Clip {ts_label} eliminado.")
-                        st.rerun()
+        _render_clips_list()
 
     # ── Preview inline ────────────────────────────────────────────────────────
     if "_preview_path" in st.session_state:

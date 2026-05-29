@@ -97,8 +97,35 @@ PYEOF
 
     if [ -n "$PLAYBACK_VIDEO" ]; then
         echo "[entrypoint] Modo playback: $PLAYBACK_VIDEO"
-        python3 /nx_tech/pipelines/app_video_testing.py --input "$PLAYBACK_VIDEO" --no-loop || true
-        # Limpiar la key para que el siguiente ciclo arranque en live
+
+        # Read active capabilities and client from the last known pipeline status so
+        # the playback pipeline runs the same models the live pipeline was using.
+        # socket_timeout=2: conservative for container-local Redis; 0.5 s would also work.
+        read -r PLAYBACK_CAPS PLAYBACK_CLIENT <<< "$(python3 - <<'PYEOF' 2>/dev/null
+import os, json
+try:
+    import redis
+    r = redis.Redis(
+        host=os.environ.get("REDIS_HOST", "redis"),
+        socket_timeout=2,
+        decode_responses=True,
+    )
+    status = json.loads(r.get("nx:qa:status") or "{}")
+    caps   = ",".join(status.get("capabilities", ["people_counting", "age_gender"]))
+    client = status.get("client", "demo")
+    print(caps, client)
+except Exception:
+    print("people_counting,age_gender demo")
+PYEOF
+)"
+        echo "[entrypoint] Playback caps: $PLAYBACK_CAPS  client: $PLAYBACK_CLIENT"
+        python3 /nx_tech/pipelines/app_video_testing.py \
+            --input "$PLAYBACK_VIDEO" \
+            --capabilities "$PLAYBACK_CAPS" \
+            --client "$PLAYBACK_CLIENT" \
+            --no-loop || true
+
+        # Clear the key so the next loop iteration restarts in live mode.
         python3 - <<'PYEOF' 2>/dev/null
 import os
 try:
