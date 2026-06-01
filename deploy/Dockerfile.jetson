@@ -30,11 +30,13 @@ RUN pip3 install --no-cache-dir \
 # InsightFace — face recognition (ArcFace embeddings)
 RUN pip3 install --no-cache-dir insightface>=0.7.3
 
-# Entrypoint: compiles custom softmax parser + patches ONNX dynamic batch
+# Entrypoint: compiles custom softmax parser + patches ONNX dynamic batch.
+# Invoked via bash so the execute bit is not required — the volume mount in
+# docker-compose.yml overrides the COPY'd file with the host version, and host
+# filesystems (NTFS, some ext4 umasks) may not preserve the execute bit.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 WORKDIR /nx_tech
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/bin/bash", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/bin/bash"]
