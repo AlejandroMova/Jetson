@@ -371,16 +371,6 @@ def main() -> None:
         _mjpeg_srv.start()
         logger.info("[QA] MjpegServer on :8080  /stream/all + /stream/<camera_id>")
 
-        if _redis_qa:
-            try:
-                _redis_qa.set("nx:qa:playback_info", json.dumps({
-                    "video":        video_path,
-                    "capabilities": pipeline_caps,
-                }))
-            except Exception:
-                # Informational metadata — Redis failure here is not critical.
-                pass
-
     # ── Main loop ─────────────────────────────────────────────────────────────
     api_client.start()
 
@@ -415,7 +405,38 @@ def main() -> None:
 
     bus.connect("message", _on_bus_message)
 
-    logger.info("Starting pipeline — first run will build TensorRT engines.")
+    # ── Pre-roll: esperar PAUSED antes de mostrar el video al usuario ─────────
+    # Con filesrc, transicionar a PAUSED fuerza el pre-roll completo del pipeline:
+    # nvinfer compila los TRT engines en este paso (puede tardar minutos la primera
+    # vez). Solo cuando PAUSED se confirma el video está listo para reproducirse
+    # desde el frame 0. Si seteáramos playback_info y arrancáramos PLAYING antes de
+    # esto, filesrc seguiría leyendo el archivo mientras nvinfer compila y el video
+    # llegaría a EOS casi inmediatamente después de que aparezcan los primeros frames.
+    logger.info("[QA] Pre-rolling pipeline (compilando TRT engines si es necesario)...")
+    pipeline.set_state(Gst.State.PAUSED)
+
+    # Timeout de 15 min — suficiente para primera compilación INT8 en Jetson Orin Nano.
+    # get_state() bloquea hasta que el estado se confirma o se agota el timeout.
+    _PREROLL_TIMEOUT_NS = 15 * 60 * 1_000_000_000
+    ret, _cur, _pend = pipeline.get_state(_PREROLL_TIMEOUT_NS)
+    if ret == Gst.StateChangeReturn.FAILURE:
+        logger.error("[QA] Pipeline falló en pre-roll — abortando playback.")
+        sys.exit(1)
+
+    logger.info("[QA] Pre-roll completo — pipeline listo para reproducir.")
+
+    # Solo ahora avisar a Streamlit: los engines están compilados, el video va a
+    # reproducirse desde el frame 0 sin saltar frames.
+    if _IS_QA_ENABLED and _redis_qa:
+        try:
+            _redis_qa.set("nx:qa:playback_info", json.dumps({
+                "video":        video_path,
+                "capabilities": pipeline_caps,
+            }))
+        except Exception:
+            pass
+
+    logger.info("[QA] Iniciando reproducción.")
     pipeline.set_state(Gst.State.PLAYING)
     start_workers()
 
