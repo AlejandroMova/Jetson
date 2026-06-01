@@ -576,33 +576,41 @@ def main():
 
     bus.connect("message", _on_bus_message)
 
-    # QA: detectar solicitud de modo playback desde Streamlit cada 5 s
+    # QA: detectar solicitud de modo playback desde Streamlit
     _exit_for_playback = [False]
     if _IS_QA_ENABLED and _redis_qa:
-        def _check_playback_mode():
-            """Polling de Redis cada 5 s para detectar solicitud de playback desde Streamlit.
+        def _playback_watcher() -> None:
+            """Thread dedicado que vigila Redis cada 3 s buscando una solicitud de playback.
 
-            Cuando el usuario hace clic en "▶ Correr Inferencia" en el dashboard,
-            Streamlit escribe la clave nx:qa:playback_video en Redis con el path del video.
-            Este callback la detecta y llama loop.quit() directamente para detener el pipeline.
+            Más confiable que GLib.timeout_add porque corre en su propio thread y no
+            compite con GStreamer por el GLib main loop. Con 4-6 cámaras + inferencia,
+            el loop principal puede estar tan ocupado procesando mensajes de pipeline
+            que los timers de GLib nunca llegan a dispararse.
 
-            NOTA: No usamos pipeline.send_event(Gst.Event.new_eos()) porque rtspsrc es una
-            live source y puede ignorar o no propagar el evento EOS downstream. El resultado
-            sería que loop.quit() nunca se llama y app.py corre indefinidamente.
-            loop.quit() es seguro de llamar desde un callback de GLib (mismo thread que el loop).
-            El cleanup del pipeline ocurre en el finally block de loop.run() via
-            pipeline.set_state(Gst.State.NULL).
+            Usa GLib.idle_add(loop.quit) para parar el loop desde este thread externo
+            de forma thread-safe: idle_add encola la llamada para que el loop principal
+            la ejecute en su próxima iteración disponible.
             """
-            try:
-                v = _redis_qa.get("nx:qa:playback_video")
-                if v and not _exit_for_playback[0]:
-                    _exit_for_playback[0] = True  # evitar múltiples quit()
-                    logger.info("[QA] Modo playback solicitado: %s — deteniendo pipeline", v)
-                    loop.quit()
-            except Exception:
-                pass
-            return True  # retornar True mantiene el timeout de GLib activo
-        GLib.timeout_add(5000, _check_playback_mode)
+            import time as _time
+            logger.info("[QA] Playback watcher iniciado — polling Redis cada 3 s")
+            while not _exit_for_playback[0]:
+                try:
+                    v = _redis_qa.get("nx:qa:playback_video")
+                    if v and not _exit_for_playback[0]:
+                        _exit_for_playback[0] = True
+                        logger.info("[QA] Playback solicitado: %s — deteniendo pipeline", v)
+                        GLib.idle_add(loop.quit)
+                        return
+                except Exception:
+                    pass
+                _time.sleep(3)
+
+        import threading as _th
+        _th.Thread(
+            target=_playback_watcher,
+            name="playback-watcher",
+            daemon=True,
+        ).start()
 
     logger.info("Starting pipeline…")
     pipeline.set_state(Gst.State.PLAYING)

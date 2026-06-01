@@ -738,12 +738,20 @@ with tab_recordings:
     rec_active = False
     rec_info: dict = {}
     playback_video = ""
+    # playback_info is set by app_video_testing.py only when inference actually starts.
+    # While it's absent (pipeline is transitioning), we show a loading screen instead
+    # of the live MJPEG stream — otherwise the user sees the live RTSP feed (which could
+    # be a nighttime view) and thinks the wrong video is playing.
+    playback_info: dict = {}
     if _r:
         try:
             rec_active = (_r.get("nx:qa:recording_active") or "0") == "1"
             if rec_active:
                 rec_info = json.loads(_r.get("nx:qa:recording_info") or "{}")
             playback_video = _r.get("nx:qa:playback_video") or ""
+            raw_pi = _r.get("nx:qa:playback_info")
+            if raw_pi:
+                playback_info = json.loads(raw_pi)
         except Exception:
             pass
 
@@ -758,7 +766,10 @@ with tab_recordings:
 
     with col_playback:
         if playback_video:
-            st.warning(f"⏯ Playback: `{Path(playback_video).name}`")
+            if playback_info:
+                st.warning(f"⏯ Corriendo inferencia: `{Path(playback_video).name}`")
+            else:
+                st.warning(f"⏳ Iniciando inferencia en: `{Path(playback_video).name}`")
             if st.button("🔴 Volver a En Vivo", type="primary", key="btn_back_live"):
                 if _r:
                     try:
@@ -769,18 +780,32 @@ with tab_recordings:
 
     st.markdown("---")
 
-    # When playback is active, show the MJPEG stream full-width so the user can
-    # inspect inference results the same way they would in the live tab.
-    if playback_video:
-        st.markdown(f"### Inferencia en curso: `{Path(playback_video).name}`")
+    if playback_video and not playback_info:
+        # Transitioning: pipeline is shutting down and app_video_testing.py hasn't started yet.
+        # Do NOT show the MJPEG stream — it would still show the live RTSP feed, which the
+        # user would mistake for the inference video.
+        video_name = Path(playback_video).name
+        st.markdown(f"### Iniciando inferencia en: `{video_name}`")
+        st.info(
+            "El pipeline está reiniciando para correr la inferencia sobre el video seleccionado. "
+            "Esto puede tardar entre 30 segundos y 2 minutos dependiendo de si los motores "
+            "TensorRT ya están compilados. El video aparecerá aquí automáticamente."
+        )
+        st.caption("Esta pantalla se actualiza sola cada 2 segundos.")
+
+    elif playback_video and playback_info:
+        # Inference is running — show the MJPEG stream.
+        video_name = Path(playback_video).name
+        st.markdown(f"### Inferencia en curso: `{video_name}`")
         col_pb_video, col_pb_det = st.columns([55, 45])
 
         with col_pb_video:
-            # Playback always has a single stream so we always use /stream/all.
-            # The sidebar capability toggles apply in real time during playback.
+            # Playback runs a single-stream 1×1 tiler, so /stream/all and the individual
+            # camera stream show the same frame. The sidebar selector has no effect here —
+            # single-file inference only has one stream.
             viewer_url = f"http://{MJPEG_HOST}:{MJPEG_PORT}/viewer/all"
             st.iframe(viewer_url, height=560)
-            st.caption("Playback con inferencia · 640×360 · MJPEG")
+            st.caption(f"`{video_name}` · inferencia con overlays · MJPEG")
 
         with col_pb_det:
             st.markdown("### Detecciones")

@@ -49,7 +49,7 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 **Causa raíz:** `_check_playback_mode()` llamaba `pipeline.send_event(Gst.Event.new_eos())` para terminar el pipeline. Las fuentes RTSP (`rtspsrc`) son _live sources_ en GStreamer — no están diseñadas para recibir EOS como señal de terminación y pueden ignorar o no propagar el evento downstream. El resultado: el bus GStreamer nunca recibe el mensaje EOS, `loop.quit()` nunca se llama desde el bus handler, `app.py` corre indefinidamente, `docker-entrypoint.sh` queda bloqueado esperando que `app.py` termine, y `app_video_testing.py` nunca arranca. Desde el dashboard: el Redis key `nx:qa:playback_video` SÍ queda seteado (la sección "Inferencia en curso" aparece en el UI), pero el stream MJPEG sigue mostrando el live feed sin cambiar.
 
-**Solución:** En `app.py` `_check_playback_mode()`: reemplazar `pipeline.send_event(Gst.Event.new_eos())` con `loop.quit()` directamente. Es seguro llamarlo desde un callback de GLib (mismo thread que el GLib.MainLoop). El cleanup del pipeline ocurre en el `finally` block de `loop.run()` vía `pipeline.set_state(Gst.State.NULL)`, como siempre.
+**Solución:** Reemplazar `GLib.timeout_add` + callback por un thread dedicado (`playback-watcher`) que hace polling de Redis cada 3 s en paralelo. Cuando detecta la key usa `GLib.idle_add(loop.quit)` — thread-safe para llamar al loop principal desde un thread externo. El cleanup del pipeline ocurre en el `finally` block de `loop.run()` vía `pipeline.set_state(Gst.State.NULL)` como siempre. La bandera `_exit_for_playback[0] = True` evita que `loop.quit()` se encole múltiples veces si el loop tarda en reaccionar.
 
 ---
 
