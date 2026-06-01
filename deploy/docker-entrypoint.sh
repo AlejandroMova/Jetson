@@ -136,9 +136,15 @@ except Exception:
 PYEOF
         echo "[entrypoint] Playback terminado — volviendo a modo live"
     else
-        # Modo live: arrancar pipeline principal
+        # Modo live: arrancar pipeline principal.
+        # set +e es necesario porque app.py sale con código 42 para señalar que debe
+        # arrancar el modo playback. Sin set +e, set -e (activo desde el inicio del
+        # script) mataría el entrypoint en ese momento, impidiendo que el loop
+        # continúe y arranque app_video_testing.py.
+        set +e
         "$@"
         EXIT_CODE=$?
+        set -e
         # Código 42 = solicitud de cambio a playback mode (app.py lo emite y loop continúa)
         # Cualquier otro código de error = salir
         if [ $EXIT_CODE -ne 0 ] && [ $EXIT_CODE -ne 42 ]; then

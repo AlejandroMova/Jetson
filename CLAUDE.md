@@ -787,7 +787,7 @@ Script de activación del modo QA. Subcomandos: `start` (default) y `stop`. Al a
 Imagen ARM64 basada en `nvcr.io/nvidia/deepstream:7.1-samples-multiarch`. Instala pyds 1.1.11, onnxruntime-gpu para aarch64, insightface ≥ 0.7.3.
 
 **`docker-entrypoint.sh`**
-Se ejecuta al iniciar el contenedor: (1) compila `custom_softmax_parser.so` para el SGIE de edad/género, (2) parchea el ONNX de PeopleNet para batch dinámico, (3) pre-descarga InsightFace buffalo_l si `face_recognition` está en el pipeline, (4) elimina engines stale si el ONNX fue modificado.
+Se ejecuta al iniciar el contenedor: (1) compila `custom_softmax_parser.so` para el SGIE de edad/género, (2) parchea el ONNX de PeopleNet para batch dinámico, (3) pre-descarga InsightFace buffalo_l si `face_recognition` está en el pipeline, (4) elimina engines stale si el ONNX fue modificado. En QA mode: loop que alterna entre `app.py` (live) y `app_video_testing.py` (playback). El comando `"$@"` que arranca el live pipeline está envuelto en `set +e` / `set -e` para que `set -e` (activo desde el inicio) no mate el entrypoint cuando `app.py` sale con código 42 — sin esta protección el loop nunca llegaría a detectar `nx:qa:playback_video` y arrancar `app_video_testing.py` (ver ErrorHistory.md 2026-06-01).
 
 **`API_REFERENCE.md`**
 Especificación completa de la API REST y WebSocket entre el Jetson y el backend NX. Todos los eventos, formatos JSON, campos requeridos, y semántica de severity.

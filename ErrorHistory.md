@@ -6,6 +6,30 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-06-01 — "Correr Inferencia" no arranca `app_video_testing.py` (set -e en entrypoint)
+
+**Contexto:** `deploy/docker-entrypoint.sh` — loop live/playback en QA mode. Ocurre al hacer clic en "▶ Correr Inferencia" en el dashboard QA.
+
+**Error en consola:**
+```
+(sin error visible — el container simplemente se reinicia)
+Container deepstream exited with code 42
+Container deepstream restarting (policy: unless-stopped)
+```
+
+**Causa raíz:** `set -e` está activo desde el inicio del script. Cuando `app.py` sale con código 42 (señal de "quiero cambiar a modo playback"), `set -e` mata el entrypoint inmediatamente — las líneas `EXIT_CODE=$?` y el `if` que maneja el código 42 nunca se ejecutan. El loop nunca llega a detectar `nx:qa:playback_video` y arrancar `app_video_testing.py` directamente. Docker Compose (`restart: unless-stopped`) reiniciaba el container automáticamente; en el reinicio el entrypoint sí encontraba la key en Redis y arrancaba el playback, pero con 1–3 minutos de overhead extra (restart del container + setup: compilar parser, patchear ONNX).
+
+**Solución:** En `docker-entrypoint.sh`, envolver `"$@"` con `set +e` / `set -e` para que el script capture el exit code sin que `set -e` lo interrumpa:
+```bash
+set +e
+"$@"
+EXIT_CODE=$?
+set -e
+```
+Así el loop continúa inmediatamente después de que `app.py` sale con 42, detecta la key de playback, y arranca `app_video_testing.py` sin necesidad de reiniciar el container.
+
+---
+
 ## 2026-05-29 — Tab Grabaciones muestra pantalla gris persistente, clips con 0 personas máx, y playback no aparece tras "Correr Inferencia"
 
 **Contexto:** `deploy/qa_app/streamlit_app.py`, `deploy/pipelines/recording_manager.py`, `deploy/pipelines/mjpeg_server.py` — tres bugs independientes en el QA Visual App.
