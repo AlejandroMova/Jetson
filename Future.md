@@ -6,6 +6,25 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## Ctrl+C en qa.sh debería hacer shutdown ordenado (igual que `./qa.sh stop`)
+
+**Descripción:** Actualmente `Ctrl+C` en `qa.sh` dispara `_cleanup()` que usa `docker compose kill` (SIGKILL), mientras que `./qa.sh stop` usa `docker compose stop` (SIGTERM). SIGKILL mata los procesos instantáneamente sin darle tiempo a Python de correr bloques `finally` — archivos de video pueden quedar corruptos, Redis puede quedar con estado residual.
+
+**Por qué sería mejor:** El operador usa Ctrl+C en el 90% de los casos porque es más rápido. Que Ctrl+C y `stop` hagan exactamente lo mismo daría shutdown limpio sin requerir recordar usar el comando largo. El tiempo de diferencia es mínimo (~2-3 segundos extra para que los containers se apaguen con SIGTERM).
+
+**Reemplazaría:**
+- Archivo: `deploy/qa.sh`
+- Sección / función: `_cleanup()` (línea ~60)
+- Descripción: cambiar `docker compose ... kill` por `docker compose ... stop --timeout 10` en el handler de Ctrl+C
+
+**Tech stack propuesto:**
+- Sin dependencias nuevas — solo cambiar `kill` por `stop --timeout 10` en `_cleanup()`
+- `--timeout 10` da 10 segundos para shutdown ordenado antes de forzar kill
+
+**Consideraciones:** Con `stop --timeout 10`, Ctrl+C tarda ~2-10 segundos más en completarse. Aceptable dado que `stop` ya lo hace así y nadie se ha quejado de la velocidad de `./qa.sh stop`.
+
+---
+
 ## ~~Galería de embeddings por global_id en ReIdManager (reemplazar EMA único)~~ ✅ IMPLEMENTADO (2026-05-20)
 
 **Descripción:** En lugar de mantener un solo vector EMA por `global_id`, almacenar una galería de hasta K embeddings (propuesta: K=5) que representen distintos ángulos y poses de la persona. Al matchear, la similitud se calcula como `max(query @ emb_i for emb_i in gallery)` — si algún ángulo coincide, el match ocurre aunque el ángulo actual difiera del resto.

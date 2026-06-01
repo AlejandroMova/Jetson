@@ -464,8 +464,11 @@ def main():
                     "osnet_input":      "128x256",
                 },
             }))
-            # Nuevo arranque — borrar overrides viejos del config editor y publicar generación
-            # para que el dashboard Streamlit detecte el reinicio y resetee su session_state.
+            # Nuevo arranque — limpiar estado residual de sesiones anteriores.
+            # playback_info puede quedar seteado si app_video_testing.py fue interrumpido
+            # antes de su bloque finally; sin limpiarla, Streamlit muestra el iframe
+            # prematuramente y el browser recibe "refused to connect".
+            _redis_qa.delete("nx:qa:playback_info")
             _redis_qa.delete("nx:qa:config_overrides")
             _redis_qa.set("nx:qa:config_gen", str(time.time()))
             # Inicializar nx:qa:entry_exit solo si no existe (preserva cambios QA en vivo)

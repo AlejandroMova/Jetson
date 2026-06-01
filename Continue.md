@@ -1,50 +1,69 @@
-# Continue.md — 2026-05-29
+# Continue.md — 2026-06-01
 
 ## Qué estábamos haciendo exactamente
-- Fix del bug de playback QA: botón "▶ Correr Inferencia" fallaba con `Unable to create video pipeline`.
-- El fix fue implementado y commiteado en branch `humanly/refector-pre-tiler-probe`.
+Diagnosticando y corrigiendo el flujo completo de "Correr Inferencia" en el QA Visual Dashboard. El botón clickeaba, seteaba la key en Redis, pero el pipeline nunca cambiaba a modo playback. Luego, una vez que el pipeline sí paraba, el dashboard mostraba "refused to connect" en lugar del video de inferencia.
 
 ## Estado actual
 **Qué funciona:**
-- Pipeline live QA completo: Probe A + Probe B, overlays, MJPEG stream, dashboard Streamlit.
-- La grabación de clips se genera correctamente en `/nx_tech/recordings/`.
-- El refactor de `pre_tiler_analytics_probe` está en producción (branch `humanly/refector-pre-tiler-probe`, probado en Jetson).
-- `qa.sh` corregido: usa `docker compose rm -sf deepstream` para forzar recreación del container.
-- **Playback QA corregido:** `app_video_testing.py` ahora usa `decodebin` en lugar de `qtdemux + h264parse`, soporta mp4v y cualquier otro codec.
+- El watcher thread (`playback-watcher`) está implementado y debería detectar la key en ~3s
+- `app.py` limpia `playback_info` al arrancar (resuelve stale data de sesiones anteriores con Ctrl+C)
+- Streamlit muestra pantalla de "cargando" mientras el pipeline transiciona (no el stream live)
+- Streamlit solo muestra el iframe MJPEG cuando `playback_info` está seteado (inferencia realmente corriendo)
 
-**Qué no funciona / está roto:**
-- Ninguno conocido — pendiente prueba en Jetson real del playback.
+**Qué no hemos probado aún:**
+- El flujo completo end-to-end con los tres fixes juntos
+- La última prueba del usuario mostró "refused to connect" — era por `playback_info` stale de sesión anterior con Ctrl+C. Fix aplicado, sin probar todavía.
 
 ## Decisiones tomadas y por qué
-- **Opción B (decodebin) sobre Opción A (cambiar codec):** `decodebin` es más robusto y funciona con cualquier codec futuro. Cambiar el codec de grabación a `avc1` tenía riesgo de que OpenCV en ARM64 no tenga el encoder H.264.
-- **nvvideoconvert + capsfilter(NVMM, NV12) tras decodebin:** necesario para garantizar NVMM a la entrada de `nvstreammux`, independientemente de si decodebin usó hardware o software decode.
-- **Detección automática de resolución con cv2.VideoCapture:** corrige el issue secundario del streammux hardcodeado a 1920×1080, que causaba distorsión con clips sub-stream (960×544) o tileados (640×360).
+- **Thread dedicado en lugar de `GLib.timeout_add`:** El GLib main loop estaba saturado con mensajes de GStreamer (16 cámaras + inferencia) y los timers nunca se disparaban. El thread corre independientemente y usa `GLib.idle_add(loop.quit)` para parar el loop de forma thread-safe.
+- **`GLib.idle_add(loop.quit)` en lugar de `pipeline.send_event(EOS)`:** `rtspsrc` es una live source y puede ignorar o no propagar eventos EOS downstream. `loop.quit()` para el GLib main loop directamente; el cleanup ocurre en el `finally` block via `pipeline.set_state(Gst.State.NULL)`.
+- **`playback_info` como señal de "inferencia lista":** `app_video_testing.py` ya seteaba esta key cuando arrancaba. Usarla en Streamlit para distinguir "transicionando" (no mostrar iframe) de "corriendo" (mostrar iframe) evita que el usuario vea el stream live de noche durante la transición.
+- **Limpiar `playback_info` en `app.py` al arrancar:** Ctrl+C usa `docker kill` (SIGKILL) y no corre los `finally` blocks de Python. Si `app_video_testing.py` fue matado así, `playback_info` queda en Redis. `app.py` la borra al arrancar para garantizar estado limpio.
 
 ## Qué intentamos que NO funcionó
-- Ninguno — el fix fue directo.
+- **`pipeline.send_event(Gst.Event.new_eos())`:** Primera implementación. Falló porque `rtspsrc` es live source y no propagó el EOS downstream. El loop nunca recibió el mensaje EOS y `app.py` corría indefinidamente.
+- **`loop.quit()` desde `GLib.timeout_add`:** Segunda implementación. Falló porque el GLib main loop estaba saturado con mensajes de GStreamer y el timer nunca se disparaba (o tardaba demasiado).
 
 ## Próximos pasos concretos
-1. Probar en Jetson real: `./qa.sh`, grabar un clip (que alguien entre a cuadro), ir a tab Grabaciones, presionar "▶ Correr Inferencia".
-2. Verificar en logs que el pipeline arranca sin `Unable to create video pipeline` y que aparecen detecciones.
-3. Hacer PR / merge del branch `humanly/refector-pre-tiler-probe` a main si todo funciona.
+1. Hacer `./qa.sh stop && ./qa.sh` para levantar con el código nuevo
+2. Ir a la tab Grabaciones, expandir un clip, clickear "▶ Correr Inferencia"
+3. Verificar en los logs del container que aparece `[QA] Playback watcher iniciado` al arrancar
+4. Verificar que tras clickear aparece `[QA] Playback solicitado: ... — deteniendo pipeline` en ~3s
+5. Verificar que Streamlit muestra la pantalla de "cargando" durante la transición (no el video live)
+6. Verificar que después de 30-120s aparece el iframe con el video de inferencia
+
+**Cómo ver los logs del container deepstream:**
+```bash
+docker compose -f docker-compose.yml -f docker-compose.qa.yml logs -f deepstream
+```
 
 ## Parámetros y valores concretos en juego
-- `decodebin` → `app_video_testing.py:138` — reemplaza qtdemux+h264parse+nvv4l2decoder
-- `caps_nvmm` capsfilter → `app_video_testing.py:140-141` — fuerza NVMM NV12 para streammux
-- `_on_decode_pad_added` → `app_video_testing.py:212` — acepta cualquier pad `video/*`
-- `video_width / video_height` → detectados con `cv2.VideoCapture` en línea 119-123
-- `streammux.set_property("width", video_width)` → línea 146 (antes hardcodeado 1920)
+- `_time.sleep(3)`: intervalo de polling del watcher thread — detecta la key en 0-3s
+- `nx:qa:playback_video`: key seteada por Streamlit al clickear el botón — path al video
+- `nx:qa:playback_info`: key seteada por `app_video_testing.py` cuando arranca — señal de "inferencia lista"
+- `sys.exit(42)`: código de salida de `app.py` para señalar al entrypoint que arranque playback
+- `docker-entrypoint.sh` loop: si exit code es 42 o 0, continúa el loop; cualquier otro código sale
 
 ## Error / síntoma actual (si aplica)
-Ninguno — bug resuelto. Pendiente verificación en Jetson.
+```
+(última prueba del usuario — 2026-06-01)
+Tab Grabaciones → "Inferencia en curso: tiled.mp4"
+iframe MJPEG → "100.67.192.58 refused to connect"
+
+Causa: playback_info stale en Redis de sesión anterior parada con Ctrl+C (SIGKILL).
+       SIGKILL no corre finally blocks → playback_info nunca se borró.
+       Streamlit veía playback_info seteado → mostraba iframe → MjpegServer no estaba corriendo.
+
+Fix aplicado: app.py ahora borra nx:qa:playback_info al arrancar en QA mode (junto a config_overrides).
+```
 
 ## Archivos modificados sin commitear
-- `deploy/pipelines/app_video_testing.py` — source block reemplazado, dims dinámicas, cv2 import
-- `CLAUDE.md` — descripción de app_video_testing.py actualizada
-- `ErrorHistory.md` — entrada del bug mp4v/h264parse agregada
-- `Continue.md` — este archivo
+- `deploy/pipelines/app.py` — watcher thread (`_playback_watcher`) reemplaza `GLib.timeout_add`; borra `nx:qa:playback_info` al arrancar en QA mode
+- `deploy/qa_app/streamlit_app.py` — pantalla de "cargando" durante transición; lee `nx:qa:playback_info` para saber cuándo mostrar el iframe
 
 ## Archivos y secciones que estábamos modificando
-| Archivo | Función / sección | Qué se cambió |
-|---------|-------------------|---------------|
-| `deploy/pipelines/app_video_testing.py` | Source block (líneas 132-142), Streammux (146-147), all_elements (199-203), Linking (211-231) | Reemplazar qtdemux+h264parse+nvv4l2decoder con decodebin+nvvidconv_src+caps_nvmm; dims dinámicas |
+| Archivo | Función / sección | Qué se estaba cambiando |
+|---------|-------------------|-------------------------|
+| `deploy/pipelines/app.py` | `main()` — bloque QA startup (~línea 467) | `_redis_qa.delete("nx:qa:playback_info")` junto a los otros deletes al arrancar |
+| `deploy/pipelines/app.py` | `main()` — bloque playback watcher (~línea 582) | Reemplazar `GLib.timeout_add` por thread dedicado con `GLib.idle_add(loop.quit)` |
+| `deploy/qa_app/streamlit_app.py` | `tab_recordings` (~línea 735) | Leer `playback_info`, mostrar loading screen vs iframe según estado |
