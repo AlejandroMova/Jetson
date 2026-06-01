@@ -584,15 +584,21 @@ def main():
 
             Cuando el usuario hace clic en "▶ Correr Inferencia" en el dashboard,
             Streamlit escribe la clave nx:qa:playback_video en Redis con el path del video.
-            Este callback la detecta, envía EOS al pipeline para detenerlo limpiamente,
-            y main() sale con código 42 para que docker-entrypoint.sh arranque el modo playback.
+            Este callback la detecta y llama loop.quit() directamente para detener el pipeline.
+
+            NOTA: No usamos pipeline.send_event(Gst.Event.new_eos()) porque rtspsrc es una
+            live source y puede ignorar o no propagar el evento EOS downstream. El resultado
+            sería que loop.quit() nunca se llama y app.py corre indefinidamente.
+            loop.quit() es seguro de llamar desde un callback de GLib (mismo thread que el loop).
+            El cleanup del pipeline ocurre en el finally block de loop.run() via
+            pipeline.set_state(Gst.State.NULL).
             """
             try:
                 v = _redis_qa.get("nx:qa:playback_video")
                 if v and not _exit_for_playback[0]:
-                    _exit_for_playback[0] = True  # evitar enviar EOS múltiples veces
-                    logger.info("[QA] Modo playback solicitado: %s — enviando EOS", v)
-                    pipeline.send_event(Gst.Event.new_eos())
+                    _exit_for_playback[0] = True  # evitar múltiples quit()
+                    logger.info("[QA] Modo playback solicitado: %s — deteniendo pipeline", v)
+                    loop.quit()
             except Exception:
                 pass
             return True  # retornar True mantiene el timeout de GLib activo

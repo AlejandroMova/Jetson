@@ -36,6 +36,23 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-05-31 — "Correr Inferencia" no cambia el pipeline a modo playback (EOS ignorado por rtspsrc)
+
+**Contexto:** `deploy/pipelines/app.py` — función `_check_playback_mode()`. Ocurre al hacer clic en "▶ Correr Inferencia" en la tab Grabaciones del dashboard QA.
+
+**Error en consola:**
+```
+(sin error — comportamiento silencioso)
+[QA] Modo playback solicitado: /nx_tech/recordings/.../tiled.mp4 — enviando EOS
+(el pipeline sigue corriendo indefinidamente, nunca aparece "Playback terminado — volviendo a modo live")
+```
+
+**Causa raíz:** `_check_playback_mode()` llamaba `pipeline.send_event(Gst.Event.new_eos())` para terminar el pipeline. Las fuentes RTSP (`rtspsrc`) son _live sources_ en GStreamer — no están diseñadas para recibir EOS como señal de terminación y pueden ignorar o no propagar el evento downstream. El resultado: el bus GStreamer nunca recibe el mensaje EOS, `loop.quit()` nunca se llama desde el bus handler, `app.py` corre indefinidamente, `docker-entrypoint.sh` queda bloqueado esperando que `app.py` termine, y `app_video_testing.py` nunca arranca. Desde el dashboard: el Redis key `nx:qa:playback_video` SÍ queda seteado (la sección "Inferencia en curso" aparece en el UI), pero el stream MJPEG sigue mostrando el live feed sin cambiar.
+
+**Solución:** En `app.py` `_check_playback_mode()`: reemplazar `pipeline.send_event(Gst.Event.new_eos())` con `loop.quit()` directamente. Es seguro llamarlo desde un callback de GLib (mismo thread que el GLib.MainLoop). El cleanup del pipeline ocurre en el `finally` block de `loop.run()` vía `pipeline.set_state(Gst.State.NULL)`, como siempre.
+
+---
+
 ## 2026-05-29 — Playback QA falla con `Unable to create video pipeline` al correr inferencia sobre clips grabados
 
 **Contexto:** `deploy/pipelines/app_video_testing.py` — invocado desde `docker-entrypoint.sh` cuando `nx:qa:playback_video` tiene un path en Redis (botón "▶ Correr Inferencia" del dashboard Streamlit).
