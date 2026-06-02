@@ -6,6 +6,32 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-06-02 — Grabaciones con `max_people: 0` y sin personas visibles en "Correr Inferencia"
+
+**Contexto:** `deploy/pipelines/recording_manager.py` — `_reset_writers()`. Ocurre al terminar un clip y arrancar el siguiente inmediatamente.
+
+**Error en consola:**
+```
+(sin error visible — los clips se guardan normalmente pero metadata.json tiene max_people: 0)
+```
+
+**Causa raíz 1 — `_last_det_time` no se reseteaba:**
+`_reset_writers()` ponía `_max_people = 0` pero NO reseteaba `_last_det_time`. El loop IDLE de `_record_loop` veía que `_last_det_time < 1.0 s` (detección reciente) y arrancaba un clip nuevo **antes** de que el probe llamara `notify_detection` otra vez. El clip nuevo empezaba con `_max_people = 0` y grababa frames vacíos (las personas ya se habían ido). Al hacer "Correr Inferencia" sobre esos clips, PeopleNet no encontraba a nadie.
+
+**Solución:** Agregar `self._last_det_time = None` en `_reset_writers()` para forzar una detección fresca antes del próximo clip.
+
+**Causa raíz 2 — `tiled.mp4` tenía bboxes quemados:**
+En `_qa_overlay_probe` (Probe B), `_draw_qa_overlays()` modificaba el frame in-place y **después** se ponía en `tiled_frame_queue`. MjpegServer lo leía y lo pasaba a `push_tiled_frame()` — el `tiled.mp4` grabado tenía los overlays ya dibujados como píxeles. Al correr inferencia sobre ese video, PeopleNet detectaba mal y se veían bboxes dobles o desfasados.
+
+**Solución:** En `_qa_overlay_probe`, llamar `push_tiled_frame(raw_copy)` **antes** de `_draw_qa_overlays()`. Quitar el `push_tiled_frame()` de `MjpegServer._encode_loop` (el recorder ya recibe el frame crudo directo del probe).
+
+**Causa raíz 3 — `duration_s` era tiempo de reloj (incluía cooldown):**
+`_finish()` calculaba `duration_s = elapsed` (tiempo de reloj desde `_start()` hasta `_finish()`), que incluye el cooldown de 10 s sin detecciones. Un clip de 5 s de contenido real mostraba `duration_s ≈ 15`. El video file era más corto que lo que decía la metadata.
+
+**Solución:** Cambiar `duration_s = round(frame_count / fps, 1)` — duración real del video file.
+
+---
+
 ## 2026-06-01 — "Correr Inferencia" no arranca `app_video_testing.py` (set -e en entrypoint)
 
 **Contexto:** `deploy/docker-entrypoint.sh` — loop live/playback en QA mode. Ocurre al hacer clic en "▶ Correr Inferencia" en el dashboard QA.

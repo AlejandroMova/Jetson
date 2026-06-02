@@ -93,10 +93,9 @@ class MjpegServer(threading.Thread):
                     # Corrupt or incompatible frame — skip silently rather than crashing
                     # the MJPEG server. The next frame will replace it.
                     pass
-                # Forward to RecordingManager without making an extra copy —
-                # the frame is already a copy from the probe.
-                if self._recorder is not None:
-                    self._recorder.push_tiled_frame(frame)
+                # Tiled recording is now handled directly by _qa_overlay_probe (Probe B),
+                # which pushes the raw frame before drawing overlays. MjpegServer only
+                # sees the overlaid frame, so it must NOT forward it to the recorder.
             except Empty:
                 pass
 

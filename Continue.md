@@ -1,69 +1,71 @@
 # Continue.md — 2026-06-01
 
 ## Qué estábamos haciendo exactamente
-Diagnosticando y corrigiendo el flujo completo de "Correr Inferencia" en el QA Visual Dashboard. El botón clickeaba, seteaba la key en Redis, pero el pipeline nunca cambiaba a modo playback. Luego, una vez que el pipeline sí paraba, el dashboard mostraba "refused to connect" en lugar del video de inferencia.
+Arreglando el flujo completo de "▶ Correr Inferencia" en el QA Visual Dashboard (tab Grabaciones). El botón seteaba Redis pero `app_video_testing.py` nunca arrancaba, o arrancaba pero el video aparecía y desaparecía en segundos.
 
 ## Estado actual
 **Qué funciona:**
-- El watcher thread (`playback-watcher`) está implementado y debería detectar la key en ~3s
-- `app.py` limpia `playback_info` al arrancar (resuelve stale data de sesiones anteriores con Ctrl+C)
-- Streamlit muestra pantalla de "cargando" mientras el pipeline transiciona (no el stream live)
-- Streamlit solo muestra el iframe MJPEG cuando `playback_info` está seteado (inferencia realmente corriendo)
+- El botón "Correr Inferencia" ahora arranca `app_video_testing.py` correctamente
+- El watcher thread en `app.py` detecta `nx:qa:playback_video` en ≤3s y llama `loop.quit()`
+- El entrypoint detecta el exit code 42 y arranca el playback (fix `set +e`/`set -e`)
+- Streamlit muestra pantalla de "cargando" durante la transición (no el stream live)
+- `playback_info` stale de sesiones anteriores se borra al arrancar `app.py`
+- `docker-entrypoint.sh` montado como volumen: cambios toman efecto sin rebuild de imagen
+- `Dockerfile.jetson` usa `ENTRYPOINT ["/bin/bash", "..."]`: no requiere execute bit en el archivo (resuelve `permission denied` con volume mount en NTFS/ext4)
 
 **Qué no hemos probado aún:**
-- El flujo completo end-to-end con los tres fixes juntos
-- La última prueba del usuario mostró "refused to connect" — era por `playback_info` stale de sesión anterior con Ctrl+C. Fix aplicado, sin probar todavía.
+- El fix de pre-roll (`set_state(PAUSED)` antes de `PLAYING`) — resuelve que el video dure correctamente
+  - Usuario reportó que el video aparecía y desaparecía en segundos
+  - Causa: `filesrc` leía el archivo mientras TRT engines compilaban, llegaba a EOS antes de que el usuario viera frames
+  - Fix: `pipeline.set_state(Gst.State.PAUSED)` + `pipeline.get_state(15min timeout)` → `playback_info` seteado → `PLAYING`
+  - Este cambio está aplicado en `app_video_testing.py` pero pendiente de probar
 
 ## Decisiones tomadas y por qué
-- **Thread dedicado en lugar de `GLib.timeout_add`:** El GLib main loop estaba saturado con mensajes de GStreamer (16 cámaras + inferencia) y los timers nunca se disparaban. El thread corre independientemente y usa `GLib.idle_add(loop.quit)` para parar el loop de forma thread-safe.
-- **`GLib.idle_add(loop.quit)` en lugar de `pipeline.send_event(EOS)`:** `rtspsrc` es una live source y puede ignorar o no propagar eventos EOS downstream. `loop.quit()` para el GLib main loop directamente; el cleanup ocurre en el `finally` block via `pipeline.set_state(Gst.State.NULL)`.
-- **`playback_info` como señal de "inferencia lista":** `app_video_testing.py` ya seteaba esta key cuando arrancaba. Usarla en Streamlit para distinguir "transicionando" (no mostrar iframe) de "corriendo" (mostrar iframe) evita que el usuario vea el stream live de noche durante la transición.
-- **Limpiar `playback_info` en `app.py` al arrancar:** Ctrl+C usa `docker kill` (SIGKILL) y no corre los `finally` blocks de Python. Si `app_video_testing.py` fue matado así, `playback_info` queda en Redis. `app.py` la borra al arrancar para garantizar estado limpio.
+- **`set +e`/`set -e` alrededor de `"$@"` en entrypoint:** `set -e` en bash puede matar el script cuando `app.py` sale con código 42 (non-zero). Aunque el comportamiento de `set -e` en while loops es ambiguo entre versiones de bash, la protección explícita es más robusta.
+- **Volume mount de `docker-entrypoint.sh` en `docker-compose.yml`:** El entrypoint está `COPY`-ado en la imagen. Sin el mount, cambios al entrypoint requieren `docker build`. Con el mount, aplican con solo reiniciar el container.
+- **`ENTRYPOINT ["/bin/bash", "..."]` en Dockerfile.jetson:** Cuando el archivo se monta desde un host Windows/NTFS, el bit de ejecución no se preserva → `permission denied`. Invocar bash explícitamente elimina esa dependencia. También elimina el `RUN chmod +x` layer.
+- **Pre-roll PAUSED antes de PLAYING:** Con `filesrc`, GStreamer puede seguir leyendo el archivo mientras `nvinfer` compila TRT engines. Al quedarse en PAUSED, el pipeline bloquea el source hasta que todos los elementos están listos. Solo después se setea `playback_info` para que Streamlit muestre el iframe.
+- **`GLib.idle_add(loop.quit)` se mantuvo:** Aunque `loop.quit()` directo es también thread-safe, el ErrorHistory documenta que `idle_add` fue la solución elegida tras dos intentos fallidos anteriores. No contradice nada y funciona.
 
 ## Qué intentamos que NO funcionó
-- **`pipeline.send_event(Gst.Event.new_eos())`:** Primera implementación. Falló porque `rtspsrc` es live source y no propagó el EOS downstream. El loop nunca recibió el mensaje EOS y `app.py` corría indefinidamente.
-- **`loop.quit()` desde `GLib.timeout_add`:** Segunda implementación. Falló porque el GLib main loop estaba saturado con mensajes de GStreamer y el timer nunca se disparaba (o tardaba demasiado).
+- **`pipeline.send_event(Gst.Event.new_eos())`:** rtspsrc ignora EOS como señal de terminación (live source). Documentado en ErrorHistory.md 2026-05-31.
+- **`GLib.timeout_add` para detectar playback:** El GLib main loop estaba saturado con mensajes de GStreamer, el timer nunca disparaba. Documentado en ErrorHistory.md 2026-05-31.
+- **Imagen Docker sin rebuild:** El `set +e` fix al entrypoint no tomaba efecto porque el archivo está `COPY`-ado en la imagen. El contenedor seguía usando el entrypoint viejo hasta que se montó como volumen.
 
 ## Próximos pasos concretos
-1. Hacer `./qa.sh stop && ./qa.sh` para levantar con el código nuevo
-2. Ir a la tab Grabaciones, expandir un clip, clickear "▶ Correr Inferencia"
-3. Verificar en los logs del container que aparece `[QA] Playback watcher iniciado` al arrancar
-4. Verificar que tras clickear aparece `[QA] Playback solicitado: ... — deteniendo pipeline` en ~3s
-5. Verificar que Streamlit muestra la pantalla de "cargando" durante la transición (no el video live)
-6. Verificar que después de 30-120s aparece el iframe con el video de inferencia
-
-**Cómo ver los logs del container deepstream:**
-```bash
-docker compose -f docker-compose.yml -f docker-compose.qa.yml logs -f deepstream
-```
+1. Probar el fix de pre-roll: `./qa.sh stop && ./qa.sh`, clickear "▶ Correr Inferencia", verificar que el video dura los ~60s completos
+2. Verificar en logs que aparece `[QA] Pre-rolling pipeline` y luego `[QA] Pre-roll completo`:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.qa.yml logs -f deepstream
+   ```
+3. Si el pre-roll tarda >15 min (TRT engines no cacheados), aumentar `_PREROLL_TIMEOUT_NS` en `app_video_testing.py` línea ~430
+4. (Opcional) Actualizar ErrorHistory.md y CLAUDE.md con los fixes de esta sesión
 
 ## Parámetros y valores concretos en juego
-- `_time.sleep(3)`: intervalo de polling del watcher thread — detecta la key en 0-3s
-- `nx:qa:playback_video`: key seteada por Streamlit al clickear el botón — path al video
-- `nx:qa:playback_info`: key seteada por `app_video_testing.py` cuando arranca — señal de "inferencia lista"
+- `_PREROLL_TIMEOUT_NS = 15 * 60 * 1_000_000_000`: timeout de 15 min para esperar PAUSED (compilación TRT). En `app_video_testing.py` ~línea 430.
+- `nx:qa:playback_video`: key seteada por Streamlit → detectada por `_playback_watcher` en `app.py` cada 3s
+- `nx:qa:playback_info`: key seteada por `app_video_testing.py` DESPUÉS del pre-roll → Streamlit muestra iframe
 - `sys.exit(42)`: código de salida de `app.py` para señalar al entrypoint que arranque playback
-- `docker-entrypoint.sh` loop: si exit code es 42 o 0, continúa el loop; cualquier otro código sale
+- `set +e` / `set -e`: bloque en `docker-entrypoint.sh` ~línea 144 que protege la captura de exit code 42
 
 ## Error / síntoma actual (si aplica)
 ```
-(última prueba del usuario — 2026-06-01)
-Tab Grabaciones → "Inferencia en curso: tiled.mp4"
-iframe MJPEG → "100.67.192.58 refused to connect"
-
-Causa: playback_info stale en Redis de sesión anterior parada con Ctrl+C (SIGKILL).
-       SIGKILL no corre finally blocks → playback_info nunca se borró.
-       Streamlit veía playback_info seteado → mostraba iframe → MjpegServer no estaba corriendo.
-
-Fix aplicado: app.py ahora borra nx:qa:playback_info al arrancar en QA mode (junto a config_overrides).
+(pendiente de probar el fix de pre-roll)
+Síntoma antes del fix:
+  - Click "Correr Inferencia" → pantalla cargando →  video aparece por 2-5 segundos → desaparece
+  - Causa: filesrc llegaba a EOS durante compilación TRT, video casi terminado cuando frames empezaban a fluir
 ```
 
 ## Archivos modificados sin commitear
-- `deploy/pipelines/app.py` — watcher thread (`_playback_watcher`) reemplaza `GLib.timeout_add`; borra `nx:qa:playback_info` al arrancar en QA mode
-- `deploy/qa_app/streamlit_app.py` — pantalla de "cargando" durante transición; lee `nx:qa:playback_info` para saber cuándo mostrar el iframe
+- `deploy/docker-entrypoint.sh` — `set +e`/`set -e` alrededor de `"$@"` en el bloque live mode
+- `deploy/docker-compose.yml` — volume mount de `docker-entrypoint.sh`
+- `deploy/Dockerfile.jetson` — `ENTRYPOINT ["/bin/bash", "..."]`, eliminado `RUN chmod +x`
+- `deploy/pipelines/app_video_testing.py` — pre-roll PAUSED antes de PLAYING; `playback_info` movido a después del pre-roll
 
 ## Archivos y secciones que estábamos modificando
 | Archivo | Función / sección | Qué se estaba cambiando |
 |---------|-------------------|-------------------------|
-| `deploy/pipelines/app.py` | `main()` — bloque QA startup (~línea 467) | `_redis_qa.delete("nx:qa:playback_info")` junto a los otros deletes al arrancar |
-| `deploy/pipelines/app.py` | `main()` — bloque playback watcher (~línea 582) | Reemplazar `GLib.timeout_add` por thread dedicado con `GLib.idle_add(loop.quit)` |
-| `deploy/qa_app/streamlit_app.py` | `tab_recordings` (~línea 735) | Leer `playback_info`, mostrar loading screen vs iframe según estado |
+| `deploy/docker-entrypoint.sh` | bloque `else` del loop live (~línea 139) | `set +e`/`set -e` alrededor de `"$@"` |
+| `deploy/docker-compose.yml` | volumes del servicio `deepstream` | volume mount `./docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh` |
+| `deploy/Dockerfile.jetson` | ENTRYPOINT (~línea 34) | `/bin/bash` explícito, sin `chmod +x` |
+| `deploy/pipelines/app_video_testing.py` | bloque QA services + main loop (~línea 374–420) | pre-roll PAUSED; `playback_info` movido post-preroll |

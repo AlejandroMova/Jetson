@@ -2193,6 +2193,15 @@ def _qa_overlay_probe(gst_buffer, batch_meta) -> Gst.PadProbeReturn:
             })
 
     if qa_frame_bgr is not None:
+        # Record raw (no-overlay) tiled frame BEFORE drawing bboxes so tiled.mp4 is virgin.
+        # "Correr Inferencia" replays this video through the full pipeline and draws fresh
+        # bboxes — it needs the original pixels, not bboxes already burned in as pixels.
+        if _recording_manager is not None and _recording_manager.is_recording:
+            try:
+                _recording_manager.push_tiled_frame(qa_frame_bgr.copy())
+            except Exception:
+                pass
+
         try:
             _draw_qa_overlays(qa_frame_bgr, qa_all_tracks)
         except Exception as _e:

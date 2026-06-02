@@ -227,12 +227,13 @@ class RecordingManager:
 
         The first frame is also saved as thumbnail.jpg for the Streamlit clip gallery.
         """
+        # create tiled writer if not created
         h, w = frame.shape[:2]
         if self._tiled_writer is None:
             self._tiled_writer = cv2.VideoWriter(
                 str(self._clip_dir / "tiled.mp4"), _FOURCC, self._fps, (w, h)
             )
-
+        # create thumbnail if not created yet
         if not self._thumbnail_saved:
             cv2.imwrite(
                 str(self._clip_dir / "thumbnail.jpg"),
@@ -261,9 +262,13 @@ class RecordingManager:
             self._tiled_writer.release()
         for w in self._cam_writers.values():
             w.release()
+        # duration_s reflects the actual encoded video length (frame_count / fps), not wall
+        # clock time. Wall clock includes the 10 s cooldown after the last detection, so it
+        # would always be ~10 s longer than the watchable content in the video file.
+        video_duration = round(self._frame_count / self._fps, 1) if self._frame_count > 0 else round(elapsed, 1)
         meta = {
             "timestamp":   self._clip_ts,
-            "duration_s":  round(elapsed, 1),
+            "duration_s":  video_duration,
             "channels":    list(self._cam_writers.keys()),
             "frame_count": self._frame_count,
             "max_people":  self._max_people,
@@ -309,7 +314,10 @@ class RecordingManager:
         self._cam_qs = {}
         self._clip_dir = None
         self._clip_start = None
-        self._max_people = 0    # reset here, not in _start() — see _start() docstring
+        self._max_people = 0       # reset here, not in _start() — see _start() docstring
+        self._last_det_time = None  # force a fresh detection before next clip; without this
+                                    # the IDLE loop sees the stale timestamp and starts a new
+                                    # clip immediately with _max_people=0
 
     def _publish_state(self, active: bool, clip_ts: str = "") -> None:
         """Publish recording state to Redis for the Streamlit dashboard.
