@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     libcairo2-dev pkg-config \
     kmod \
+    nmap \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-built pyds wheel for arm64 — no 20-minute from-source build needed.
