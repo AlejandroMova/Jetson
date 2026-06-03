@@ -550,30 +550,100 @@ def main():
     bus  = pipeline.get_bus()
     bus.add_signal_watch()
 
+    # ── DVR IP auto-rediscovery ───────────────────────────────────────────────
+    # Si TODOS los streams RTSP fallan en los primeros 60 s de arranque, es señal
+    # de que el DVR cambió de IP por DHCP. En ese caso se corre nmap para encontrar
+    # la nueva IP, se actualiza /etc/nx_dvr_ip y se reinicia el pipeline (exit 1).
+    _pipeline_start_time  = time.monotonic()
+    _failed_sources: set  = set()
+    _exit_for_rediscover  = [False]
+    _STARTUP_WINDOW_S     = 60   # solo actuar si todos fallan dentro de los primeros 60 s
+
+    def _try_rediscover_dvr() -> None:
+        """Corre en background thread cuando todas las fuentes RTSP fallan al arrancar.
+
+        Ejecuta nmap en la subred /24 del DVR actual buscando un host con el puerto
+        554 abierto. Si encuentra una IP distinta a la actual:
+          1. Escribe la nueva IP en /etc/nx_dvr_ip
+          2. Pide al main loop que termine (exit code 1)
+          3. docker-entrypoint.sh detecta el exit 1 y reinicia app.py con la nueva IP
+
+        Solo se lanza una vez por ciclo de vida del pipeline (guardado por _exit_for_rediscover).
+        """
+        import subprocess
+
+        current_ip = cfg.dvr_ip
+        try:
+            import ipaddress
+            subnet = str(ipaddress.ip_network(f"{current_ip}/24", strict=False))
+        except Exception as e:
+            logger.error("[DVR] No se pudo derivar subred de %s: %s", current_ip, e)
+            return
+
+        logger.info("[DVR] Escaneando %s en puerto 554 (nmap -T4, ~15 s)...", subnet)
+        try:
+            result = subprocess.run(
+                ["nmap", "-p", "554", subnet, "--open", "-T4", "-oG", "-"],
+                capture_output=True, text=True, timeout=90,
+            )
+            new_ip = None
+            for line in result.stdout.splitlines():
+                if line.startswith("Host:") and "554/open" in line:
+                    candidate = line.split()[1]
+                    if candidate != current_ip:
+                        new_ip = candidate
+                        break
+        except Exception as e:
+            logger.error("[DVR] nmap falló: %s", e)
+            return
+
+        if new_ip:
+            logger.info("[DVR] DVR encontrado en nueva IP: %s → %s — actualizando y reiniciando", current_ip, new_ip)
+            try:
+                Path("/etc/nx_dvr_ip").write_text(new_ip)
+            except Exception as e:
+                logger.error("[DVR] No se pudo escribir /etc/nx_dvr_ip: %s", e)
+                return
+            _exit_for_rediscover[0] = True
+            GLib.idle_add(loop.quit)  # loop.quit() → finally → sys.exit(0) → entrypoint reinicia app.py
+        else:
+            logger.warning("[DVR] DVR no encontrado en %s. ¿Está apagado o cambió de subred?", subnet)
+
     def _on_bus_message(_bus, message):
         """Maneja mensajes del bus GStreamer: EOS, WARNING y ERROR.
 
         Los errores en fuentes RTSP individuales (source-N) no detienen el pipeline —
         el stream simplemente se pierde pero los demás continúan. Solo los errores
         en elementos core (mux, PGIE, tracker) detienen el pipeline completo.
+
+        Si TODAS las fuentes configuradas fallan dentro del primer minuto de arranque,
+        se asume cambio de IP del DVR y se lanza _try_rediscover_dvr en background.
         """
         t = message.type
         if t == Gst.MessageType.EOS:
-            # Fin de stream — ocurre en modo playback o cuando todas las fuentes RTSP se cierran
             logger.info("EOS received — stopping.")
             loop.quit()
         elif t == Gst.MessageType.WARNING:
-            # Advertencias no fatales — loguear para diagnóstico sin detener el pipeline
             err, dbg = message.parse_warning()
             logger.warning("GStreamer WARNING: %s — %s", err, dbg)
         elif t == Gst.MessageType.ERROR:
             err, dbg = message.parse_error()
             src_name = message.src.get_name() if message.src else ""
             if src_name.startswith("source-"):
-                # Error en una cámara RTSP — el resto del pipeline continúa
                 logger.warning("RTSP '%s' failed: %s — pipeline continues.", src_name, err)
+                _failed_sources.add(src_name)
+                # Trigger rediscovery if ALL configured sources failed in the startup window
+                elapsed = time.monotonic() - _pipeline_start_time
+                if (not _exit_for_rediscover[0]
+                        and elapsed < _STARTUP_WINDOW_S
+                        and len(_failed_sources) >= len(cfg.channels)):
+                    logger.warning(
+                        "[DVR] Todos los %d streams fallaron en %.0f s — probablemente el DVR cambió de IP",
+                        len(cfg.channels), elapsed,
+                    )
+                    import threading as _th
+                    _th.Thread(target=_try_rediscover_dvr, name="dvr-rediscover", daemon=True).start()
             else:
-                # Error en elemento core — detener todo
                 logger.error("GStreamer ERROR: %s — %s", err, dbg)
                 loop.quit()
 
@@ -630,9 +700,13 @@ def main():
         if _recording_manager is not None:
             _recording_manager.stop()
 
-    # Salir con código 42 para que docker-entrypoint.sh arranque modo playback
+    # exit 42 → el entrypoint loop arranca app_video_testing.py (playback)
     if _exit_for_playback[0]:
         sys.exit(42)
+    # exit 0 → el entrypoint loop reinicia app.py con la nueva IP ya escrita en /etc/nx_dvr_ip
+    if _exit_for_rediscover[0]:
+        logger.info("[DVR] Reiniciando pipeline con nueva IP del DVR.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

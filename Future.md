@@ -312,22 +312,11 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 
 ---
 
-## ~~Auto-recuperación cuando el DVR cambia de IP~~ ✅ IMPLEMENTADO (2026-05-26)
+## ~~Auto-recuperación cuando el DVR cambia de IP~~ ✅ IMPLEMENTADO (2026-06-02)
 
-**Descripción:** Cuando todos los streams RTSP fallan al arrancar (o todos mueren dentro de los primeros 30 s), `app.py` lanza automáticamente un ping sweep del subnet configurado para encontrar la nueva IP del DVR. Si la encuentra, actualiza `/etc/nx_dvr_ip` y reinicia el pipeline con la nueva dirección — sin intervención manual.
+**Descripción:** Cuando todos los streams RTSP fallan dentro de los primeros 60 s de arranque, `app.py` lanza automáticamente nmap en la subred /24 del DVR actual buscando un host con puerto 554 abierto. Si encuentra una IP distinta, actualiza `/etc/nx_dvr_ip` y sale con código 0 para que el entrypoint reinicie `app.py` con la nueva dirección — sin intervención manual.
 
-**Por qué sería mejor:** En instalaciones de campo la IP del DVR puede cambiar por DHCP, cambio de router, o re-configuración del cliente. Hoy el pipeline queda corriendo vacío hasta que alguien lo detecta y actualiza `/etc/nx_dvr_ip` manualmente.
-
-**Reemplazaría:**
-- Archivo: `deploy/pipelines/app.py`
-- Sección / función: bus handler `_on_bus_message` + nueva función `_try_rediscover_dvr()`
-- Descripción: agregar lógica que cuente streams fallidos en los primeros 30 s; si todos fallan, llamar `identify_dvr.py` con el subnet derivado del IP actual del Jetson (via `ip route get 1`). Si se encuentra una nueva IP, escribir `/etc/nx_dvr_ip` y hacer `sys.exit(1)` para que el entrypoint reinicie el pipeline.
-
-**Tech stack propuesto:**
-- `identify_dvr.py` ya existente en `deploy/tools/`
-- Alternativa más rápida: `subprocess.run(["nmap", "-p", "554", subnet, "--open"])` — solo busca el host sin probar patrones RTSP (asume que el patrón del DVR no cambia, solo la IP)
-
-**Consideraciones:** `identify_dvr.py` tarda 2-5 min; la versión solo-nmap tarda ~15 s. Para runtime, preferir la versión rápida. Activar solo si el 100% de los streams fallan en los primeros 30 s (no activar por fallo de cámaras individuales). El subnet se puede derivar del `ip route` del Jetson sin configuración adicional.
+**Implementado en:** `deploy/pipelines/app.py` — función `_try_rediscover_dvr()` + contador `_failed_sources` en `_on_bus_message`. Exit code 0 (no 1) para que el entrypoint loop continúe sin matar el container. Ventana de startup: 60 s. Timeout de nmap: 90 s.
 
 ---
 
