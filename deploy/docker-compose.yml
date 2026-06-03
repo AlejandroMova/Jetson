@@ -18,7 +18,7 @@ services:
       - ./test_videos:/nx_tech/test_videos
       - ./recordings:/nx_tech/recordings   # clips grabados (solo activo si recording_enabled=true)
       - /etc/nx_client:/etc/nx_client:ro   # written by setup.sh
-      - /etc/nx_dvr_ip:/etc/nx_dvr_ip:ro  # written by setup.sh
+      - /etc/nx_dvr_ip:/etc/nx_dvr_ip:rw  # rw: auto-rediscovery updates this when DVR IP changes
       # Entrypoint montado como volumen: cambios en docker-entrypoint.sh toman efecto
       # con solo reiniciar el container (sin necesidad de docker build).
       - ./docker-entrypoint.sh:/usr/local/bin/docker-entrypoint.sh
