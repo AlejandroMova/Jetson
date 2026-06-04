@@ -1393,11 +1393,13 @@ def osd_sink_pad_buffer_probe(_pad, info):
                         _crop_counts[p_track_id] = count + 1
                         _crop_last_frame[p_track_id] = frame_num
 
-            # Guardar label final en _track_labels para que Probe B lo lea en el tiler
+            # Guardar label final en _track_labels para que Probe B lo lea en el tiler.
+            # str() es necesario: display_text en pyds es un tipo ctypes, no Python str.
             if _IS_STREAM_ENABLED:
+                raw = obj_meta.text_params.display_text
                 _track_labels[p_track_id] = {
-                    "label": obj_meta.text_params.display_text or f"P#{p_track_id}",
-                    "fall":  False,  # fall detection placeholder (no activo en MVP)
+                    "label": str(raw) if raw else f"P#{p_track_id}",
+                    "fall":  False,
                 }
 
         # ── Expirar tracks perdidos ───────────────────────────────────────────
