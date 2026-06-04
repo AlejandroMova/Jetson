@@ -1,0 +1,8 @@
+# docker-compose.stream.yml — Override para Stream Mode
+# Usar SOLO con stream.sh  →  docker compose -f docker-compose.yml -f docker-compose.stream.yml up
+# En producción nunca se carga este archivo.
+
+services:
+  deepstream:
+    environment:
+      NX_STREAM_ENABLED: "true"

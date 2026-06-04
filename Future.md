@@ -6,22 +6,93 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
-## Ctrl+C en qa.sh debería hacer shutdown ordenado (igual que `./qa.sh stop`)
+## Detección de Caídas (`fall_detection`) — removido del MVP, pendiente reintegración
 
-**Descripción:** Actualmente `Ctrl+C` en `qa.sh` dispara `_cleanup()` que usa `docker compose kill` (SIGKILL), mientras que `./qa.sh stop` usa `docker compose stop` (SIGTERM). SIGKILL mata los procesos instantáneamente sin darle tiempo a Python de correr bloques `finally` — archivos de video pueden quedar corruptos, Redis puede quedar con estado residual.
+**Descripción:** Detecta cuando una persona cae al suelo mediante estimación de pose. Aplica 3 reglas geométricas: ángulo del torso > 45°, bbox más ancho que alto, caderas al nivel de los tobillos. Emite alerta si ≥ 2/3 reglas se cumplen. Cooldown de 4 segundos por persona.
 
-**Por qué sería mejor:** El operador usa Ctrl+C en el 90% de los casos porque es más rápido. Que Ctrl+C y `stop` hagan exactamente lo mismo daría shutdown limpio sin requerir recordar usar el comando largo. El tiempo de diferencia es mínimo (~2-3 segundos extra para que los containers se apaguen con SIGTERM).
+**Por qué sería mejor:** Feature de alto valor para el sector hogar (residencias, condominios). Fue removido del MVP para simplificar el pipeline inicial.
 
 **Reemplazaría:**
-- Archivo: `deploy/qa.sh`
-- Sección / función: `_cleanup()` (línea ~60)
-- Descripción: cambiar `docker compose ... kill` por `docker compose ... stop --timeout 10` en el handler de Ctrl+C
+- Archivo: `deploy/pipelines/probes.py` — agregar `_FallDetectionHandler` y wiring en `init_handlers()`
+- Archivo: `deploy/pipelines/app.py` — agregar `"fall_detection": None` en `SGIE_CONFIGS`
+- Archivo: `deploy/pipelines/config_loader.py` — agregar a `VALID_CAPABILITIES` y paquetes `hogar_*`
+- Nuevo archivo: `deploy/pipelines/pose_worker.py` — worker thread MoveNet ONNX
+- Archivo: `deploy/pipelines/probes.py` — `NxApiClient.post_fall_detected()`
 
 **Tech stack propuesto:**
-- Sin dependencias nuevas — solo cambiar `kill` por `stop --timeout 10` en `_cleanup()`
-- `--timeout 10` da 10 segundos para shutdown ordenado antes de forzar kill
+- Modelo: MoveNet SinglePose Lightning ONNX (192×192, 17 keypoints COCO) — MIT
+- Runtime: onnxruntime-gpu (ya instalado para OSNet/ArcFace)
+- Descarga: `tools/download_models.py --movenet` (URL pública GitHub)
 
-**Consideraciones:** Con `stop --timeout 10`, Ctrl+C tarda ~2-10 segundos más en completarse. Aceptable dado que `stop` ya lo hace así y nadie se ha quejado de la velocidad de `./qa.sh stop`.
+**Consideraciones:** El modelo es ligero (~5 MB). Workers ONNX corren en CPU y no compiten con TensorRT. Fue implementado y funcionaba — ver ErrorHistory.md para problemas previos resueltos.
+
+---
+
+## EPP Detection (`epp_detection`) — pendiente modelo
+
+**Descripción:** Detecta cumplimiento de equipos de protección personal (cascos, chalecos, guantes) en entornos industriales. Emite `epp_violation` con lista de items faltantes y presentes.
+
+**Por qué sería mejor:** Feature de alto valor para sector industrial. Solo falta definir y entrenar/adaptar el modelo SGIE.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/probes.py` — implementar `_EppHandler.process()` (stub listo, retorna None)
+- Archivo: `deploy/pipelines/app.py` — `"epp_detection": str(_MODELS_DIR / "epp/config_infer.txt")`
+- Archivo: `deploy/pipelines/config_loader.py` — agregar a `VALID_CAPABILITIES` y paquetes `industrial_*`
+
+**Tech stack propuesto:**
+- Modelo: SGIE DeepStream custom (YOLOv8-nano o similar), exportado a ONNX → TRT FP16
+- Clases: helmet/no_helmet, vest/no_vest, gloves/no_gloves
+
+**Consideraciones:** La arquitectura del pipeline ya soporta SGIEs. El stub `_EppHandler` está listo para recibir la implementación real. El trabajo principal es entrenar/adaptar el modelo y compilar el config nvinfer.
+
+---
+
+## Detección de Fuego y Humo (`fire_smoke`) — pendiente modelo
+
+**Descripción:** Clasificador a nivel de frame que detecta presencia de fuego o humo. Emite `fire_smoke_alert` con severidad crítica.
+
+**Por qué sería mejor:** Feature de seguridad crítica para sectores industrial y hogar. Solo falta el modelo.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/probes.py` — implementar `_FireSmokeHandler.process()` (stub listo)
+- Archivo: `deploy/pipelines/app.py` — `"fire_smoke": str(_MODELS_DIR / "fire_smoke/config_infer.txt")`
+- Archivo: `deploy/pipelines/config_loader.py` — agregar a `VALID_CAPABILITIES` y paquetes relevantes
+
+**Tech stack propuesto:**
+- Modelo: clasificador frame-level (EfficientNet-Lite o MobileNetV3), exportado a ONNX → TRT FP16
+- Alternativa: modelo pre-entrenado público (Kaggle fire detection dataset)
+
+---
+
+## Lectura de Placas Vehiculares (`license_plate`) — pendiente modelos
+
+**Descripción:** Detecta vehículos y lee sus placas (two-stage: LPD + LPR). Emite `vehicle_detected` con la placa leída.
+
+**Por qué sería mejor:** Feature diferenciador para sector industrial (control de acceso vehicular).
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/probes.py` — implementar `_LicensePlateHandler.process()` (stub listo)
+- Archivo: `deploy/pipelines/app.py` — agregar SGIEs para LPD y LPR en `SGIE_CONFIGS`
+
+**Tech stack propuesto:**
+- Modelos: NVIDIA LPD + LPR de NGC (disponibles públicamente, ARM64)
+- Dos SGIEs en cadena: LPD (detecta ROI de placa) → LPR (lee caracteres)
+
+---
+
+## Grabación automática de clips (`recording_enabled`) — removida del MVP
+
+**Descripción:** `RecordingManager` grababa automáticamente clips MP4 cuando se detectaban personas. Guardaba `tiled.mp4` (640×360) y `<camera_id>.mp4` (full-res) con thumbnail, metadata y auto-limpieza cuando el total superaba 10 GB.
+
+**Por qué sería mejor:** Útil para auditoría y revisión post-evento. Fue removido porque el caso de uso principal era la QA app (que también fue removida).
+
+**Reemplazaría:**
+- Nuevo archivo: `deploy/pipelines/recording_manager.py` — restaurar desde git (`git show main:deploy/pipelines/recording_manager.py`)
+- Archivo: `deploy/pipelines/probes.py` — wiring de `notify_detection()` en el probe
+- Archivo: `deploy/pipelines/app.py` — instanciar y arrancar `RecordingManager` si `recording_enabled=true`
+- Archivo: `deploy/pipelines/config_loader.py` — restaurar campo `recording_enabled: bool = False`
+
+**Consideraciones:** La implementación completa está en el branch `main` (antes del MVP). Restaurar es trivial con `git show`. El valor sin QA app es limitado a menos que se agregue otro mecanismo de acceso a los clips (API endpoint o sftp).
 
 ---
 
@@ -317,6 +388,129 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 **Descripción:** Cuando todos los streams RTSP fallan dentro de los primeros 60 s de arranque, `app.py` lanza automáticamente nmap en la subred /24 del DVR actual buscando un host con puerto 554 abierto. Si encuentra una IP distinta, actualiza `/etc/nx_dvr_ip` y sale con código 0 para que el entrypoint reinicie `app.py` con la nueva dirección — sin intervención manual.
 
 **Implementado en:** `deploy/pipelines/app.py` — función `_try_rediscover_dvr()` + contador `_failed_sources` en `_on_bus_message`. Exit code 0 (no 1) para que el entrypoint loop continúe sin matar el container. Ventana de startup: 60 s. Timeout de nmap: 90 s.
+
+---
+
+## [Bug] `person_channel_change` rechazado por el backend con HTTP 422
+
+**Descripción:** El Jetson emite `type: "person_channel_change"` a `POST /api/events` cada vez que el ReID local confirma que la misma persona cambió de cámara. El backend usa un discriminated union de Pydantic (`JetsonEvent`) que no incluye este tipo — Pydantic lanza `ValidationError` y el backend retorna 422. El Jetson loguea el error pero no reintenta (el diseño actual solo reintenta en fallos de red). Todos los eventos de cambio de cámara se pierden silenciosamente.
+
+**Por qué sería mejor:** Corregirlo permite que el backend reciba el resultado del ReID del Jetson directamente (además del que calcula él mismo con `appearance_vector`), elimina los 422 en los logs del Jetson, y habilita la trazabilidad cross-cámara en tiempo real sin esperar a que llegue `person_appearance`.
+
+**Reemplazaría:**
+- Archivo: `NX-Platform/Backend/app/schemas.py`
+- Sección / función: `JetsonEvent` union (líneas 178–197) — agregar `PersonChannelChangeEvent` con campos `track_id: int`, `bbox: BBoxSchema`, `confidence: float`, `global_id: str`, `prev_camera_id: Optional[str]`, `is_entry_exit_camera: bool`
+- Archivo: `NX-Platform/Backend/app/routes/events.py`
+- Sección / función: dispatcher `if t == "person_entry" / elif t == ...` (líneas 129–178) — agregar rama `elif t == "person_channel_change"` que llame a `tracker.on_person_channel_change(...)` (método nuevo en `person_tracker.py`) para reusar el `global_person_id` ya existente en lugar de crear uno nuevo
+
+**Tech stack propuesto:**
+- Sin dependencias nuevas — solo Pydantic + SQLAlchemy ya presentes
+
+**Verificado en código:**
+- `probes.py:552` — `post_person_channel_change()` envía `type: "person_channel_change"`
+- `schemas.py:178–197` — `JetsonEvent` union no contiene este tipo → Pydantic ValidationError → HTTP 422
+- `events.py:128–178` — ningún `elif` maneja `"person_channel_change"`
+
+**Consideraciones:** El backend ya tiene su propia lógica de ReID por `appearance_vector` en `PersonTracker.on_person_appearance()`. El `person_channel_change` del Jetson es complementario — llega más rápido (no espera OSNet) pero es menos robusto. Se puede implementar como: si llega `person_channel_change`, buscar en `active_persons` el `global_person_id` por el `global_id` del Jetson (guardado en `payload`) y moverlo a la nueva cámara. Esfuerzo estimado: 2–3 horas.
+
+---
+
+## [Bug] Página de Asistencia siempre vacía — attendance.py filtra por event_type incorrecto
+
+**Descripción:** `attendance.py` consulta la tabla `events` filtrando por `event_type == "employee_identified"` en cuatro lugares (líneas 89, 186, 275, 345). El Jetson **nunca** genera ese tipo de evento — emite `employee_seen` (comercio/industrial) y `known_person_seen` (hogar). Adicionalmente, la columna `Event.employee_id` (UUID FK hacia `employees`) solo se llena en `events.py` cuando `event.type == "employee_identified"` — para `employee_seen` siempre queda `NULL`. Resultado: todas las queries de asistencia retornan 0 filas y la página muestra a todos los empleados como "ausente" siempre.
+
+**Por qué sería mejor:** Con la corrección, la página de Asistencia funcionaría con los datos reales que genera el pipeline, sin cambiar el Jetson.
+
+**Reemplazaría:**
+- Archivo: `NX-Platform/Backend/app/routes/attendance.py`
+- Sección / función: los cuatro `Event.event_type == "employee_identified"` (líneas 89, 186, 275, 345) — reemplazar por `Event.event_type.in_(["employee_seen", "known_person_seen"])`. Eliminar el filtro `Event.employee_id.is_not(None)` (ese campo es siempre NULL para estos eventos). Cambiar el SELECT para extraer el nombre del empleado desde `Event.payload["employee_id"]` (string con el nombre, no UUID) o, mejor, usar la tabla `EmployeeZoneInterval` que ya está correctamente poblada con name strings desde `events.py:173`
+- Archivo: `NX-Platform/Backend/app/routes/events.py`
+- Sección / función: línea 105 — `employee_id_col = getattr(event, "employee_id", None) if event.type == "employee_identified" else None` — para `employee_seen` el campo `employee_id` contiene el nombre del empleado (str), no un UUID FK. Si se quiere mantener el lookup por UUID, hay que hacer `SELECT id FROM employees WHERE name = event.employee_id AND tenant_id = jetson.tenant_id` en el handler de `employee_seen`
+
+**Tech stack propuesto:**
+- Sin dependencias nuevas. La solución más simple: reescribir las queries de `attendance.py` sobre `EmployeeZoneInterval` (ya poblada) en lugar de sobre `Event` directamente
+
+**Verificado en código:**
+- `probes.py:608–616` — Jetson emite `"employee_seen"`, nunca `"employee_identified"`
+- `attendance.py:89,186,275,345` — filtra `event_type == "employee_identified"` → 0 resultados
+- `events.py:105` — `employee_id_col` es `None` para `employee_seen` → columna `Event.employee_id` siempre NULL
+- `models.py:146` — `Event.employee_id` es `UUID | None`, FK a `employees.id` — incompatible con el string que llega en `employee_seen`
+
+**Consideraciones:** La corrección más robusta es cambiar las queries de asistencia para usar `EmployeeZoneInterval` (que usa `employee_id: str` con el nombre) y hacer el JOIN con `employees` por nombre. Alternativa más correcta a largo plazo: en el handler de `employee_seen` en `events.py`, resolver el nombre a UUID con un SELECT a la tabla `employees` y guardar el UUID en `Event.employee_id`. Esto requiere una query extra por evento pero mantiene la integridad referencial. Esfuerzo estimado: 3–5 horas.
+
+---
+
+## [Bug] Campo `entry_type` de `person_entry` se descarta silenciosamente en el backend
+
+**Descripción:** El Jetson envía `entry_type: "new" | "return"` en cada `person_entry` (probes.py:541) para indicar si la persona es un visitante nuevo o alguien que el ReID local ya reconoció como regresante. El schema `PersonEntryEvent` en `schemas.py` no tiene este campo y usa `extra="ignore"`, por lo que Pydantic lo descarta sin error. El backend no puede distinguir una visita nueva de una reentrada y trata todo como nuevo, potencialmente creando `PersonSession` duplicadas para la misma persona.
+
+**Por qué sería mejor:** Agregar el campo permite que el `PersonTracker` del backend salte la creación de una nueva `PersonSession` cuando `entry_type == "return"` y en cambio busque la sesión existente para el mismo `global_id` — reduciendo conteos duplicados de visitantes.
+
+**Reemplazaría:**
+- Archivo: `NX-Platform/Backend/app/schemas.py`
+- Sección / función: `PersonEntryEvent` (líneas 54–59) — agregar `entry_type: Literal["new", "return"] = "new"`
+- Archivo: `NX-Platform/Backend/app/routes/events.py`
+- Sección / función: handler `t == "person_entry"` (líneas 129–135) — pasar `entry_type=event.entry_type` a `tracker.on_person_entry()`
+- Archivo: `NX-Platform/Backend/app/services/person_tracker.py`
+- Sección / función: `on_person_entry()` — si `entry_type == "return"` y existe sesión abierta para ese `global_person_id`, reutilizarla en lugar de crear una nueva
+
+**Tech stack propuesto:**
+- Sin dependencias nuevas
+
+**Verificado en código:**
+- `probes.py:541` — `"entry_type": "return" if is_return else "new"` siempre presente en el payload
+- `schemas.py:54–59` — `PersonEntryEvent` no tiene `entry_type` → campo ignorado
+
+**Consideraciones:** Cambio de bajo riesgo — el campo ya existe en el payload del Jetson. Solo requiere agregar el campo al schema, pasarlo al tracker, y agregar la lógica de reutilización de sesión. Esfuerzo estimado: 1–2 horas.
+
+---
+
+## [Bug] Campo `global_id` del Jetson se descarta en todos los eventos de persona
+
+**Descripción:** El Jetson incluye `global_id` (su UUID de ReID local, asignado por `ReIdManager`) en `person_entry`, `person_exit` y `person_channel_change` (probes.py:544, 575). Ninguno de los schemas del backend tiene este campo — `PersonEntryEvent` y `PersonExitEvent` usan `extra="ignore"`, por lo que el campo se descarta silenciosamente. El backend calcula su propio ReID por separado usando `appearance_vector`, sin poder correlacionarlo con el ID que ya calculó el Jetson localmente.
+
+**Por qué sería mejor:** Exponer el `global_id` del Jetson al backend permitiría: (1) vincular `person_channel_change` con la persona existente sin esperar `person_appearance`; (2) correlacionar el ReID local del Jetson con el del backend para detectar inconsistencias; (3) usar el `global_id` como clave de deduplicación adicional cuando llegan eventos fuera de orden.
+
+**Reemplazaría:**
+- Archivo: `NX-Platform/Backend/app/schemas.py`
+- Sección / función: `PersonEntryEvent` (líneas 54–59) — agregar `global_id: Optional[str] = None`; mismo campo en `PersonExitEvent` (líneas 68–71)
+- Archivo: `NX-Platform/Backend/app/routes/events.py`
+- Sección / función: handler `t == "person_entry"` (líneas 129–135) — pasar `jetson_global_id=event.global_id` al tracker para que lo guarde en `ActivePerson`
+
+**Tech stack propuesto:**
+- Sin dependencias nuevas
+
+**Verificado en código:**
+- `probes.py:543–544` — `if global_id: payload["global_id"] = global_id` en `post_person_entry`
+- `probes.py:574–575` — mismo patrón en `post_person_exit`
+- `schemas.py:54–71` — ninguno de los dos schemas tiene `global_id`
+
+**Consideraciones:** Este bug está relacionado con el Bug de `person_channel_change` — ambos se resuelven más fácilmente juntos, ya que `PersonChannelChangeEvent` también necesita `global_id`. Esfuerzo estimado: 1 hora (solo agregar el campo; decidir qué hacer con él en el tracker es el trabajo real).
+
+---
+
+## [Bug] `EmployeeIdentifiedEvent` es código muerto — nunca lo genera el Jetson
+
+**Descripción:** El backend define `EmployeeIdentifiedEvent` con `type: "employee_identified"` y `employee_id: UUID` (FK a `employees`) en `schemas.py:167–175`. Este tipo está incluido en el `JetsonEvent` union y tiene lógica especial en `events.py:105`. El Jetson nunca genera este evento — fue probablemente el tipo original de reconocimiento facial antes de ser renombrado a `employee_seen`. El código muerto confunde porque `attendance.py` lo busca directamente (ver Bug de asistencia), y cualquier desarrollador que lea el schema asume que el Jetson lo envía.
+
+**Por qué sería mejor:** Eliminar o marcar claramente el tipo muerto reduce la confusión, evita que bugs futuros dependan de él, y simplifica la lista de tipos del `JetsonEvent` union.
+
+**Reemplazaría:**
+- Archivo: `NX-Platform/Backend/app/schemas.py`
+- Sección / función: `EmployeeIdentifiedEvent` (líneas 167–175) y su entrada en `JetsonEvent` union (línea 193) — eliminar la clase y la entrada del union. Antes de eliminar, confirmar que no hay ningún producer en el Jetson o en scripts de testing que lo use
+- Archivo: `NX-Platform/Backend/app/routes/events.py`
+- Sección / función: línea 105 — eliminar `employee_id_col = ... if event.type == "employee_identified" else None` ya que nunca entra por esa rama
+
+**Tech stack propuesto:**
+- Sin dependencias nuevas — solo eliminación de código
+
+**Verificado en código:**
+- `probes.py` — búsqueda completa de `"employee_identified"` retorna 0 resultados; el Jetson emite `"employee_seen"` (línea 608)
+- `schemas.py:167–175` — `EmployeeIdentifiedEvent` con `employee_id: UUID` (UUID FK, no nombre string)
+- `events.py:105` — rama especial que nunca se ejecuta
+- `attendance.py:89` — usa este tipo como referencia, causando el Bug de asistencia
+
+**Consideraciones:** Antes de eliminar, correr `grep -rn "employee_identified"` en toda la plataforma (incluidos tests, scripts de CI, y cualquier integración externa) para confirmar que no hay otro producer. Si existe un plan futuro de migrar la identificación de empleados a UUID (en lugar de nombre string), `EmployeeIdentifiedEvent` es el diseño correcto — en ese caso documentar el intent y marcar como `# pendiente conexión con el Jetson` en lugar de eliminar. Esfuerzo estimado: 30 minutos (verificación) + 1 hora (eliminación + ajuste de attendance).
 
 ---
 

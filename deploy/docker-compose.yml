@@ -16,7 +16,6 @@ services:
       - ./models:/nx_tech/models         # model files + TensorRT engines (rebuilt on first run)
       - ./tools:/nx_tech/tools             # DVR discovery + probe scripts
       - ./test_videos:/nx_tech/test_videos
-      - ./recordings:/nx_tech/recordings   # clips grabados (solo activo si recording_enabled=true)
       - /etc/nx_client:/etc/nx_client:ro   # written by setup.sh
       - /etc/nx_dvr_ip:/etc/nx_dvr_ip:rw  # rw: auto-rediscovery updates this when DVR IP changes
       # Entrypoint montado como volumen: cambios en docker-entrypoint.sh toman efecto
@@ -53,13 +52,6 @@ services:
       POSTGRES_DB: nxcomputing
     volumes:
       - pgdata:/var/lib/postgresql/data
-
-  # ── Cache ────────────────────────────────────────────────────────────────────
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
 
 volumes:
   pgdata:

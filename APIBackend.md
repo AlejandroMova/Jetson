@@ -212,34 +212,7 @@ Store on `ActivePerson.demographics`. Propagate to `PersonSession.demographics`.
 
 ---
 
-### 4.3 Fall Detection (`fall_detection` — Hogar only)
-
-#### `fall_detected`
-
-Sent when MoveNet detects a fall (≥ 2 of 3 pose rules triggered). 4-second cooldown per track prevents duplicate alerts.
-
-```json
-{
-  "type": "fall_detected",
-  "severity": "critical",
-  "track_id": 7,
-  "bbox": { "left": 100, "top": 400, "width": 200, "height": 60 },
-  "fall_score": 3,
-  "avg_kp_conf": 0.72
-}
-```
-
-| Field | Notes |
-|-------|-------|
-| `fall_score` | 1–3: how many of the 3 detection rules fired. ≥ 2 triggers the event. |
-| `avg_kp_conf` | Average keypoint confidence from MoveNet (0–1). Lower = less reliable skeleton. |
-| `severity` | `"critical"` for hogar, `"high"` for industrial if ever enabled. |
-
-**Backend action:** push notification immediately. Store incident with `camera_id`, `timestamp`, `track_id`, and the `bbox` (person's position when the fall occurred).
-
----
-
-### 4.4 Face Recognition (`face_recognition`)
+### 4.3 Face Recognition (`face_recognition`)
 
 Two model pairs run independently:
 - **ArcFace** (InsightFace buffalo_l): identifies WHO a person is against `known_faces.json`
@@ -317,63 +290,6 @@ Close the `EmployeeZoneInterval`.
 ```
 
 Triggered once per unrecognized person per track. Push notification with face photo.
-
----
-
-### 4.5 EPP Detection (`epp_detection`) — model pending
-
-#### `epp_violation`
-
-```json
-{
-  "type": "epp_violation",
-  "severity": "high",
-  "track_id": 12,
-  "violations": ["no_helmet", "no_vest"],
-  "present": ["gloves"],
-  "confidence": 0.87,
-  "bbox": { "left": 80, "top": 150, "width": 70, "height": 200 }
-}
-```
-
-`violations`: list of missing items. `present`: list of correctly worn items. Log the incident and push notification within 30s.
-
----
-
-### 4.6 Fire/Smoke Detection (`fire_smoke`) — model pending
-
-#### `fire_smoke_alert`
-
-```json
-{
-  "type": "fire_smoke_alert",
-  "severity": "critical",
-  "detected": ["fire"],
-  "confidence": 0.94,
-  "frame_snapshot_b64": "<jpeg base64>"
-}
-```
-
-`detected`: `["fire"]`, `["smoke"]`, or `["fire", "smoke"]`. Push notification immediately.
-
----
-
-### 4.7 License Plate (`license_plate`) — model pending
-
-#### `vehicle_detected`
-
-```json
-{
-  "type": "vehicle_detected",
-  "severity": "info",
-  "track_id": 5,
-  "plate": "ABC-1234",
-  "plate_confidence": 0.93,
-  "bbox": { "left": 200, "top": 600, "width": 120, "height": 40 }
-}
-```
-
-Log plate, timestamp, camera, and optionally compare against an allowlist/blocklist.
 
 ---
 
@@ -807,79 +723,7 @@ def detect_missed_heartbeat(interval: EmployeeZoneInterval,
 
 ---
 
-### 7.8 Fall Incident Log
-
-**What it shows:** Timeline of detected falls, with severity and location context.
-
-**Data source:** `fall_detected` events.
-
-```python
-def fall_log_entry(event: dict) -> dict:
-    return {
-        "incident_id":   event["event_id"],
-        "timestamp":     event["timestamp"],
-        "camera_id":     event["camera_id"],
-        "track_id":      event["track_id"],
-        "bbox":          event["bbox"],
-        "fall_score":    event["fall_score"],     # 2 or 3 rules triggered
-        "kp_confidence": event["avg_kp_conf"],    # skeleton quality
-        "severity":      event["severity"],
-        "notified":      False,                   # set to True after push sent
-    }
-
-# Rule: fall_score=3 and avg_kp_conf > 0.7 → high-confidence fall
-# Rule: fall_score=2 or avg_kp_conf < 0.5 → lower confidence, may need manual review
-```
-
-Store each incident. Link to the `global_person_id` if a `person_appearance` was received for that `track_id`.
-
----
-
-### 7.9 EPP Compliance Rate
-
-**What it shows:** What percentage of workers had all required equipment on (when EPP model is integrated).
-
-**Data source:** `epp_violation` events + `person_entry` count per camera per shift.
-
-```python
-def epp_compliance(entries_total: int, violations: list[dict]) -> dict:
-    # One violation per track_id per entry (deduplicate by track_id)
-    violated_tracks = {v["track_id"] for v in violations}
-    compliant = entries_total - len(violated_tracks)
-    return {
-        "total_persons":   entries_total,
-        "compliant":       compliant,
-        "violations":      len(violated_tracks),
-        "compliance_pct":  round(compliant / entries_total * 100, 1) if entries_total else 100,
-        "missing_items":   Counter(
-            item for v in violations for item in v["violations"]
-        ),
-    }
-```
-
----
-
-### 7.10 Vehicle/Plate Log
-
-**What it shows:** Which vehicles entered (when license plate model is integrated).
-
-**Data source:** `vehicle_detected` events.
-
-```python
-def check_plate(plate: str, allowlist: set, blocklist: set) -> str:
-    if plate in blocklist:
-        return "blocked"
-    if plate in allowlist:
-        return "authorized"
-    return "unknown"
-
-# Store: {plate, timestamp, camera_id, confidence, status}
-# Send alert if status == "blocked"
-```
-
----
-
-### 7.11 Unknown Person Alert (Hogar)
+### 7.8 Unknown Person Alert (Hogar)
 
 **What it shows:** Timeline of unrecognized faces detected at the front door or secure zones.
 
@@ -971,10 +815,10 @@ Never mix these scores. A person can have high OSNet similarity (same clothing) 
 
 | Severity | Events | Required action |
 |----------|--------|----------------|
-| `critical` | `fire_smoke_alert`, `fall_detected` (hogar) | Push notification immediately |
-| `high` | `fall_detected` (industrial), `epp_violation` | Push notification ≤ 30s |
+| `critical` | (reserved for future: fall detection, fire/smoke) | Push notification immediately |
+| `high` | (reserved for future: EPP violation) | Push notification ≤ 30s |
 | `medium` | `unknown_person_alert` | Push with face photo |
-| `info` | `person_entry`, `person_classified`, `employee_seen`, `vehicle_detected`, `analytics_snapshot` | Dashboard display only |
+| `info` | `person_entry`, `person_classified`, `employee_seen`, `analytics_snapshot` | Dashboard display only |
 
 ---
 

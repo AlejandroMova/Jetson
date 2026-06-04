@@ -54,10 +54,6 @@ STREAM_TYPES = {
 VALID_CAPABILITIES = {
     "people_counting",   # Always active — PeopleNet PGIE + tracker. No extra model needed.
     "age_gender",        # ResNet-18 SGIE: gender (male/female) + age group (young/adult/senior)
-    "epp_detection",     # SGIE: PPE compliance — helmet, vest, gloves on person crops
-    "fire_smoke",        # Frame-level classifier: fire and smoke detection
-    "license_plate",     # LPD + LPR: detect and read vehicle license plates
-    "fall_detection",    # MoveNet ONNX Python worker: detects person fall events
     "face_recognition",  # PeopleNet class 2 (face) + InsightFace ArcFace: identifies known persons
 }
 
@@ -65,17 +61,17 @@ VALID_CAPABILITIES = {
 # Mirrors PACKAGE_CAPABILITIES in setup.sh. Set package: manual in config.yaml to
 # specify pipeline and sector explicitly instead of deriving them from a package.
 PACKAGE_DEFINITIONS = {
-    "comercio_basico":      {"pipeline": ["people_counting"],                                                                "sector": "comercio"},
-    "comercio_avanzado":    {"pipeline": ["people_counting"],                                                                "sector": "comercio"},
-    "comercio_total":       {"pipeline": ["people_counting", "age_gender", "face_recognition"],                              "sector": "comercio"},
-    "comercio_enterprise":  {"pipeline": ["people_counting", "age_gender", "face_recognition"],                              "sector": "comercio"},
-    "industrial_basico":    {"pipeline": ["people_counting"],                                                                "sector": "industrial"},
-    "industrial_avanzado":  {"pipeline": ["people_counting", "epp_detection"],                                               "sector": "industrial"},
-    "industrial_total":     {"pipeline": ["people_counting", "epp_detection", "license_plate", "fire_smoke", "face_recognition"], "sector": "industrial"},
-    "industrial_enterprise":{"pipeline": ["people_counting", "epp_detection", "license_plate", "fire_smoke", "face_recognition"], "sector": "industrial"},
-    "hogar_basico":         {"pipeline": ["people_counting"],                                                                "sector": "hogar"},
-    "hogar_avanzado":       {"pipeline": ["people_counting", "fall_detection"],                                              "sector": "hogar"},
-    "hogar_total":          {"pipeline": ["people_counting", "fall_detection", "fire_smoke", "face_recognition"],            "sector": "hogar"},
+    "comercio_basico":      {"pipeline": ["people_counting"],                                    "sector": "comercio"},
+    "comercio_avanzado":    {"pipeline": ["people_counting", "age_gender"],                      "sector": "comercio"},
+    "comercio_total":       {"pipeline": ["people_counting", "age_gender", "face_recognition"],  "sector": "comercio"},
+    "comercio_enterprise":  {"pipeline": ["people_counting", "age_gender", "face_recognition"],  "sector": "comercio"},
+    "industrial_basico":    {"pipeline": ["people_counting"],                                    "sector": "industrial"},
+    "industrial_avanzado":  {"pipeline": ["people_counting"],                                    "sector": "industrial"},
+    "industrial_total":     {"pipeline": ["people_counting", "face_recognition"],                "sector": "industrial"},
+    "industrial_enterprise":{"pipeline": ["people_counting", "face_recognition"],                "sector": "industrial"},
+    "hogar_basico":         {"pipeline": ["people_counting"],                                    "sector": "hogar"},
+    "hogar_avanzado":       {"pipeline": ["people_counting", "face_recognition"],                "sector": "hogar"},
+    "hogar_total":          {"pipeline": ["people_counting", "face_recognition"],                "sector": "hogar"},
     "manual":               None,  # pipeline and sector must be set explicitly in config.yaml
 }
 
@@ -113,7 +109,6 @@ class ClientConfig:
     pgie_nms_iou_threshold: float = -1.0   # ≥0 = NMS IoU threshold; -1 = use file value (0.35)
     pgie_pre_cluster_threshold: float = -1.0  # ≥0 = min confidence before NMS; -1 = use file value (0.3)
     reid_gallery_size: int = 10  # max embeddings per global_id in ReIdManager (1 per distinct angle/camera)
-    recording_enabled: bool = False  # grabar video cuando se detectan personas (QA y producción)
 
     def tracker_config_path(self) -> str:
         """Devuelve la ruta absoluta del YAML de config para el tracker seleccionado.
@@ -345,7 +340,6 @@ def load_config() -> ClientConfig:
         pgie_nms_iou_threshold=float(cfg.get("pgie_nms_iou_threshold", -1.0)),
         pgie_pre_cluster_threshold=float(cfg.get("pgie_pre_cluster_threshold", -1.0)),
         reid_gallery_size=int(cfg.get("reid_gallery_size", 10)),
-        recording_enabled=bool(cfg.get("recording_enabled", False)),
     )
     _warn_decoder_load(config)
     return config

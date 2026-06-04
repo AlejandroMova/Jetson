@@ -2,24 +2,22 @@
 app.py — NX Computing AI | Production Pipeline (Live DVR / RTSP)
 
 Source: RTSP stream(s) from DVR, configured per-client via config_loader.
-Sink  : fakesink — no display output.
+Sink  : fakesink — no display output en producción.
 
 Pipeline (capabilities driven by config.yaml `pipeline` field or /etc/nx_pipeline):
   rtspsrc → rtph264depay → h264parse → nvv4l2decoder
     → nvstreammux → nvinfer (PeopleNet PGIE) → nvtracker
     → [nvinfer SGIE per active capability]
-    → nvmultistreamtiler(640×360) → nvvideoconvert → capsfilter(RGBA)
-    → [probe: crops para analytics] → fakesink
+    → nvvideoconvert → capsfilter(RGBA)
+    → [probe: analytics full-res por cámara] → fakesink
 
-QA Visual (NX_QA_ENABLED=true):
-  El probe dibuja bboxes/labels en el frame tileado y los sirve vía MjpegServer (:8080).
-  Metadata se publica a Redis pub/sub para el dashboard Streamlit (:8501).
-  Activar con: ./qa.sh  (desde deploy/)
+Stream mode (NX_STREAM_ENABLED=true):
+  El probe dibuja bboxes/labels sobre cada frame y los sirve vía StreamServer (:8080).
+  Activar con: ./stream.sh  (desde deploy/)
+  Acceder en:  http://<jetson-ip>:8080/viewer/<camera_id>
 """
 
-import json
 import logging
-import math
 import os
 import sys
 import time
@@ -32,13 +30,11 @@ from gi.repository import GLib, Gst
 import pyds
 from config_loader import load_config
 from probes import (
-    osd_sink_pad_buffer_probe, pre_tiler_analytics_probe, api_client,
+    osd_sink_pad_buffer_probe, api_client,
     init_channel_map, init_sector, init_entry_exit_pads, init_camera_types,
     init_handlers, init_workers, start_workers, stop_workers,
-    init_qa_grid, init_qa_cameras, init_pipeline_stats,
-    set_recording_manager,
-    tiled_frame_queue, camera_frame_queues,
-    _IS_QA_ENABLED, _redis_qa,
+    init_stream_cameras, camera_frame_queues,
+    _IS_STREAM_ENABLED,
 )
 
 # Maps each pipeline capability to its nvinfer config file (relative to deploy/).
@@ -54,10 +50,6 @@ _NVINFER_PATH_KEYS = frozenset({
 })
 SGIE_CONFIGS = {
     "age_gender":      str(_MODELS_DIR / "resnet_age_gender_FB2/config_infer.txt"),
-    "epp_detection":   str(_MODELS_DIR / "epp/config_infer.txt"),
-    "fire_smoke":      str(_MODELS_DIR / "fire_smoke/config_infer.txt"),
-    "license_plate":   str(_MODELS_DIR / "license_plate/config_infer.txt"),
-    "fall_detection":  None,  # MoveNet Python worker — no SGIE
     "face_recognition": None,  # PeopleNet class 2 (face) detections fed directly to worker
 }
 
@@ -288,15 +280,11 @@ def main():
       2. Validar que todos los modelos requeridos existen antes de iniciar GStreamer
       3. Inicializar mapas de canales, sector, handlers y workers async
       4. Construir el grafo GStreamer: rtspsrc × N → mux → PGIE → tracker → SGIEs
-         → nvvidconv → RGBA capsfilter → [tiler si QA] → fakesink
-      5. Adjuntar probes (analytics en full-res; overlays en tileado si QA)
-      6. Correr el GLib.MainLoop hasta EOS, error, o solicitud de playback (código 42)
-      7. Parar workers, cliente API, pipeline y RecordingManager al salir
-
-    En QA mode (NX_QA_ENABLED=true) también:
-      - Levanta MjpegServer en :8080
-      - Publica nx:qa:status a Redis con toda la configuración del Jetson
-      - Inicia polling cada 5 s para detectar solicitud de modo playback desde Streamlit
+         → nvvidconv → RGBA capsfilter → fakesink
+      5. Adjuntar probe único en caps_rgba src-pad (analytics full-res)
+      6. Si NX_STREAM_ENABLED: inicializar queues de cámara + lanzar StreamServer en :8080
+      7. Correr el GLib.MainLoop hasta EOS o error
+      8. Parar workers, cliente API y pipeline al salir
     """
     cfg = load_config()
     cfg.log_summary()
@@ -305,9 +293,6 @@ def main():
     init_sector(cfg.sector)
     init_entry_exit_pads(cfg.entry_exit_pad_indices())
     init_camera_types(cfg.external_pad_indices(), cfg.count_internal, cfg.count_external)
-    # QA: inicializar queues de cámara (se usan en el probe y en MjpegServer)
-    if _IS_QA_ENABLED:
-        init_qa_cameras(cfg.channels)
 
     client_dir = Path(__file__).resolve().parent.parent / "clients" / cfg.client_name
     face_db_path = str(client_dir / "known_faces.json")
@@ -322,6 +307,17 @@ def main():
         reid_gallery_size=cfg.reid_gallery_size,
     )
     init_handlers(cfg.pipeline)
+
+    # ── Stream mode: inicializar queues de cámara + StreamServer ─────────────
+    if _IS_STREAM_ENABLED:
+        init_stream_cameras(cfg.channels)
+        from stream_server import StreamServer
+        _stream_srv = StreamServer(camera_queues=camera_frame_queues, port=8080)
+        _stream_srv.start()
+        logger.info("[Stream] StreamServer en :8080 — /stream/<camera_id> + /viewer/<camera_id>")
+        for ch in cfg.channels:
+            jetson_id = os.environ.get("JETSON_ID", "jetson")
+            logger.info("[Stream] URL: http://<jetson-ip>:8080/viewer/%s-%s", jetson_id, ch)
 
     urls = cfg.rtsp_urls()
     n_streams = len(urls)
@@ -386,112 +382,13 @@ def main():
     if not sgie_elements:
         logger.info("No SGIEs loaded — running people_counting only")
 
-    # ── Tiler — solo en QA mode para compositar el video preview ─────────────
-    # En producción el probe recibe frames full-res por cámara directamente.
-    tiler_cols = math.ceil(math.sqrt(n_streams))
-    tiler_rows = math.ceil(n_streams / tiler_cols)
-    tiler = None
-    if _IS_QA_ENABLED:
-        tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
-        tiler.set_property("rows",    tiler_rows)
-        tiler.set_property("columns", tiler_cols)
-        tiler.set_property("width",   640)
-        tiler.set_property("height",  360)
-
-    # ── RecordingManager — activo cuando recording_enabled=true en config.yaml ─
-    # En QA mode siempre está activo (independiente del valor en config.yaml).
-    # En producción solo si cfg.recording_enabled=true.
-    _recording_manager = None
-    if cfg.recording_enabled or _IS_QA_ENABLED:
-        from recording_manager import RecordingManager
-        _recording_manager = RecordingManager(
-            recordings_dir="/nx_tech/recordings",
-            redis_client=_redis_qa,   # None en producción sin QA; se ignora elegantemente
-        )
-        set_recording_manager(_recording_manager)
-        _recording_manager.start()
-        logger.info("[Recording] RecordingManager iniciado — /nx_tech/recordings/")
-
-    # QA: informar grid al probe + arrancar MjpegServer
-    if _IS_QA_ENABLED:
-        cell_w = 640 // tiler_cols
-        cell_h = 360 // tiler_rows
-        init_qa_grid(tiler_cols, tiler_rows, cell_w, cell_h)
-
-        from mjpeg_server import MjpegServer
-        _mjpeg_srv = MjpegServer(
-            tiled_frame_queue=tiled_frame_queue,
-            camera_queues=camera_frame_queues,
-            port=8080,
-            recorder=_recording_manager,
-        )
-        _mjpeg_srv.start()
-        logger.info("[QA] MjpegServer en :8080  /stream/all + /stream/<camera_id>")
-        # Publicar status del Jetson a Redis para que Streamlit lo muestre
-        if _redis_qa:
-            _redis_qa.set("nx:qa:status", json.dumps({
-                "client":              cfg.client_name,
-                "package":             cfg.package,
-                "capabilities":        cfg.pipeline,
-                "channels":            cfg.channels,
-                "tracker":             cfg.tracker,
-                "sector":              cfg.sector,
-                "tiler_cols":          tiler_cols,
-                "tiler_rows":          tiler_rows,
-                "jetson_id":           os.environ.get("JETSON_ID", ""),
-                "entry_exit_channels": cfg.entry_exit_channels,
-                "external_channels":   cfg.external_channels,
-                "count_internal":      cfg.count_internal,
-                "count_external":      cfg.count_external,
-                "stream_width":        cfg.stream_width,
-                "stream_height":       cfg.stream_height,
-                "stream_type":         cfg.stream_type,
-                "dvr_port":            cfg.dvr_port,
-                "rtsp_url_pattern":    cfg.rtsp_url_pattern,
-                "pgie_batch_size":     cfg.pgie_batch_size,
-                "pgie_interval":       cfg.pgie_interval,
-                "sgie_interval":       cfg.sgie_interval,
-                "reid_gallery_size":   cfg.reid_gallery_size,
-                "recording_enabled":   cfg.recording_enabled,
-                "component_resolutions": {
-                    "source":           f"{cfg.stream_width}x{cfg.stream_height}",
-                    "probe_a_frame":    f"{cfg.stream_width}x{cfg.stream_height}",
-                    "probe_b_frame":    "640x360",
-                    "pgie_input":       "960x544",
-                    "age_gender_input": "224x224",
-                    "facedetect_input": "240x136",
-                    "movenet_input":    "192x192",
-                    "osnet_input":      "128x256",
-                },
-            }))
-            # Nuevo arranque — limpiar estado residual de sesiones anteriores.
-            # playback_info puede quedar seteado si app_video_testing.py fue interrumpido
-            # antes de su bloque finally; sin limpiarla, Streamlit muestra el iframe
-            # prematuramente y el browser recibe "refused to connect".
-            _redis_qa.delete("nx:qa:playback_info")
-            _redis_qa.delete("nx:qa:config_overrides")
-            _redis_qa.set("nx:qa:config_gen", str(time.time()))
-            # Inicializar nx:qa:entry_exit solo si no existe (preserva cambios QA en vivo)
-            if not _redis_qa.exists("nx:qa:entry_exit"):
-                import json as _json
-                _redis_qa.set("nx:qa:entry_exit", _json.dumps(cfg.entry_exit_channels))
-            # external_channels: igual que entry_exit, no sobreescribir si ya existe
-            if not _redis_qa.exists("nx:qa:external_channels"):
-                _redis_qa.set("nx:qa:external_channels", json.dumps(cfg.external_channels))
-            # count_internal/count_external: igual que entry_exit, no sobreescribir si ya existe
-            if not _redis_qa.exists("nx:qa:count_internal"):
-                _redis_qa.set("nx:qa:count_internal", "1" if cfg.count_internal else "0")
-            if not _redis_qa.exists("nx:qa:count_external"):
-                _redis_qa.set("nx:qa:count_external", "1" if cfg.count_external else "0")
-            init_pipeline_stats(cfg.channels)
-
     # ── NV12→RGBA (probe needs RGBA for crop extraction) ─────────────────────
     nvvidconv1 = Gst.ElementFactory.make("nvvideoconvert", "convertor1")
     caps_rgba  = Gst.ElementFactory.make("capsfilter",     "capsfilter-rgba")
     caps_rgba.set_property("caps",
         Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
 
-    # ── fakesink — probe extracts all needed crops from RGBA before here ─────
+    # ── fakesink — probe extracts all needed data from RGBA before here ──────
     fakesink = Gst.ElementFactory.make("fakesink", "fakesink")
     fakesink.set_property("sync", False)
 
@@ -499,14 +396,9 @@ def main():
     if not all(fixed_elements):
         logger.error("Failed to create one or more pipeline elements.")
         sys.exit(1)
-    if _IS_QA_ENABLED and not tiler:
-        logger.error("Failed to create nvmultistreamtiler in QA mode.")
-        sys.exit(1)
 
     for el in fixed_elements + sgie_elements:
         pipeline.add(el)
-    if tiler is not None:
-        pipeline.add(tiler)
 
     # ── Linking ───────────────────────────────────────────────────────────────
     streammux.link(pgie)
@@ -517,31 +409,14 @@ def main():
         prev.link(sgie)
         prev = sgie
 
-    # nvvidconv1 siempre va despues de los SGIEs (produccion y QA)
     prev.link(nvvidconv1)
     nvvidconv1.link(caps_rgba)
+    caps_rgba.link(fakesink)
 
-    if _IS_QA_ENABLED:
-        # QA: caps_rgba -> tiler (compuesto 640x360) -> fakesink
-        caps_rgba.link(tiler)
-        tiler.link(fakesink)
-    else:
-        # Produccion: caps_rgba -> fakesink (sin tiler)
-        caps_rgba.link(fakesink)
-
-    # ── Probe attachment ──────────────────────────────────────────────────────
+    # ── Probe — analytics full-res por cámara, y overlays si stream mode ─────
     caps_rgba_src_pad = caps_rgba.get_static_pad("src")
-    if _IS_QA_ENABLED:
-        # Probe A: analytics en frames full-res RGBA (pre-tiler)
-        caps_rgba_src_pad.add_probe(Gst.PadProbeType.BUFFER, pre_tiler_analytics_probe)
-        # Probe B: overlays en frame tileado RGBA (post-tiler)
-        tiler_src_pad = tiler.get_static_pad("src")
-        tiler_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
-        logger.info("[QA] Probe A (analytics) en caps_rgba; Probe B (overlays) en tiler src")
-    else:
-        # Produccion: probe unico con frames full-res
-        caps_rgba_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
-        logger.info("Probe unico (produccion) en caps_rgba src-pad")
+    caps_rgba_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
+    logger.info("Probe en caps_rgba src-pad (frames full-res por cámara)")
 
     # ── Run ───────────────────────────────────────────────────────────────────
     api_client.start()
@@ -553,7 +428,7 @@ def main():
     # ── DVR IP auto-rediscovery ───────────────────────────────────────────────
     # Si TODOS los streams RTSP fallan en los primeros 60 s de arranque, es señal
     # de que el DVR cambió de IP por DHCP. En ese caso se corre nmap para encontrar
-    # la nueva IP, se actualiza /etc/nx_dvr_ip y se reinicia el pipeline (exit 1).
+    # la nueva IP, se actualiza /etc/nx_dvr_ip y se reinicia el pipeline (exit 0).
     _pipeline_start_time  = time.monotonic()
     _failed_sources: set  = set()
     _exit_for_rediscover  = [False]
@@ -565,8 +440,8 @@ def main():
         Ejecuta nmap en la subred /24 del DVR actual buscando un host con el puerto
         554 abierto. Si encuentra una IP distinta a la actual:
           1. Escribe la nueva IP en /etc/nx_dvr_ip
-          2. Pide al main loop que termine (exit code 1)
-          3. docker-entrypoint.sh detecta el exit 1 y reinicia app.py con la nueva IP
+          2. Pide al main loop que termine (exit code 0)
+          3. docker-entrypoint.sh detecta el exit 0 y reinicia app.py con la nueva IP
 
         Solo se lanza una vez por ciclo de vida del pipeline (guardado por _exit_for_rediscover).
         """
@@ -605,7 +480,7 @@ def main():
                 logger.error("[DVR] No se pudo escribir /etc/nx_dvr_ip: %s", e)
                 return
             _exit_for_rediscover[0] = True
-            GLib.idle_add(loop.quit)  # loop.quit() → finally → sys.exit(0) → entrypoint reinicia app.py
+            GLib.idle_add(loop.quit)
         else:
             logger.warning("[DVR] DVR no encontrado en %s. ¿Está apagado o cambió de subred?", subnet)
 
@@ -649,42 +524,6 @@ def main():
 
     bus.connect("message", _on_bus_message)
 
-    # QA: detectar solicitud de modo playback desde Streamlit
-    _exit_for_playback = [False]
-    if _IS_QA_ENABLED and _redis_qa:
-        def _playback_watcher() -> None:
-            """Thread dedicado que vigila Redis cada 3 s buscando una solicitud de playback.
-
-            Más confiable que GLib.timeout_add porque corre en su propio thread y no
-            compite con GStreamer por el GLib main loop. Con 4-6 cámaras + inferencia,
-            el loop principal puede estar tan ocupado procesando mensajes de pipeline
-            que los timers de GLib nunca llegan a dispararse.
-
-            Usa GLib.idle_add(loop.quit) para parar el loop desde este thread externo
-            de forma thread-safe: idle_add encola la llamada para que el loop principal
-            la ejecute en su próxima iteración disponible.
-            """
-            import time as _time
-            logger.info("[QA] Playback watcher iniciado — polling Redis cada 3 s")
-            while not _exit_for_playback[0]:
-                try:
-                    v = _redis_qa.get("nx:qa:playback_video")
-                    if v and not _exit_for_playback[0]:
-                        _exit_for_playback[0] = True
-                        logger.info("[QA] Playback solicitado: %s — deteniendo pipeline", v)
-                        GLib.idle_add(loop.quit)
-                        return
-                except Exception:
-                    pass
-                _time.sleep(3)
-
-        import threading as _th
-        _th.Thread(
-            target=_playback_watcher,
-            name="playback-watcher",
-            daemon=True,
-        ).start()
-
     logger.info("Starting pipeline…")
     pipeline.set_state(Gst.State.PLAYING)
     start_workers()
@@ -697,13 +536,7 @@ def main():
         pipeline.set_state(Gst.State.NULL)
         api_client.stop()
         stop_workers()
-        if _recording_manager is not None:
-            _recording_manager.stop()
 
-    # exit 42 → el entrypoint loop arranca app_video_testing.py (playback)
-    if _exit_for_playback[0]:
-        sys.exit(42)
-    # exit 0 → el entrypoint loop reinicia app.py con la nueva IP ya escrita en /etc/nx_dvr_ip
     if _exit_for_rediscover[0]:
         logger.info("[DVR] Reiniciando pipeline con nueva IP del DVR.")
         sys.exit(0)
