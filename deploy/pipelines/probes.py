@@ -10,9 +10,9 @@ Arquitectura:
   FaceRecognizer y AppearanceWorker corren en hilos de fondo (patrón queue+thread).
 
 Stream mode (NX_STREAM_ENABLED=true):
-  Al final de cada frame, el probe dibuja bboxes+labels sobre el frame BGR y lo
-  encola para que StreamServer lo sirva vía HTTP MJPEG. Solo activo cuando
-  NX_STREAM_ENABLED=true — cero overhead en producción normal.
+  En stream mode el pipeline inserta nvmultistreamtiler (640×360) después del probe
+  analytics. Un segundo probe (tiled_overlay_probe) dibuja bboxes sobre el frame
+  tileado y lo sirve vía MjpegServer (:8080/viewer/all). Cero overhead en producción.
 
 Para agregar un nuevo modelo:
   1. Crear una clase que implemente process(obj_meta, frame_num, frame_np).
@@ -151,42 +151,123 @@ ENTRY_EMIT_DEADLINE_FRAMES: int = 30
 
 # ==============================================================================
 # STREAM MODE — activo solo cuando NX_STREAM_ENABLED=true
-# Cero overhead en producción normal.
 # ==============================================================================
 
 _IS_STREAM_ENABLED: bool = os.getenv("NX_STREAM_ENABLED", "false").lower() == "true"
 
-# Queues de frames por cámara para StreamServer (pobladas vía init_stream_cameras)
-camera_frame_queues: dict = {}   # camera_id → Queue(maxsize=1)
+# Queue de frames tileados para MjpegServer (poblada por tiled_overlay_probe)
+tiled_frame_queue: queue.Queue = queue.Queue(maxsize=1)
+
+# Grid del tiler — seteado por init_stream_grid() desde app.py antes de arrancar
+_stream_tiler_cols: int = 1
+_stream_tiler_rows: int = 1
+_stream_cell_w: int = 640
+_stream_cell_h: int = 360
+
+# Labels de tracks activos — Probe A (osd_sink_pad_buffer_probe) escribe,
+# Probe B (tiled_overlay_probe) lee. Seguro: ambos probes corren en el mismo hilo GStreamer.
+_track_labels: dict = {}   # track_id → {"label": str, "fall": bool}
 
 
-def init_stream_cameras(channels: list) -> None:
-    """Crea una Queue por cámara en camera_frame_queues. Llamar después de init_channel_map."""
-    camera_frame_queues.clear()
-    for i in range(len(channels)):
-        camera_frame_queues[_camera_id_for(i)] = queue.Queue(maxsize=1)
-    logger.info("[Stream] Camera queues: %s", list(camera_frame_queues.keys()))
+def init_stream_grid(cols: int, rows: int, cell_w: int, cell_h: int) -> None:
+    """Setea las dimensiones del grid del tiler. Llamar desde app.py después de crear el tiler."""
+    global _stream_tiler_cols, _stream_tiler_rows, _stream_cell_w, _stream_cell_h
+    _stream_tiler_cols = cols
+    _stream_tiler_rows = rows
+    _stream_cell_w = cell_w
+    _stream_cell_h = cell_h
+    logger.info("[Stream] Grid: %dx%d tiles de %dx%d px", cols, rows, cell_w, cell_h)
 
 
-def _draw_stream_overlays(frame_bgr: np.ndarray, stream_tracks: list) -> None:
-    """Dibuja bboxes y labels sobre frame_bgr in-place (stream mode).
+def _draw_tiled_overlays(frame_bgr: np.ndarray, tracks: list) -> None:
+    """Dibuja bboxes y labels sobre frame_bgr in-place (coordenadas ya en espacio tileado).
 
-    stream_tracks: list of (bbox_dict, label_str) con coordenadas full-res.
+    tracks: lista de {"bbox_tiled": (x, y, w, h), "label": str, "fall": bool}.
     """
-    for bbox, label in stream_tracks:
-        x1 = max(0, bbox["left"])
-        y1 = max(0, bbox["top"])
-        x2 = min(frame_bgr.shape[1] - 1, x1 + bbox["width"])
-        y2 = min(frame_bgr.shape[0] - 1, y1 + bbox["height"])
+    for t in tracks:
+        x1, y1, w, h = t["bbox_tiled"]
+        x2 = min(frame_bgr.shape[1] - 1, x1 + w)
+        y2 = min(frame_bgr.shape[0] - 1, y1 + h)
+        x1 = max(0, x1)
+        y1 = max(0, y1)
         if x2 <= x1 or y2 <= y1:
             continue
-        color = (0, 210, 0)
+        color = (0, 0, 230) if t.get("fall") else (0, 210, 0)
         cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
+        label = t["label"]
         txt_y = max(y1 - 3, 12)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         cv2.rectangle(frame_bgr, (x1, txt_y - th - 2), (x1 + tw, txt_y + 1), color, -1)
         cv2.putText(frame_bgr, label, (x1, txt_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+def tiled_overlay_probe(_pad, info):
+    """Probe B — adjuntado al src pad del nvmultistreamtiler (solo en stream mode).
+
+    Recibe el frame compuesto 640×360 RGBA. Lee _track_labels para obtener los
+    labels ya calculados por Probe A, mapea las coordenadas de cada bbox al espacio
+    tileado usando la geometría del grid, dibuja bboxes+labels y encola el frame
+    en tiled_frame_queue para que MjpegServer lo sirva como MJPEG.
+    """
+    gst_buffer = info.get_buffer()
+    if gst_buffer is None:
+        return Gst.PadProbeReturn.OK
+
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    if batch_meta is None:
+        return Gst.PadProbeReturn.OK
+
+    cols = _stream_tiler_cols
+    rows = _stream_tiler_rows
+    cw   = _stream_cell_w
+    ch   = _stream_cell_h
+
+    # El tiler produce un único frame compuesto (batch_id=0)
+    frame_meta = None
+    for fm in _iter_pyds_list(batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast):
+        frame_meta = fm
+        break
+    if frame_meta is None:
+        return Gst.PadProbeReturn.OK
+
+    # Leer frame RGBA del tiler (640×360 → pequeño, GPU→CPU rápido)
+    try:
+        n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
+        frame_bgr = cv2.cvtColor(np.array(n_frame, copy=True, order='C'), cv2.COLOR_RGBA2BGR)
+    except Exception:
+        return Gst.PadProbeReturn.OK
+
+    # Recolectar tracks del frame tileado con coordenadas mapeadas
+    overlay_tracks = []
+    for obj_meta in _iter_pyds_list(frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast):
+        if int(obj_meta.class_id) != PGIE_CLASS_PERSON:
+            continue
+        r = obj_meta.rect_params
+        # Centro del bbox en el frame tileado → índice de celda → pad_idx original
+        cx = int(r.left + r.width / 2)
+        cy = int(r.top + r.height / 2)
+        tile_col = min(cx // cw, cols - 1)
+        tile_row = min(cy // ch, rows - 1)
+        # Obtener label calculado por Probe A para este track_id
+        track_id = int(obj_meta.object_id)
+        info_dict = _track_labels.get(track_id, {})
+        label = info_dict.get("label") or f"P#{track_id}"
+        overlay_tracks.append({
+            "bbox_tiled": (int(r.left), int(r.top), int(r.width), int(r.height)),
+            "label":      label,
+            "fall":       info_dict.get("fall", False),
+        })
+
+    if overlay_tracks:
+        _draw_tiled_overlays(frame_bgr, overlay_tracks)
+
+    try:
+        tiled_frame_queue.put_nowait(frame_bgr)
+    except queue.Full:
+        pass  # MjpegServer no alcanzó a consumir — OK descartar frame anterior
+
+    return Gst.PadProbeReturn.OK
 
 
 # ==============================================================================
@@ -1005,6 +1086,7 @@ def _expire_lost_tracks(pad_index: int, frame_num: int,
             _face_handler.on_track_lost(track_id, dwell)
         _crop_counts.pop(track_id, None)
         _crop_last_frame.pop(track_id, None)
+        _track_labels.pop(track_id, None)
         if _appearance_worker is not None:
             _appearance_worker.clear_result(track_id, pad_index)
         for handler in _active_handlers:
@@ -1164,12 +1246,10 @@ def osd_sink_pad_buffer_probe(_pad, info):
             continue
 
         # ── Lazy frame read ───────────────────────────────────────────────────
-        # GPU→CPU copy solo cuando:
-        #   - face_recognizer necesita el frame para extraer crops de cara
-        #   - appearance_worker necesita crops de persona (tracks nuevos o sin embedding)
-        #   - stream mode está activo (necesita el frame para dibujar bboxes)
+        # GPU→CPU copy solo cuando face_recognizer o appearance_worker necesitan crops.
+        # Stream mode (tiler) no requiere frame aquí — Probe B lo lee del tiler output.
         frame_np = None
-        _needs_pixel = _IS_STREAM_ENABLED  # stream siempre requiere el frame
+        _needs_pixel = False
 
         if frame_meta.num_obj_meta > 0:
             if _face_recognizer is not None:
@@ -1219,7 +1299,6 @@ def osd_sink_pad_buffer_probe(_pad, info):
 
         # ── Tracks de personas ────────────────────────────────────────────────
         visible_ids: Set[int] = set()
-        stream_tracks: List[Tuple[dict, str]] = []  # (bbox, label) para stream overlay
 
         for obj_meta in persons_meta:
             p_track_id = int(obj_meta.object_id)
@@ -1314,10 +1393,12 @@ def osd_sink_pad_buffer_probe(_pad, info):
                         _crop_counts[p_track_id] = count + 1
                         _crop_last_frame[p_track_id] = frame_num
 
-            # Recoger label final (ya con age/gender + face name) para stream overlay
+            # Guardar label final en _track_labels para que Probe B lo lea en el tiler
             if _IS_STREAM_ENABLED:
-                final_label = obj_meta.text_params.display_text or f"P#{p_track_id}"
-                stream_tracks.append((bbox, final_label))
+                _track_labels[p_track_id] = {
+                    "label": obj_meta.text_params.display_text or f"P#{p_track_id}",
+                    "fall":  False,  # fall detection placeholder (no activo en MVP)
+                }
 
         # ── Expirar tracks perdidos ───────────────────────────────────────────
         _expire_lost_tracks(pad_index, frame_num, visible_ids)
@@ -1355,17 +1436,5 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 "gender_female": 0, "age_gender_classes": {},
             }
             _analytics_last_sent[pad_index] = now
-
-        # ── Stream overlay: dibujar bboxes y encolar frame para StreamServer ──
-        if _IS_STREAM_ENABLED and frame_np is not None:
-            stream_frame = frame_np.copy()
-            if stream_tracks:
-                _draw_stream_overlays(stream_frame, stream_tracks)
-            q = camera_frame_queues.get(camera_id)
-            if q is not None:
-                try:
-                    q.put_nowait(stream_frame)
-                except queue.Full:
-                    pass  # el servidor MJPEG consume el frame anterior — OK saltar este
 
     return Gst.PadProbeReturn.OK

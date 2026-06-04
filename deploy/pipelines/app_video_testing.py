@@ -16,6 +16,7 @@ Stream mode (NX_STREAM_ENABLED=true):
 """
 import argparse
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -30,6 +31,7 @@ import pyds
 from app import SGIE_CONFIGS
 from probes import (
     osd_sink_pad_buffer_probe,
+    tiled_overlay_probe,
     api_client,
     init_channel_map,
     init_sector,
@@ -37,8 +39,8 @@ from probes import (
     init_workers,
     start_workers,
     stop_workers,
-    init_stream_cameras,
-    camera_frame_queues,
+    init_stream_grid,
+    tiled_frame_queue,
     _IS_STREAM_ENABLED,
 )
 
@@ -117,7 +119,6 @@ def main() -> None:
     logger.info("Video       : %s", video_path)
     logger.info("Capabilities: %s", pipeline_caps)
     logger.info("Client      : %s", client_name)
-    logger.info("Stream mode : %s", _IS_STREAM_ENABLED)
 
     # Probe actual clip dimensions so nvstreammux uses the real resolution.
     # Without this, sub-stream or tiled clips get stretched inside the muxer.
@@ -136,14 +137,6 @@ def main() -> None:
     init_channel_map([1])
     init_workers(pipeline_caps, model_dir=str(_MODELS_DIR), face_db_path=face_db_path)
     init_handlers(pipeline_caps)
-
-    # Stream mode: inicializar queues + StreamServer (mismo que app.py)
-    if _IS_STREAM_ENABLED:
-        init_stream_cameras([1])
-        from stream_server import StreamServer
-        _stream_srv = StreamServer(camera_queues=camera_frame_queues, port=8080)
-        _stream_srv.start()
-        logger.info("[Stream] StreamServer en :8080 — /stream/<camera_id> + /viewer/<camera_id>")
 
     Gst.init(None)
     pipeline = Gst.Pipeline()
@@ -204,6 +197,24 @@ def main() -> None:
     fakesink   = Gst.ElementFactory.make("fakesink", "fakesink")
     fakesink.set_property("sync", False)
 
+    # ── Stream mode: tiler (1 video → 1×1 grid 640×360) ──────────────────────
+    tiler = None
+    if _IS_STREAM_ENABLED:
+        tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
+        if not tiler:
+            logger.error("[Stream] No se pudo crear nvmultistreamtiler — abortando.")
+            sys.exit(1)
+        tiler.set_property("rows",    1)
+        tiler.set_property("columns", 1)
+        tiler.set_property("width",   640)
+        tiler.set_property("height",  360)
+        pipeline.add(tiler)
+        init_stream_grid(1, 1, 640, 360)
+        from mjpeg_server import MjpegServer
+        _mjpeg_srv = MjpegServer(tiled_queue=tiled_frame_queue, port=8080)
+        _mjpeg_srv.start()
+        logger.info("[Stream] MjpegServer en :8080 — /stream/all  /viewer/all")
+
     all_elements = (
         [source, decodebin, nvvidconv_src, caps_nvmm, streammux, pgie, tracker]
         + sgie_elements
@@ -240,12 +251,24 @@ def main() -> None:
         prev = sgie
     prev.link(nvvidconv1)
     nvvidconv1.link(caps_rgba)
-    caps_rgba.link(fakesink)
 
-    # ── Probe ─────────────────────────────────────────────────────────────────
+    if _IS_STREAM_ENABLED and tiler is not None:
+        caps_rgba.link(tiler)
+        tiler.link(fakesink)
+    else:
+        caps_rgba.link(fakesink)
+
+    # ── Probe A — analytics full-res (siempre) ────────────────────────────────
     caps_rgba.get_static_pad("src").add_probe(
         Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe
     )
+
+    # ── Probe B — overlay tileado (solo stream mode) ──────────────────────────
+    if _IS_STREAM_ENABLED and tiler is not None:
+        tiler.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, tiled_overlay_probe
+        )
+        logger.info("[Stream] Probe B en tiler src-pad (frame tileado 640×360)")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     api_client.start()

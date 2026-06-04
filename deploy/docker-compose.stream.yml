@@ -1,7 +1,7 @@
-# docker-compose.stream.yml — Override para Stream Mode
-# Usar SOLO con stream.sh  →  docker compose -f docker-compose.yml -f docker-compose.stream.yml up
-# En producción nunca se carga este archivo.
-
+# Override para stream mode: agrega nvmultistreamtiler al pipeline y sirve
+# el frame tileado (con bboxes e inferencia) en http://<ip>:8080/viewer/all
+# Usar con: docker compose -f docker-compose.yml -f docker-compose.stream.yml up -d
+# O simplemente: ./stream.sh
 services:
   deepstream:
     environment:

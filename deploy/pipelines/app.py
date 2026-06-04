@@ -9,15 +9,20 @@ Pipeline (capabilities driven by config.yaml `pipeline` field or /etc/nx_pipelin
     → nvstreammux → nvinfer (PeopleNet PGIE) → nvtracker
     → [nvinfer SGIE per active capability]
     → nvvideoconvert → capsfilter(RGBA)
-    → [probe: analytics full-res por cámara] → fakesink
+    → [Probe A: analytics full-res por cámara] → fakesink
 
 Stream mode (NX_STREAM_ENABLED=true):
-  El probe dibuja bboxes/labels sobre cada frame y los sirve vía StreamServer (:8080).
+  → nvvideoconvert → capsfilter(RGBA)
+  → [Probe A: analytics full-res, guarda labels en _track_labels]
+  → nvmultistreamtiler(640×360)
+  → [Probe B: tiled_overlay_probe — dibuja bboxes → tiled_frame_queue]
+  → fakesink
+  MjpegServer(:8080) sirve tiled_frame_queue en /stream/all y /viewer/all.
   Activar con: ./stream.sh  (desde deploy/)
-  Acceder en:  http://<jetson-ip>:8080/viewer/<camera_id>
 """
 
 import logging
+import math
 import os
 import sys
 import time
@@ -30,10 +35,10 @@ from gi.repository import GLib, Gst
 import pyds
 from config_loader import load_config
 from probes import (
-    osd_sink_pad_buffer_probe, api_client,
+    osd_sink_pad_buffer_probe, tiled_overlay_probe, api_client,
     init_channel_map, init_sector, init_entry_exit_pads, init_camera_types,
     init_handlers, init_workers, start_workers, stop_workers,
-    init_stream_cameras, camera_frame_queues,
+    init_stream_grid, tiled_frame_queue,
     _IS_STREAM_ENABLED,
 )
 
@@ -281,8 +286,8 @@ def main():
       3. Inicializar mapas de canales, sector, handlers y workers async
       4. Construir el grafo GStreamer: rtspsrc × N → mux → PGIE → tracker → SGIEs
          → nvvidconv → RGBA capsfilter → fakesink
-      5. Adjuntar probe único en caps_rgba src-pad (analytics full-res)
-      6. Si NX_STREAM_ENABLED: inicializar queues de cámara + lanzar StreamServer en :8080
+      5. Adjuntar Probe A en caps_rgba src-pad (analytics full-res)
+      6. Si NX_STREAM_ENABLED: insertar nvmultistreamtiler + Probe B + MjpegServer en :8080
       7. Correr el GLib.MainLoop hasta EOS o error
       8. Parar workers, cliente API y pipeline al salir
     """
@@ -307,17 +312,6 @@ def main():
         reid_gallery_size=cfg.reid_gallery_size,
     )
     init_handlers(cfg.pipeline)
-
-    # ── Stream mode: inicializar queues de cámara + StreamServer ─────────────
-    if _IS_STREAM_ENABLED:
-        init_stream_cameras(cfg.channels)
-        from stream_server import StreamServer
-        _stream_srv = StreamServer(camera_queues=camera_frame_queues, port=8080)
-        _stream_srv.start()
-        logger.info("[Stream] StreamServer en :8080 — /stream/<camera_id> + /viewer/<camera_id>")
-        for ch in cfg.channels:
-            jetson_id = os.environ.get("JETSON_ID", "jetson")
-            logger.info("[Stream] URL: http://<jetson-ip>:8080/viewer/%s-%s", jetson_id, ch)
 
     urls = cfg.rtsp_urls()
     n_streams = len(urls)
@@ -388,9 +382,28 @@ def main():
     caps_rgba.set_property("caps",
         Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
 
-    # ── fakesink — probe extracts all needed data from RGBA before here ──────
     fakesink = Gst.ElementFactory.make("fakesink", "fakesink")
     fakesink.set_property("sync", False)
+
+    # ── Stream mode: tiler (compone todas las cámaras en 640×360) ─────────────
+    tiler = None
+    if _IS_STREAM_ENABLED:
+        tiler_cols = math.ceil(math.sqrt(n_streams))
+        tiler_rows = math.ceil(n_streams / tiler_cols)
+        tiler = Gst.ElementFactory.make("nvmultistreamtiler", "nvtiler")
+        if not tiler:
+            logger.error("[Stream] No se pudo crear nvmultistreamtiler — abortando.")
+            sys.exit(1)
+        tiler.set_property("rows",    tiler_rows)
+        tiler.set_property("columns", tiler_cols)
+        tiler.set_property("width",   640)
+        tiler.set_property("height",  360)
+        pipeline.add(tiler)
+        init_stream_grid(tiler_cols, tiler_rows, 640 // tiler_cols, 360 // tiler_rows)
+        from mjpeg_server import MjpegServer
+        _mjpeg_srv = MjpegServer(tiled_queue=tiled_frame_queue, port=8080)
+        _mjpeg_srv.start()
+        logger.info("[Stream] MjpegServer en :8080 — /stream/all  /viewer/all")
 
     fixed_elements = [pgie, tracker, nvvidconv1, caps_rgba, fakesink]
     if not all(fixed_elements):
@@ -411,12 +424,23 @@ def main():
 
     prev.link(nvvidconv1)
     nvvidconv1.link(caps_rgba)
-    caps_rgba.link(fakesink)
 
-    # ── Probe — analytics full-res por cámara, y overlays si stream mode ─────
-    caps_rgba_src_pad = caps_rgba.get_static_pad("src")
-    caps_rgba_src_pad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
-    logger.info("Probe en caps_rgba src-pad (frames full-res por cámara)")
+    if _IS_STREAM_ENABLED and tiler is not None:
+        # Stream: caps_rgba → tiler → fakesink
+        caps_rgba.link(tiler)
+        tiler.link(fakesink)
+    else:
+        # Producción: caps_rgba → fakesink
+        caps_rgba.link(fakesink)
+
+    # ── Probe A — analytics full-res por cámara (siempre activo) ─────────────
+    caps_rgba.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe)
+    logger.info("Probe A en caps_rgba src-pad (frames full-res por cámara)")
+
+    # ── Probe B — overlay tileado (solo stream mode) ──────────────────────────
+    if _IS_STREAM_ENABLED and tiler is not None:
+        tiler.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, tiled_overlay_probe)
+        logger.info("Probe B en tiler src-pad (frame tileado 640×360)")
 
     # ── Run ───────────────────────────────────────────────────────────────────
     api_client.start()
