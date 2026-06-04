@@ -168,6 +168,10 @@ _stream_cell_h: int = 360
 # Probe B (tiled_overlay_probe) lee. Seguro: ambos probes corren en el mismo hilo GStreamer.
 _track_labels: dict = {}   # track_id → {"label": str, "fall": bool}
 
+# Mapeo de display: global_id (hex12) → número corto (1, 2, 3...). Solo para stream, no afecta API.
+_display_ids: dict[str, int] = {}
+_display_id_counter: int = 0
+
 
 def init_stream_grid(cols: int, rows: int, cell_w: int, cell_h: int) -> None:
     """Setea las dimensiones del grid del tiler. Llamar desde app.py después de crear el tiler."""
@@ -671,8 +675,9 @@ class _AgeGenderHandler:
         if int(r.width) < VOTE_MIN_WIDTH or int(r.height) < VOTE_MIN_HEIGHT:
             if p_track_id in self._cache:
                 raw, gender_disp, age_disp, prob = self._cache[p_track_id]
+                prefix = str(obj_meta.text_params.display_text) or "..."
                 return _HandlerResult(
-                    osd_text=f"P#{p_track_id} | {gender_disp} | {age_disp} {prob:.0%}",
+                    osd_text=f"{prefix} | {gender_disp} | {age_disp} {prob:.0%}",
                     border_color=(0.0, 1.0, 0.0, 1.0),
                 )
             return None
@@ -680,8 +685,9 @@ class _AgeGenderHandler:
         # Si ya está bloqueado en caché, devolver el resultado sin volver a inferir
         if p_track_id in self._cache:
             raw, gender_disp, age_disp, prob = self._cache[p_track_id]
+            prefix = str(obj_meta.text_params.display_text) or "..."
             return _HandlerResult(
-                osd_text=f"P#{p_track_id} | {gender_disp} | {age_disp} {prob:.0%}",
+                osd_text=f"{prefix} | {gender_disp} | {age_disp} {prob:.0%}",
                 border_color=(0.0, 1.0, 0.0, 1.0),
             )
 
@@ -703,8 +709,9 @@ class _AgeGenderHandler:
             votes.append(raw_label)
             n = len(votes)
             if n < VOTES_REQUIRED:
+                prefix = str(obj_meta.text_params.display_text) or "..."
                 return _HandlerResult(
-                    osd_text=f"P#{p_track_id} | Analizando ({n}/{VOTES_REQUIRED})",
+                    osd_text=f"{prefix} | Analizando ({n}/{VOTES_REQUIRED})",
                     border_color=(0.2, 0.6, 1.0, 1.0),
                 )
             # Suficientes votos: bloquear con la moda
@@ -727,16 +734,18 @@ class _AgeGenderHandler:
                 "age_gender_classes": winner,
                 "gender_key": "gender_male" if winner.startswith("male") else "gender_female",
             }
+            prefix = str(obj_meta.text_params.display_text) or "..."
             return _HandlerResult(
-                osd_text=f"P#{p_track_id} | {winner_gd} | {winner_ad} {winner_prob:.0%}",
+                osd_text=f"{prefix} | {winner_gd} | {winner_ad} {winner_prob:.0%}",
                 border_color=(0.0, 1.0, 0.0, 1.0),
                 event_type=event_type,
                 det_extra=det_extra,
                 analytics_update=analytics,
             )
 
+        prefix = str(obj_meta.text_params.display_text) or "..."
         return _HandlerResult(
-            osd_text=f"P#{p_track_id} | Analizando",
+            osd_text=f"{prefix} | Analizando",
             border_color=(0.2, 0.6, 1.0, 1.0),
         )
 
@@ -1341,8 +1350,18 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 frame_num, frame_np, pad_index,
             )
 
-            # OSD base label — handlers may override
-            _set_osd_text(obj_meta, f"P#{p_track_id}", border_color=(0.2, 0.6, 1.0, 1.0))
+            # OSD base label — número corto de display si el ReID ya resolvió, "..." si espera.
+            # _display_ids es solo para el stream; no toca global_id ni los payloads de API.
+            state = _active_tracks[track_key]
+            if state.global_id:
+                global _display_id_counter
+                if state.global_id not in _display_ids:
+                    _display_id_counter += 1
+                    _display_ids[state.global_id] = _display_id_counter
+                base_label = f"#{_display_ids[state.global_id]}"
+            else:
+                base_label = "..."
+            _set_osd_text(obj_meta, base_label, border_color=(0.2, 0.6, 1.0, 1.0))
 
             # ── Handler dispatch ──────────────────────────────────────────────
             for handler in _active_handlers:
@@ -1369,7 +1388,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 if identity:
                     name, conf = identity
                     if name != "Desconocido":
-                        cur = obj_meta.text_params.display_text or f"P#{p_track_id}"
+                        cur = str(obj_meta.text_params.display_text) or "..."
                         _set_osd_text(
                             obj_meta,
                             f"{cur} | {name} {conf:.0%}",

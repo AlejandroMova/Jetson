@@ -559,6 +559,7 @@ El motor central de analytics. Probe único (`osd_sink_pad_buffer_probe`) en `ca
 - `_FaceRecognitionHandler`: cruza detecciones de cara de PeopleNet (class_id=2) con el `FaceRecognizer`; emite `employee_seen/presence/exit` o `unknown_person_alert`
 - `osd_sink_pad_buffer_probe`: probe único. Lazy frame read: GPU→CPU solo cuando workers necesitan pixels o `NX_STREAM_ENABLED=true`. Al final del loop de cámara, si stream mode activo: dibuja bboxes+labels con OpenCV y empuja a `camera_frame_queues[camera_id]`.
 - **Stream mode helpers**: `init_stream_cameras(channels)`, `camera_frame_queues`, `_IS_STREAM_ENABLED`, `_draw_stream_overlays(frame_bgr, stream_tracks)`
+- **Label en stream**: muestra `G#<global_id>` (ReID cross-cámara, 12 chars hex) si el embedding ya fue procesado, o `...` mientras espera. Los handlers appendean al prefijo existente: ej. `G#a3f92c1b8d04 | male_adult | 87%`. El `track_id` local ya no aparece en el stream.
 
 **`stream_server.py`** (~130 líneas)
 Servidor HTTP MJPEG daemon para stream mode (`NX_STREAM_ENABLED=true`). Solo per-cámara, sin tiler. Expone:
