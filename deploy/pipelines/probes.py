@@ -51,6 +51,23 @@ JETSON_ID: str    = os.environ.get("JETSON_ID",  os.uname().nodename)
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "http://localhost:8000")
 API_KEY: str      = os.environ.get("API_KEY",    "your-api-key")
 
+
+def _get_tailscale_ip() -> Optional[str]:
+    """Return the Tailscale IPv4 address of this device, or None if unavailable."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=2,
+        )
+        ip = result.stdout.strip()
+        return ip if ip else None
+    except Exception:
+        return None
+
+
+TAILSCALE_IP: Optional[str] = _get_tailscale_ip()
+
 # Mapa pad_index → número de canal real del DVR.
 # Se inicializa desde app.py llamando a init_channel_map(cfg.channels).
 _channel_map: Dict[int, int] = {}
@@ -1699,6 +1716,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 "gender_male":        an["gender_male"],
                 "gender_female":      an["gender_female"],
                 "age_gender_classes": an["age_gender_classes"],
+                "tailscale_ip":       TAILSCALE_IP,
             }, period_seconds=ANALYTICS_SEND_INTERVAL_SECS)
             _analytics[pad_index] = {
                 "person_count": 0, "gender_male": 0,
