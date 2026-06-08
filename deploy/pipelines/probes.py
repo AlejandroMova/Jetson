@@ -195,7 +195,7 @@ def _slog(*parts: str) -> None:
 # Acumulador para el resumen periódico de analytics_snapshot.
 # _send() corre en el hilo worker de NxApiClient — el lock protege acceso concurrente.
 _analytics_slog_cameras: list = []
-_analytics_slog_last_t: float = 0.0
+_analytics_slog_last_t: float = time.monotonic()  # evita flush inmediato en el primer call
 _ANALYTICS_SLOG_INTERVAL: float = 60.0  # segundos entre líneas de resumen
 _analytics_slog_lock = threading.Lock()
 
