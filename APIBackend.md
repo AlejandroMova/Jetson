@@ -218,6 +218,18 @@ Two model pairs run independently:
 - **ArcFace** (InsightFace buffalo_l): identifies WHO a person is against `known_faces.json`
 - **OSNet** (appearance_worker): identifies WHICH body this is cross-camera (§4.1)
 
+**Employee ID contract (important):**
+`employee_id` in all face recognition events is now the **backend-assigned UUID** from `employees.id`
+(not the employee's name). The Jetson receives this UUID via `GET /api/employees/embeddings` and
+echoes it in events. The backend can join directly on `Employee.id` without a name-based lookup.
+
+**Roster sync flow:**
+1. Admin activates employee on platform → backend generates ArcFace embedding → emits `face_update`
+   Socket.IO event on namespace `/jetson` (room `jt_{tenant_id}`)
+2. Jetson's `JetsonSyncClient` receives `face_update` → calls `GET /api/employees/embeddings`
+3. Jetson updates `known_faces.json` with UUID-keyed entries
+4. On next recognition, events carry the UUID in `employee_id`
+
 Event names differ by sector:
 
 | Sector | Recognized | Heartbeat | Exit | Unknown |
@@ -234,7 +246,7 @@ Fired on first face identification for this track in this camera session.
 {
   "type": "employee_seen",
   "track_id": 15,
-  "employee_id": "Juan Perez",
+  "employee_id": "3f2a1b4c-0000-0000-0000-000000000001",
   "similarity": 0.87,
   "bbox": { "left": 210, "top": 100, "width": 55, "height": 165 }
 }
@@ -252,6 +264,8 @@ Fired on first face identification for this track in this camera session.
 
 `similarity` = ArcFace cosine similarity (0–1). Jetson already applied its threshold (≥ 0.50) — events below that are never sent.
 
+`employee_id` is a UUID string matching `employees.id` in the backend DB. No name lookup needed.
+
 Open an `EmployeeZoneInterval`. For hogar `known_person_seen`, trigger "Maria arrived home" push notification.
 
 #### `employee_presence`
@@ -262,7 +276,7 @@ Heartbeat every 30s while the employee is visible. No equivalent for hogar.
 {
   "type": "employee_presence",
   "track_id": 15,
-  "employee_id": "Juan Perez"
+  "employee_id": "3f2a1b4c-0000-0000-0000-000000000001"
 }
 ```
 
@@ -271,8 +285,8 @@ Update `EmployeeZoneInterval.last_heartbeat`. If missed for > 90s, assume the Je
 #### `employee_exit` / `known_person_exit`
 
 ```json
-{ "type": "employee_exit",    "employee_id": "Juan Perez", "track_id": 15, "dwell_seconds": 870.0 }
-{ "type": "known_person_exit","name": "Maria",             "track_id": 3,  "dwell_seconds": 300.0 }
+{ "type": "employee_exit",    "employee_id": "3f2a1b4c-...", "track_id": 15, "dwell_seconds": 870.0 }
+{ "type": "known_person_exit","name": "Maria",               "track_id": 3,  "dwell_seconds": 300.0 }
 ```
 
 Close the `EmployeeZoneInterval`.

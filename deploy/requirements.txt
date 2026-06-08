@@ -8,3 +8,4 @@ numpy
 onnxruntime
 insightface>=0.7.3
 websocket-client
+python-socketio>=5.0

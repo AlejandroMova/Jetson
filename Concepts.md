@@ -244,17 +244,40 @@ PeopleNet emite un objeto con class_id=2 (cara)
   → _find_parent_track() → busca la persona (class_id=0) que contiene esa cara
   → recortar crop de cara del frame full-res
   → enqueue al FaceRecognizer worker
-  → (próximo frame) get_result → (nombre, similitud) o None
+  → (próximo frame) get_result → (uuid_str, similitud) o None
   → sistema de votos: 3 coincidencias antes de fijar identidad
+  → events enviados al backend con employee_id = UUID del backend
 ```
 
 Los eventos son distintos por sector:
 - `comercio/industrial` → `employee_seen`, `employee_presence`, `employee_exit`
 - `hogar` → `known_person_seen`, `unknown_person_alert`, `known_person_exit`
 
-- Handler: [probes.py línea 1039](deploy/pipelines/probes.py#L1039)
-- Worker: [face_recognizer.py](deploy/pipelines/face_recognizer.py)
-- DB de caras: `deploy/known_faces.json` (generada con `register_face.py`)
+**`employee_id` en los eventos es ahora un UUID** asignado por el backend (de `employees.id`).
+El backend no necesita resolver por nombre — hace join directo por UUID FK.
+
+**Flujo de registro de empleados (automático desde plataforma):**
+```
+Admin activa empleado en plataforma
+  → backend genera embedding ArcFace desde fotos
+  → backend emite face_update en Socket.IO /jetson room
+  → JetsonSyncClient recibe face_update
+  → sync_from_backend() llama GET /api/employees/embeddings
+  → known_faces.json actualizado (clave = UUID, valor = {name, embeddings})
+  → FaceRecognizer.reload() — DB en memoria reemplazada sin reiniciar pipeline
+```
+
+**Formato `known_faces.json` (nuevo):**
+```json
+{
+  "<employee-uuid>": { "name": "Juan Perez", "embeddings": [[...512 floats...]] }
+}
+```
+Formato legacy (nombre-clave) sigue siendo compatible en lectura.
+
+- Handler: [probes.py](deploy/pipelines/probes.py) — `_FaceRecognitionHandler`
+- Worker: [face_recognizer.py](deploy/pipelines/face_recognizer.py) — `sync_from_backend`, `reload`, `get_display_name`
+- Sync client: [jetson_sync_client.py](deploy/pipelines/jetson_sync_client.py) — Socket.IO /jetson namespace
 
 ---
 

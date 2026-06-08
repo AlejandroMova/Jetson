@@ -923,25 +923,28 @@ class _FaceRecognitionHandler:
         if identity is None:
             return
 
-        name, conf = identity
+        # identity key is now a UUID string (or "Unknown" if below threshold)
+        identity_key, conf = identity
+        display_name = self._worker.get_display_name(identity_key)
         now = time.monotonic()
 
-        if name != "Desconocido":
+        if identity_key != "Unknown":
             if parent_track_id not in self._identity_reported:
                 self._identity_reported.add(parent_track_id)
-                api_client.post_employee_seen(camera_id, name, parent_track_id, conf, bbox)
+                # identity_key is the backend-assigned UUID — used in events for FK join
+                api_client.post_employee_seen(camera_id, identity_key, parent_track_id, conf, bbox)
                 _slog(
                     f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
                     f"{_C.get('green', '')}{_C.get('bold', '')}EMPLEADO{_C.get('reset', '')}   ",
                     f"track={parent_track_id:<4} ",
-                    f"nombre={_C.get('bold', '')}{name}{_C.get('reset', '')}  sim={conf:.2f}",
+                    f"nombre={_C.get('bold', '')}{display_name}{_C.get('reset', '')}  sim={conf:.2f}",
                 )
             last_hb = self._last_heartbeat.get(parent_track_id, 0.0)
             if now - last_hb >= self.PRESENCE_HEARTBEAT_SECS:
-                api_client.post_employee_presence(camera_id, name, parent_track_id)
+                api_client.post_employee_presence(camera_id, identity_key, parent_track_id)
                 self._last_heartbeat[parent_track_id] = now
         else:
-            # Cara reconocida como Desconocido — loguear una vez por track en stream mode.
+            # Cara no reconocida — loguear una vez por track en stream mode.
             if parent_track_id not in self._unknown_face_logged:
                 self._unknown_face_logged.add(parent_track_id)
                 _slog(
@@ -959,13 +962,13 @@ class _FaceRecognitionHandler:
     def on_track_lost(self, track_id: int, dwell_seconds: float) -> None:
         """Llamado desde _expire_lost_tracks. Emite employee_exit / known_person_exit."""
         identity = self._cache.get(track_id)
-        if identity and identity[0] != "Desconocido":
-            name, _ = identity
+        if identity and identity[0] != "Unknown":
+            identity_key, _ = identity  # UUID string assigned by the backend
             state = _active_tracks.get(
                 next((k for k in _active_tracks if k[1] == track_id), (None, None))
             )
             camera_id = state.camera_id if state else ""
-            api_client.post_employee_exit(camera_id, name, track_id, dwell_seconds)
+            api_client.post_employee_exit(camera_id, identity_key, track_id, dwell_seconds)
         self._cache.pop(track_id, None)
         self._identity_reported.discard(track_id)
         self._last_heartbeat.pop(track_id, None)
@@ -996,10 +999,11 @@ class _FaceRecognitionHandler:
 # 5. WORKER GLOBALS + LIFECYCLE
 # ==============================================================================
 
-_face_recognizer   = None  # FaceRecognizer (face_recognition)
-_appearance_worker = None  # AppearanceWorker — embeddings 512-dim por persona
-_reid_manager      = None  # ReIdManager — DB local cross-cámara
-_ws_client         = None  # WsPositionClient (WebSocket de posiciones / heatmaps)
+_face_recognizer    = None  # FaceRecognizer (face_recognition)
+_appearance_worker  = None  # AppearanceWorker — embeddings 512-dim por persona
+_reid_manager       = None  # ReIdManager — DB local cross-cámara
+_ws_client          = None  # WsPositionClient (WebSocket de posiciones / heatmaps)
+_jetson_sync_client = None  # JetsonSyncClient (Socket.IO face roster sync)
 
 # Buffer de posiciones: pad_index → list of {track_id, x_norm, y_norm}
 _position_buffer: Dict[int, List[dict]] = {}
@@ -1021,8 +1025,9 @@ def init_workers(
       - AppearanceWorker + ReIdManager: siempre (si existe el modelo OSNet)
       - FaceRecognizer: si 'face_recognition' está en pipeline_capabilities
       - WsPositionClient: si WS_BASE_URL está configurado (heatmaps)
+      - JetsonSyncClient: si face_recognition activo y API_BASE_URL configurado
     """
-    global _face_recognizer, _appearance_worker, _reid_manager, _ws_client
+    global _face_recognizer, _appearance_worker, _reid_manager, _ws_client, _jetson_sync_client
 
     # AppearanceWorker + ReIdManager — siempre activo si existe el modelo OSNet.
     osnet_path = str(Path(model_dir) / "osnet" / "osnet_x0_25_market1501.onnx")
@@ -1042,7 +1047,21 @@ def init_workers(
         _face_recognizer = FaceRecognizer(
             db_path=face_db_path,
             model_root=str(Path(model_dir) / "insightface"),
+            api_base_url=API_BASE_URL,
+            api_key=api_key,
         )
+
+        # JetsonSyncClient — Socket.IO listener for face_update events from backend.
+        # When the backend activates or revokes an employee, this triggers a roster pull.
+        if API_BASE_URL:
+            from jetson_sync_client import JetsonSyncClient
+            _jetson_sync_client = JetsonSyncClient(
+                api_base_url=API_BASE_URL,
+                api_key=api_key,
+                sync_callback=_face_recognizer.sync_from_backend,
+            )
+        else:
+            logger.info("API_BASE_URL not set — JetsonSyncClient disabled (no face roster push).")
 
     # WebSocket de posiciones para heatmaps en el backend
     if ws_base_url:
@@ -1094,10 +1113,14 @@ def start_workers() -> None:
         _face_recognizer.start()
     if _ws_client is not None:
         _ws_client.start()
+    if _jetson_sync_client is not None:
+        _jetson_sync_client.start()
 
 
 def stop_workers() -> None:
     """Detiene todos los workers y persiste el estado del ReIdManager a disco."""
+    if _jetson_sync_client is not None:
+        _jetson_sync_client.stop()
     if _appearance_worker is not None:
         _appearance_worker.stop()
     if _reid_manager is not None:

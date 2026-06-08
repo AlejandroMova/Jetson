@@ -79,7 +79,8 @@ StreamServer (:8080) consume camera_frame_queues y sirve /stream/<cam_id>
 
 **Workers async (Python threads, no bloquean el pipeline):**
 - `AppearanceWorker` — OSNet-x0.25 ONNX, re-ID entre cámaras
-- `FaceRecognizer` — InsightFace buffalo_l, reconocimiento facial
+- `FaceRecognizer` — InsightFace buffalo_l, reconocimiento facial; claves UUID del backend
+- `JetsonSyncClient` — Socket.IO /jetson namespace; recibe face_update del backend y llama sync_from_backend()
 - `NxApiClient` — cola async para REST API backend
 - `WsPositionClient` — telemetría de posiciones / heatmaps en tiempo real
 
@@ -127,9 +128,11 @@ Clasifica a cada persona detectada en una de 6 categorías: female_young, female
 Identifica personas conocidas (empleados, residentes) a partir de una base de datos de embeddings faciales. Usa PeopleNet class 2 (face) para detectar rostros, luego un worker Python extrae el embedding y lo compara con la DB. Requiere 3 coincidencias antes de bloquear la identidad por persona. No hay SGIE dedicado para caras — el SGIE FaceDetectIR fue eliminado.
 - **Detección:** PeopleNet class_id=2 (face) — mismo PGIE que detecta personas, sin SGIE adicional
 - **Embedding:** InsightFace buffalo_l — ArcFace 512-dim, threshold similitud coseno ≥ 0.50
-- **Worker:** `FaceRecognizer` (Python thread)
-- **DB:** `known_faces.json` (nombre → lista de embeddings). Se genera con `register_face.py`
+- **Worker:** `FaceRecognizer` (Python thread) — ahora usa UUID de backend como clave de identidad
+- **DB:** `known_faces.json` — formato nuevo: `{"<uuid>": {"name": "...", "embeddings": [[...]]}}`. Formato legacy (nombre-clave) sigue siendo compatible en lectura.
+- **Registro automático:** `JetsonSyncClient` recibe `face_update` de backend via Socket.IO `/jetson` namespace, llama `sync_from_backend()` que hace GET `/api/employees/embeddings` y actualiza la DB en caliente sin reiniciar el pipeline
 - **Semántica por sector:** comercio/industrial → `employee_seen/presence/exit`; hogar → `known_person_seen/unknown_person_alert`
+- **`employee_id` en eventos:** UUID string del backend (`employees.id`) — no el nombre del empleado
 
 ### Detección de EPP, Fuego/Humo, Placas — 🔄 Pendiente (no en MVP)
 Removidas del MVP por falta de modelos entrenados. Ver `Future.md` para el plan de reintegración.
@@ -580,8 +583,15 @@ Handler genérico de mensajes del bus GStreamer (EOS, WARNING, ERROR). Estándar
 **`common/FPS.py`**
 Medidor de FPS con ventana de 5 segundos. Clase `GETFPS` con `get_fps()` y `print_data()`.
 
-**`face_recognizer.py`** (~162 líneas)
-Worker thread para reconocimiento facial. Carga `known_faces.json` (nombre → lista de embeddings). Para cada crop de rostro: extrae embedding 512-dim con InsightFace buffalo_l, calcula similitud coseno contra la DB, acumula 3 votos antes de bloquear identidad. Threshold: ≥ 0.50.
+**`face_recognizer.py`** (~270 líneas)
+Worker thread para reconocimiento facial. Carga `known_faces.json` (dos formatos: legacy nombre-clave, nuevo UUID-clave `{"uuid": {"name": "...", "embeddings": [...]}}`) en `_load_db()`. Para cada crop de rostro: extrae embedding 512-dim con InsightFace buffalo_l, calcula similitud coseno contra la DB, acumula 3 votos antes de bloquear identidad. Threshold: ≥ 0.50.
+- `sync_from_backend(action, employee_id)`: llama GET `/api/employees/embeddings`, reescribe JSON a disco y llama `reload()` — bloqueante, ejecutar en hilo separado
+- `reload(raw_db)`: reemplaza `_db` y `_uuid_to_name` en memoria; resetea `_locked` y `_votes` para evitar votos stale
+- `get_display_name(uuid_str)`: retorna nombre legible para OSD (de `_uuid_to_name`)
+- En `start()`: lanza `sync_from_backend()` en hilo separado si `api_base_url` está configurado
+
+**`jetson_sync_client.py`** (~100 líneas)
+Worker Socket.IO que mantiene conexión persistente al namespace `/jetson` del backend. Autentica con `X-API-Key` en el dict `auth` de Socket.IO. En `face_update` recibido: despacha `sync_callback(action, employee_id)` en hilo separado (sin bloquear el event loop). También dispara un sync en `on_connect` para sincronizar si el Jetson estuvo offline. Reconexión automática gestionada por python-socketio.
 
 **`appearance_worker.py`** (~139 líneas)
 Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x0.25 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Crop enviado al worker en 3 momentos: (1) primer frame del track, (2) cada 15 frames hasta recibir la primera embedding, (3) cada 90 frames después del primer match para mantener el DB fresco. El resultado es consumido y limpiado (`clear_result`) por `_handle_appearance_reid()` en `probes.py`.
