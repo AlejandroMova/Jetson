@@ -195,7 +195,7 @@ def _slog(*parts: str) -> None:
 # Acumulador para el resumen periódico de analytics_snapshot.
 # _send() corre en el hilo worker de NxApiClient — el lock protege acceso concurrente.
 _analytics_slog_cameras: list = []
-_analytics_slog_last_t: float = time.monotonic()  # evita flush inmediato en el primer call
+_analytics_slog_last_t: Optional[float] = None  # None = timer no iniciado; arranca en el primer call
 _ANALYTICS_SLOG_INTERVAL: float = 60.0  # segundos entre líneas de resumen
 _analytics_slog_lock = threading.Lock()
 
@@ -203,8 +203,9 @@ _analytics_slog_lock = threading.Lock()
 def _accumulate_analytics_slog(camera_id: str) -> None:
     """Acumula cámaras con analytics_snapshot exitoso y emite una línea resumen cada 60s.
 
-    En lugar de una línea por cámara por minuto, agrupa todas las cámaras en un solo
-    mensaje periódico: [API] analytics_snapshot  ['cam1', 'cam2', ...]  200
+    El timer arranca en el primer call real (no en el import), para no verse afectado
+    por el tiempo de carga de modelos. La primera línea se emite ~60s después de que
+    el pipeline empieza a procesar, con todas las cámaras ya acumuladas.
     """
     global _analytics_slog_last_t
     cams_to_log = None
@@ -212,7 +213,10 @@ def _accumulate_analytics_slog(camera_id: str) -> None:
         if camera_id not in _analytics_slog_cameras:
             _analytics_slog_cameras.append(camera_id)
         now = time.monotonic()
-        if now - _analytics_slog_last_t >= _ANALYTICS_SLOG_INTERVAL:
+        if _analytics_slog_last_t is None:
+            # Primera llamada: iniciar el timer sin flushear todavía.
+            _analytics_slog_last_t = now
+        elif now - _analytics_slog_last_t >= _ANALYTICS_SLOG_INTERVAL:
             _analytics_slog_last_t = now
             cams_to_log = list(_analytics_slog_cameras)
             _analytics_slog_cameras.clear()
