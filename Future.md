@@ -415,28 +415,42 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 
 ---
 
-## [Bug] Página de Asistencia siempre vacía — attendance.py filtra por event_type incorrecto
+## ~~[Bug] Página de Asistencia siempre vacía — backend roto y frontend bloqueado con "Pronto"~~ ✅ IMPLEMENTADO (2026-06-07)
 
-**Descripción:** `attendance.py` consulta la tabla `events` filtrando por `event_type == "employee_identified"` en cuatro lugares (líneas 89, 186, 275, 345). El Jetson **nunca** genera ese tipo de evento — emite `employee_seen` (comercio/industrial) y `known_person_seen` (hogar). Adicionalmente, la columna `Event.employee_id` (UUID FK hacia `employees`) solo se llena en `events.py` cuando `event.type == "employee_identified"` — para `employee_seen` siempre queda `NULL`. Resultado: todas las queries de asistencia retornan 0 filas y la página muestra a todos los empleados como "ausente" siempre.
+**Descripción:** La página de Asistencia (`/activity`) tiene dos problemas independientes que hacen que nunca muestre datos reales:
 
-**Por qué sería mejor:** Con la corrección, la página de Asistencia funcionaría con los datos reales que genera el pipeline, sin cambiar el Jetson.
+1. **Backend:** `attendance.py` filtra por `event_type == "employee_identified"` en cuatro lugares (líneas 89, 186, 275, 345). El Jetson **nunca** genera ese tipo de evento — emite `employee_seen` (comercio/industrial) y `known_person_seen` (hogar). La columna `Event.employee_id` (UUID FK hacia `employees`) solo se llena cuando `event.type == "employee_identified"` — para `employee_seen` siempre queda `NULL`. Resultado: todas las queries de asistencia retornan 0 filas y la página muestra a todos los empleados como "ausente".
+
+2. **Frontend:** la ruta `/activity` está enrutada a `<ComingSoon title="Actividad de empleados" />` en `App.jsx:121` en lugar del componente `Attendance` ya existente. La ruta también aparece en `COMING_SOON_ROUTES` en `lib/plans.js:47`, lo que agrega el badge "Pronto" en el sidebar. La página real (`Attendance.jsx`) existe y tiene la estructura UI, pero el usuario nunca llega a verla.
+
+**Por qué sería mejor:** Con ambas correcciones, la página de Asistencia funcionaría de punta a punta con los datos reales que genera el pipeline, sin ningún cambio en el Jetson.
 
 **Reemplazaría:**
+
+*Backend:*
 - Archivo: `NX-Platform/Backend/app/routes/attendance.py`
 - Sección / función: los cuatro `Event.event_type == "employee_identified"` (líneas 89, 186, 275, 345) — reemplazar por `Event.event_type.in_(["employee_seen", "known_person_seen"])`. Eliminar el filtro `Event.employee_id.is_not(None)` (ese campo es siempre NULL para estos eventos). Cambiar el SELECT para extraer el nombre del empleado desde `Event.payload["employee_id"]` (string con el nombre, no UUID) o, mejor, usar la tabla `EmployeeZoneInterval` que ya está correctamente poblada con name strings desde `events.py:173`
 - Archivo: `NX-Platform/Backend/app/routes/events.py`
-- Sección / función: línea 105 — `employee_id_col = getattr(event, "employee_id", None) if event.type == "employee_identified" else None` — para `employee_seen` el campo `employee_id` contiene el nombre del empleado (str), no un UUID FK. Si se quiere mantener el lookup por UUID, hay que hacer `SELECT id FROM employees WHERE name = event.employee_id AND tenant_id = jetson.tenant_id` en el handler de `employee_seen`
+- Sección / función: línea 105 — `employee_id_col = ... if event.type == "employee_identified" else None` — para `employee_seen` el campo `employee_id` contiene el nombre del empleado (str), no un UUID FK. Si se quiere mantener el lookup por UUID, hay que hacer `SELECT id FROM employees WHERE name = event.employee_id AND tenant_id = jetson.tenant_id` en el handler de `employee_seen`
+
+*Frontend:*
+- Archivo: `NX-Platform/frontend/src/App.jsx`
+- Sección / función: línea 121 — `<Route path="/activity" element={<PlanRoute path="/activity"><ComingSoon title="Actividad de empleados" /></PlanRoute>} />` — reemplazar `<ComingSoon ...>` por `<Attendance />` (el import ya existe en línea 11)
+- Archivo: `NX-Platform/frontend/src/lib/plans.js`
+- Sección / función: línea 47 — eliminar `'/activity'` del set `COMING_SOON_ROUTES` para quitar el badge "Pronto" del sidebar
 
 **Tech stack propuesto:**
-- Sin dependencias nuevas. La solución más simple: reescribir las queries de `attendance.py` sobre `EmployeeZoneInterval` (ya poblada) en lugar de sobre `Event` directamente
+- Sin dependencias nuevas. La solución más simple para el backend: reescribir las queries de `attendance.py` sobre `EmployeeZoneInterval` (ya correctamente poblada) en lugar de sobre `Event` directamente. Para el frontend: cambio de dos líneas.
 
 **Verificado en código:**
 - `probes.py:608–616` — Jetson emite `"employee_seen"`, nunca `"employee_identified"`
 - `attendance.py:89,186,275,345` — filtra `event_type == "employee_identified"` → 0 resultados
 - `events.py:105` — `employee_id_col` es `None` para `employee_seen` → columna `Event.employee_id` siempre NULL
 - `models.py:146` — `Event.employee_id` es `UUID | None`, FK a `employees.id` — incompatible con el string que llega en `employee_seen`
+- `App.jsx:121` — ruta `/activity` apunta a `<ComingSoon>` en lugar de `<Attendance>`
+- `plans.js:47` — `'/activity'` en `COMING_SOON_ROUTES` → badge "Pronto" en sidebar
 
-**Consideraciones:** La corrección más robusta es cambiar las queries de asistencia para usar `EmployeeZoneInterval` (que usa `employee_id: str` con el nombre) y hacer el JOIN con `employees` por nombre. Alternativa más correcta a largo plazo: en el handler de `employee_seen` en `events.py`, resolver el nombre a UUID con un SELECT a la tabla `employees` y guardar el UUID en `Event.employee_id`. Esto requiere una query extra por evento pero mantiene la integridad referencial. Esfuerzo estimado: 3–5 horas.
+**Consideraciones:** La corrección del backend más robusta es cambiar las queries de `attendance.py` para usar `EmployeeZoneInterval` (que usa `employee_id: str` con el nombre) y hacer el JOIN con `employees` por nombre. Alternativa más correcta a largo plazo: resolver el nombre a UUID en el handler de `employee_seen` en `events.py` y guardar el UUID en `Event.employee_id` — requiere una query extra por evento pero mantiene integridad referencial. El cambio de frontend es trivial (2 líneas) y debe hacerse junto al fix del backend, no antes — de lo contrario el usuario verá una página con datos vacíos sin explicación. Esfuerzo estimado: 3–5 horas (backend) + 15 min (frontend).
 
 ---
 
@@ -511,6 +525,124 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 - `attendance.py:89` — usa este tipo como referencia, causando el Bug de asistencia
 
 **Consideraciones:** Antes de eliminar, correr `grep -rn "employee_identified"` en toda la plataforma (incluidos tests, scripts de CI, y cualquier integración externa) para confirmar que no hay otro producer. Si existe un plan futuro de migrar la identificación de empleados a UUID (en lugar de nombre string), `EmployeeIdentifiedEvent` es el diseño correcto — en ese caso documentar el intent y marcar como `# pendiente conexión con el Jetson` en lugar de eliminar. Esfuerzo estimado: 30 minutos (verificación) + 1 hora (eliminación + ajuste de attendance).
+
+---
+
+## ~~Heatmap de recorrido por empleado~~ ✅ IMPLEMENTADO (2026-06-07)
+
+**Descripción:** Vista de heatmap individual por empleado que muestra, sobre el reference frame de cada cámara, las zonas donde el empleado estuvo y cuánto tiempo pasó en ellas. Accesible desde la página de empleados al hacer click en un empleado específico.
+
+**Por qué sería mejor:** Actualmente el dashboard solo muestra el tiempo total de permanencia por zona (`EmployeeZoneInterval.duration_seconds`) sin visualización espacial. Esta feature combinaría la información de tiempo por zona con las posiciones reales (WebSocket de posiciones) para mostrar un mapa de calor personalizado por empleado, permitiendo entender patrones de movimiento individuales: qué áreas recorre más, en qué zonas se detiene, comparativas entre turnos o empleados.
+
+**Reemplazaría:**
+- No reemplaza nada existente — es una página nueva en el frontend
+- Se apoya en datos ya almacenados: `EmployeeZoneInterval` (tiempo por cámara), `reference_frames` (fondo de imagen por cámara), y posiciones del WebSocket (coordenadas normalizadas x_norm, y_norm)
+
+**Tech stack propuesto:**
+- Backend: nuevo endpoint `GET /api/employees/{employee_id}/heatmap?camera_id=&start=&end=` que agrega posiciones históricas filtradas por `employee_id` desde una nueva tabla `employee_position_logs`
+- Frontend: reusar el componente canvas de `Heatmap.jsx` con el reference frame de la cámara como fondo, renderizando los puntos de calor del empleado seleccionado sobre la imagen real de la cámara
+- Datos de posición: los snapshots del WebSocket (`/ws/positions`, cada 10s) actualmente son efímeros — habría que persistirlos en una nueva tabla `employee_position_logs (employee_id, camera_id, x_norm, y_norm, timestamp)` con retención configurable (ej. 30 días)
+
+**Consideraciones:** El WebSocket de posiciones actualmente no se persiste en base de datos — es la principal barrera para esta feature. Hay dos opciones de diseño: (a) guardar todas las posiciones históricas en `employee_position_logs` cuando el track corresponde a un empleado identificado por face recognition — esto requiere cruzar el `track_id` del WebSocket con el de `employee_seen` en tiempo real dentro del backend; (b) calcular el heatmap solo en tiempo real para sesiones activas, sin historia. La opción (a) es más valiosa pero requiere más trabajo de infraestructura. La tabla de posiciones puede crecer rápido — considerar TimescaleDB hypertable con política de retención automática. Esfuerzo estimado: 3–5 días (tabla + persistencia en WS handler + endpoint + página frontend).
+
+---
+
+## Output verbose en modo stream (`NX_STREAM_ENABLED=true`)
+
+**Descripción:** Cuando el pipeline corre en modo stream (`./stream.sh`), imprimir por stdout — visible en `docker logs` — una línea legible por cada detección y por cada llamada a la API. Actualmente las llamadas exitosas solo se loguean en nivel DEBUG (invisible en producción) y las detecciones no generan ningún output de texto; solo se ven errores. En modo stream el operador quiere ver qué está pasando en tiempo real sin necesidad de un debugger.
+
+**Por qué sería mejor:** Permite confirmar de un vistazo que el pipeline está detectando personas, asignando global IDs, clasificando demografía, reconociendo empleados y enviando eventos al backend — sin tener que consultar el dashboard ni esperar a que aparezcan datos.
+
+**Reemplazaría / extendería:**
+
+- Archivo: `deploy/pipelines/probes.py`
+- Sección: inicio del archivo (después de `_IS_STREAM_ENABLED`) — agregar función helper:
+  ```python
+  _C = {  # ANSI colors, solo en stream mode
+      "reset": "\033[0m", "bold": "\033[1m",
+      "green": "\033[92m", "yellow": "\033[93m",
+      "cyan": "\033[96m", "magenta": "\033[95m", "red": "\033[91m",
+  }
+
+  def _slog(*parts: str) -> None:
+      """Print una línea de stream-log a stdout (visible en docker logs)."""
+      if _IS_STREAM_ENABLED:
+          print("".join(parts) + _C["reset"], flush=True)
+  ```
+
+- Archivo: `deploy/pipelines/probes.py`
+- Sección / función: `_handle_appearance_reid()` línea ~1150, después de que `_reid_manager.match_or_create()` devuelve el resultado — imprimir detección con global ID:
+  ```python
+  # Línea existente: logger.info("ReID track=%d cam=%s → %s gid=%s prev=%s", ...)
+  _slog(
+      f"{_C['cyan']}[{camera_id}]{_C['reset']} ",
+      f"{_C['bold']}DETECCIÓN{_C['reset']} ",
+      f"track={p_track_id:<4} ",
+      f"gid={_C['green']}{global_id[:8]}{_C['reset']}  ",
+      f"tipo={_C['yellow']}{event_type}{_C['reset']}  ",
+      f"conf={confidence:.2f}",
+      f"  prev={prev_camera}" if prev_camera else "",
+  )
+  ```
+
+- Archivo: `deploy/pipelines/probes.py`
+- Sección / función: `_AgeGenderHandler.process()` línea ~738, cuando se consolida el `winner` con suficientes votos — imprimir clasificación demográfica:
+  ```python
+  _slog(
+      f"{_C['cyan']}[{camera_id}]{_C['reset']} ",
+      f"{_C['magenta']}DEMOGRAFÍA{_C['reset']} ",
+      f"track={p_track_id:<4} ",
+      f"{winner_gd} | {winner_ad}  conf={winner_prob:.0%}",
+  )
+  ```
+  `camera_id` y `p_track_id` ya están en scope en ese método.
+
+- Archivo: `deploy/pipelines/probes.py`
+- Sección / función: `_FaceRecognitionHandler.process()` línea ~830, cuando se reconoce un empleado (`name != "Desconocido"`) — imprimir reconocimiento:
+  ```python
+  _slog(
+      f"{_C['cyan']}[{camera_id}]{_C['reset']} ",
+      f"{_C['green']}{_C['bold']}EMPLEADO{_C['reset']} ",
+      f"track={parent_track_id:<4} ",
+      f"nombre={_C['bold']}{name}{_C['reset']}  sim={conf:.2f}",
+  )
+  ```
+
+- Archivo: `deploy/pipelines/probes.py`
+- Sección / función: `NxApiClient._send()` líneas 383–396 — cambiar el `logger.debug` de éxito a `_slog` y mostrar el tipo de evento cuando está disponible. La firma de `_send()` actualmente no recibe el payload, pero `post_*` métodos sí lo tienen — la forma más simple es loguear en cada `post_*` individualmente (ya conocen el tipo de evento) en lugar de en `_send()`:
+  ```python
+  # En cada método post_* de NxApiClient (post_person_entry, post_person_exit,
+  # post_employee_seen, post_reference_frame, post_analytics_snapshot, etc.)
+  # agregar al inicio, antes de llamar a self._send():
+  _slog(
+      f"{_C['yellow']}[API]{_C['reset']} ",
+      f"POST {endpoint}  ",
+      f"tipo={_C['bold']}{event_type}{_C['reset']}  ",
+      f"cam={camera_id}  track={track_id}",
+  )
+  ```
+  Alternativamente, pasar el `event_type` como argumento opcional a `_send()` y loguearlo ahí junto con el status code de respuesta.
+
+**Formato de output esperado en `docker logs`:**
+```
+[DEMOT-01-ch05] DETECCIÓN  track=42    gid=a3f9c1b2  tipo=new          conf=0.87
+[DEMOT-01-ch05] DEMOGRAFÍA track=42    Masculino | Adulto  conf=84%
+[DEMOT-01-ch05] EMPLEADO   track=42    nombre=Juan García  sim=0.91
+[API] POST /api/events  tipo=person_entry    cam=DEMOT-01-ch05  track=42
+[API] POST /api/events  tipo=person_classified  cam=DEMOT-01-ch05  track=42
+[API] POST /api/events  tipo=employee_seen   cam=DEMOT-01-ch05  track=42
+```
+
+**Tech stack propuesto:**
+- Sin dependencias nuevas — solo `print()` con códigos ANSI estándar (soportados en terminales Linux y en `docker logs`)
+- Gateado en `_IS_STREAM_ENABLED` (línea 156) — cero overhead en producción normal
+
+**Consideraciones:**
+- `print(..., flush=True)` es necesario para que el output aparezca sin buffer en `docker logs -f`
+- Los colores ANSI pueden quitarse si el operador prefiere logs limpios para grep — hacer los códigos configurables via `NO_COLOR=1` env var
+- En instalaciones con 16 cámaras y alta actividad, el volumen de líneas puede ser alto — considerar un rate-limit por cámara (ej. max 1 línea/segundo por `camera_id`) para no saturar la terminal
+- `_slog` debe ser una función de módulo (no método) para ser accesible desde handlers, probe callbacks y `NxApiClient` sin pasar referencias
+- Esfuerzo estimado: 2–3 horas
 
 ---
 
