@@ -6,6 +6,27 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-06-08 — Reference frame nunca se envía durante escenas vacías
+
+**Contexto:** `deploy/pipelines/probes.py` — lógica de reference frame (líneas ~1694–1728)
+
+**Síntoma en logs:**
+No aparecía ningún mensaje `"Frame de referencia encolado camera=..."` en períodos prolongados sin personas, incluso de día con buena iluminación.
+
+**Causa raíz:** doble bloqueo silencioso:
+
+1. **`frame_np` siempre `None` en escenas vacías.** El lazy frame read (`_needs_pixel`) solo se activaba cuando `frame_meta.num_obj_meta > 0` (había objetos detectados). En escena vacía, `num_obj_meta == 0` → `_needs_pixel = False` → `frame_np = None` → la condición `frame_np is not None` del reference frame fallaba siempre. El GPU→CPU copy nunca ocurría cuando más se necesitaba.
+
+2. **`num_obj_meta == 0` como condición adicional (secundario).** PeopleNet detecta también bolsos (`PGIE_CLASS_BAG=1`) y caras sin cuerpo (`PGIE_CLASS_FACE=2`). Aunque `visible_ids` estuviera vacío (sin personas), si había un bolso o una cara detectada, `num_obj_meta > 0` bloqueaba el reference frame aun sin personas.
+
+**Solución:** dos cambios en `probes.py`:
+
+1. Antes del bloque `if _needs_pixel:`, agregar lógica que activa `_needs_pixel = True` cuando la escena está vacía Y las condiciones de tiempo se cumplen (≥30 s sin confirmar, ó ≥24 h desde último confirmado). Overhead máximo: un GPU→CPU copy cada 30 s cuando no hay personas.
+
+2. Remover `frame_meta.num_obj_meta == 0` de la condición del reference frame. Solo `len(visible_ids) == 0` es necesario — los objetos no-persona son parte del fondo.
+
+---
+
 ## 2026-06-02 — Grabaciones con `max_people: 0` y sin personas visibles en "Correr Inferencia"
 
 **Contexto:** `deploy/pipelines/recording_manager.py` — `_reset_writers()`. Ocurre al terminar un clip y arrancar el siguiente inmediatamente.
