@@ -547,7 +547,7 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 
 ---
 
-## Output verbose en modo stream (`NX_STREAM_ENABLED=true`)
+## ✅ Output verbose en modo stream (`NX_STREAM_ENABLED=true`) — implementado 2026-06-07
 
 **Descripción:** Cuando el pipeline corre en modo stream (`./stream.sh`), imprimir por stdout — visible en `docker logs` — una línea legible por cada detección y por cada llamada a la API. Actualmente las llamadas exitosas solo se loguean en nivel DEBUG (invisible en producción) y las detecciones no generan ningún output de texto; solo se ven errores. En modo stream el operador quiere ver qué está pasando en tiempo real sin necesidad de un debugger.
 

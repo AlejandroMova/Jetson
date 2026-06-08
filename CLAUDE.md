@@ -560,6 +560,7 @@ El motor central de analytics. Probe único (`osd_sink_pad_buffer_probe`) en `ca
 - `osd_sink_pad_buffer_probe`: probe único. Lazy frame read: GPU→CPU solo cuando workers necesitan pixels o `NX_STREAM_ENABLED=true`. Al final del loop de cámara, si stream mode activo: dibuja bboxes+labels con OpenCV y empuja a `camera_frame_queues[camera_id]`.
 - **Stream mode helpers**: `init_stream_cameras(channels)`, `camera_frame_queues`, `_IS_STREAM_ENABLED`, `_draw_stream_overlays(frame_bgr, stream_tracks)`
 - **Label en stream**: muestra `G#<global_id>` (ReID cross-cámara, 12 chars hex) si el embedding ya fue procesado, o `...` mientras espera. Los handlers appendean al prefijo existente: ej. `G#a3f92c1b8d04 | male_adult | 87%`. El `track_id` local ya no aparece en el stream.
+- **Stream verbose output** (`_slog`, `_C`): cuando `NX_STREAM_ENABLED=true`, imprime líneas coloreadas a stdout (visibles en `docker logs -f`) por cada evento relevante: `DETECCIÓN` (tras ReID), `DEMOGRAFÍA` (clasificación edad/género), `EMPLEADO` (reconocimiento facial exitoso), `ROSTRO Desconocido` (cara vista sin match, una vez por track), y `[API]` (cada POST exitoso al backend). Desactivar colores ANSI con `NO_COLOR=1`. Sin overhead en producción.
 
 **`stream_server.py`** (~130 líneas)
 Servidor HTTP MJPEG daemon para stream mode (`NX_STREAM_ENABLED=true`). Solo per-cámara, sin tiler. Expone:
@@ -713,6 +714,7 @@ Especificación completa de la API REST y WebSocket entre el Jetson y el backend
 | `API_KEY` | `.env` | Token de autenticación hacia el backend |
 | `WS_BASE_URL` | `.env` | URL WebSocket para telemetría de posiciones / heatmaps |
 | `NX_STREAM_ENABLED` | `docker-compose.stream.yml` | Activa stream mode (MJPEG con bboxes en :8080). Inyectado por `stream.sh`. |
+| `NO_COLOR` | entorno del operador | Si `1`, desactiva códigos ANSI en los logs de `_slog` (útil para `grep` en `docker logs`). Default: `0`. |
 
 ---
 

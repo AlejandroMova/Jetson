@@ -155,6 +155,30 @@ ENTRY_EMIT_DEADLINE_FRAMES: int = 30
 
 _IS_STREAM_ENABLED: bool = os.getenv("NX_STREAM_ENABLED", "false").lower() == "true"
 
+# ANSI colors para stream logs. Desactivar con NO_COLOR=1 (útil para grep en logs sin escapes).
+_NO_COLOR: bool = os.getenv("NO_COLOR", "0") == "1"
+_C: dict = {} if (_NO_COLOR or not _IS_STREAM_ENABLED) else {
+    "reset":   "\033[0m",
+    "bold":    "\033[1m",
+    "green":   "\033[92m",
+    "yellow":  "\033[93m",
+    "cyan":    "\033[96m",
+    "magenta": "\033[95m",
+    "red":     "\033[91m",
+}
+
+
+def _slog(*parts: str) -> None:
+    """Imprime una línea de log coloreado a stdout cuando stream mode está activo.
+
+    Visible en `docker logs -f`. flush=True es necesario para que las líneas
+    aparezcan inmediatamente sin buffer en el contexto de Docker.
+    Solo emite output si NX_STREAM_ENABLED=true — cero overhead en producción.
+    """
+    if _IS_STREAM_ENABLED:
+        print("".join(parts) + _C.get("reset", ""), flush=True)
+
+
 # Queue de frames tileados para MjpegServer (poblada por tiled_overlay_probe)
 tiled_frame_queue: queue.Queue = queue.Queue(maxsize=1)
 
@@ -387,6 +411,11 @@ class NxApiClient:
             resp = self._session.request(method=method, url=url, json=payload, timeout=5)
             resp.raise_for_status()
             logger.debug("%s %s → %d", method, endpoint, resp.status_code)
+            _slog(
+                f"{_C.get('yellow', '')}[API]{_C.get('reset', '')} ",
+                f"{method} {endpoint}  ",
+                f"{_C.get('bold', '')}{resp.status_code}{_C.get('reset', '')}",
+            )
         except requests.exceptions.Timeout:
             logger.warning("Timeout: %s %s", method, url)
         except requests.exceptions.HTTPError as e:
@@ -769,6 +798,8 @@ class _FaceRecognitionHandler:
         self._identity_reported: Set[int] = set()
         self._last_heartbeat: Dict[int, float] = {}
         self._unknown_alerted: Set[int] = set()
+        # Rastrea qué tracks ya recibieron una línea ROSTRO Desconocido en stream log.
+        self._unknown_face_logged: Set[int] = set()
 
     def process_face(
         self,
@@ -828,15 +859,31 @@ class _FaceRecognitionHandler:
             if parent_track_id not in self._identity_reported:
                 self._identity_reported.add(parent_track_id)
                 api_client.post_employee_seen(camera_id, name, parent_track_id, conf, bbox)
+                _slog(
+                    f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
+                    f"{_C.get('green', '')}{_C.get('bold', '')}EMPLEADO{_C.get('reset', '')}   ",
+                    f"track={parent_track_id:<4} ",
+                    f"nombre={_C.get('bold', '')}{name}{_C.get('reset', '')}  sim={conf:.2f}",
+                )
             last_hb = self._last_heartbeat.get(parent_track_id, 0.0)
             if now - last_hb >= self.PRESENCE_HEARTBEAT_SECS:
                 api_client.post_employee_presence(camera_id, name, parent_track_id)
                 self._last_heartbeat[parent_track_id] = now
-        elif _JETSON_SECTOR == "hogar" and parent_track_id not in self._unknown_alerted:
-            self._unknown_alerted.add(parent_track_id)
-            _, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            face_b64 = base64.b64encode(buf).decode("utf-8")
-            api_client.post_unknown_person_alert(camera_id, parent_track_id, face_b64, bbox)
+        else:
+            # Cara reconocida como Desconocido — loguear una vez por track en stream mode.
+            if parent_track_id not in self._unknown_face_logged:
+                self._unknown_face_logged.add(parent_track_id)
+                _slog(
+                    f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
+                    f"ROSTRO     ",
+                    f"track={parent_track_id:<4} ",
+                    f"Desconocido  sim={conf:.2f}",
+                )
+            if _JETSON_SECTOR == "hogar" and parent_track_id not in self._unknown_alerted:
+                self._unknown_alerted.add(parent_track_id)
+                _, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                face_b64 = base64.b64encode(buf).decode("utf-8")
+                api_client.post_unknown_person_alert(camera_id, parent_track_id, face_b64, bbox)
 
     def on_track_lost(self, track_id: int, dwell_seconds: float) -> None:
         """Llamado desde _expire_lost_tracks. Emite employee_exit / known_person_exit."""
@@ -1149,6 +1196,14 @@ def _handle_appearance_reid(
                 state.global_id = global_id
                 logger.info("ReID track=%d cam=%s → %s gid=%s prev=%s",
                             p_track_id, camera_id, event_type, global_id, prev_camera)
+                _slog(
+                    f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
+                    f"{_C.get('bold', '')}DETECCIÓN{_C.get('reset', '')}  ",
+                    f"track={p_track_id:<4} ",
+                    f"gid={_C.get('green', '')}{global_id[:8]}{_C.get('reset', '')}  ",
+                    f"tipo={_C.get('yellow', '')}{event_type}{_C.get('reset', '')}",
+                    f"  prev={prev_camera}" if prev_camera else "",
+                )
 
                 # Same-camera re-detection → tratar como return, no channel_change
                 if event_type == "channel_change" and prev_camera == camera_id:
@@ -1371,8 +1426,16 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 if result.osd_text:
                     _set_osd_text(obj_meta, result.osd_text, border_color=result.border_color)
                 if result.event_type == "person_classified":
+                    demo = result.det_extra.get("demographics", {})
+                    gd, ad = _AGE_GENDER_LABEL_MAP.get(demo.get("label", ""), ("?", "?"))
+                    _slog(
+                        f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
+                        f"{_C.get('magenta', '')}DEMOGRAFÍA{_C.get('reset', '')} ",
+                        f"track={p_track_id:<4} ",
+                        f"{gd} | {ad}  conf={demo.get('confidence', 0.0):.0%}",
+                    )
                     api_client.post_person_classified(
-                        camera_id, p_track_id, bbox, result.det_extra.get("demographics", {})
+                        camera_id, p_track_id, bbox, demo
                     )
                     an = _get_analytics(pad_index)
                     au = result.analytics_update
