@@ -1513,6 +1513,21 @@ def osd_sink_pad_buffer_probe(_pad, info):
                            for k, s in _active_tracks.items() if k[0] == pad_index)
                 )
 
+        # Escena vacía: decodificar píxeles solo cuando toca capturar reference frame.
+        # Sin esto frame_np queda None y el reference frame nunca se envía.
+        # Overhead: un GPU→CPU copy cada ≥30 s (sin confirmar) o ≥24 h (ya confirmado).
+        if not _needs_pixel and frame_meta.num_obj_meta == 0:
+            _rc_confirmed = _reference_frame_confirmed_np.get(camera_id)
+            _rc_ts        = _reference_frame_confirmed_ts.get(camera_id, 0.0)
+            _rc_attempt   = _reference_frame_last_attempt.get(pad_index, 0.0)
+            _now_rc       = time.monotonic()
+            _needs_pixel  = (
+                (_rc_confirmed is None
+                 and _now_rc - _rc_attempt >= REFERENCE_FRAME_RETRY_SECS)
+                or (_rc_confirmed is not None
+                    and _now_rc - _rc_ts >= REFERENCE_FRAME_MIN_INTERVAL_SECS)
+            )
+
         if _needs_pixel:
             try:
                 n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
@@ -1692,11 +1707,11 @@ def osd_sink_pad_buffer_probe(_pad, info):
             _analytics_last_sent[pad_index] = now
 
         # ── Frame de referencia: retry hasta confirmar + detección de cambio ──
-        # Solo se evalúa cuando la escena está vacía y tiene suficiente iluminación.
-        # Frames nocturnos o con cámara tapada se descartan para no enviar un fondo negro.
+        # Solo se evalúa cuando no hay personas y hay suficiente iluminación.
+        # Bolsos u otros objetos estáticos (clase BAG/FACE de PeopleNet) son parte
+        # del fondo y no deben bloquear el envío; solo se excluyen frames nocturnos.
         if (frame_np is not None
                 and len(visible_ids) == 0
-                and frame_meta.num_obj_meta == 0
                 and _frame_is_bright_enough(frame_np)):
             _ref_confirmed_np = _reference_frame_confirmed_np.get(camera_id)
             _ref_confirmed_ts = _reference_frame_confirmed_ts.get(camera_id, 0.0)
