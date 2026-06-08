@@ -179,6 +179,38 @@ def _slog(*parts: str) -> None:
         print("".join(parts) + _C.get("reset", ""), flush=True)
 
 
+# Acumulador para el resumen periódico de analytics_snapshot.
+# _send() corre en el hilo worker de NxApiClient — el lock protege acceso concurrente.
+_analytics_slog_cameras: list = []
+_analytics_slog_last_t: float = 0.0
+_ANALYTICS_SLOG_INTERVAL: float = 60.0  # segundos entre líneas de resumen
+_analytics_slog_lock = threading.Lock()
+
+
+def _accumulate_analytics_slog(camera_id: str) -> None:
+    """Acumula cámaras con analytics_snapshot exitoso y emite una línea resumen cada 60s.
+
+    En lugar de una línea por cámara por minuto, agrupa todas las cámaras en un solo
+    mensaje periódico: [API] analytics_snapshot  ['cam1', 'cam2', ...]  200
+    """
+    global _analytics_slog_last_t
+    cams_to_log = None
+    with _analytics_slog_lock:
+        if camera_id not in _analytics_slog_cameras:
+            _analytics_slog_cameras.append(camera_id)
+        now = time.monotonic()
+        if now - _analytics_slog_last_t >= _ANALYTICS_SLOG_INTERVAL:
+            _analytics_slog_last_t = now
+            cams_to_log = list(_analytics_slog_cameras)
+            _analytics_slog_cameras.clear()
+    if cams_to_log is not None:
+        _slog(
+            f"{_C.get('yellow', '')}[API]{_C.get('reset', '')} ",
+            f"analytics_snapshot  ",
+            f"{_C.get('cyan', '')}{cams_to_log}{_C.get('reset', '')}  200",
+        )
+
+
 # Queue de frames tileados para MjpegServer (poblada por tiled_overlay_probe)
 tiled_frame_queue: queue.Queue = queue.Queue(maxsize=1)
 
@@ -411,11 +443,15 @@ class NxApiClient:
             resp = self._session.request(method=method, url=url, json=payload, timeout=5)
             resp.raise_for_status()
             logger.debug("%s %s → %d", method, endpoint, resp.status_code)
-            _slog(
-                f"{_C.get('yellow', '')}[API]{_C.get('reset', '')} ",
-                f"{method} {endpoint}  ",
-                f"{_C.get('bold', '')}{resp.status_code}{_C.get('reset', '')}",
-            )
+            if endpoint == "/api/analytics":
+                # Analytics snapshots son uno por cámara cada 60s — agrupa en una línea resumen.
+                _accumulate_analytics_slog((payload or {}).get("camera_id", "?"))
+            else:
+                _slog(
+                    f"{_C.get('yellow', '')}[API]{_C.get('reset', '')} ",
+                    f"{method} {endpoint}  ",
+                    f"{_C.get('bold', '')}{resp.status_code}{_C.get('reset', '')}",
+                )
         except requests.exceptions.Timeout:
             logger.warning("Timeout: %s %s", method, url)
         except requests.exceptions.HTTPError as e:
