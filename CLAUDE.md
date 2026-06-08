@@ -554,10 +554,12 @@ Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + decodebin` en 
 
 **`probes.py`** (~900 líneas)
 El motor central de analytics. Probe único (`osd_sink_pad_buffer_probe`) en `caps_rgba src-pad` (frames full-res por cámara, sin tiler).
-- `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea)
+- `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea). Soporta callbacks de éxito por endpoint (`register_success_callback`) invocados desde el worker thread cuando el backend confirma 2xx.
 - `_AgeGenderHandler`: acumula 10 votes del SGIE antes de confirmar clasificación; emite `person_classified`
 - `_FaceRecognitionHandler`: cruza detecciones de cara de PeopleNet (class_id=2) con el `FaceRecognizer`; emite `employee_seen/presence/exit` o `unknown_person_alert`
 - `osd_sink_pad_buffer_probe`: probe único. Lazy frame read: GPU→CPU solo cuando workers necesitan pixels o `NX_STREAM_ENABLED=true`. Al final del loop de cámara, si stream mode activo: dibuja bboxes+labels con OpenCV y empuja a `camera_frame_queues[camera_id]`.
+- **Reference frame con retry + cambio visual**: se envía el primer frame vacío (sin personas, sin objetos) y se reintenta cada `REFERENCE_FRAME_RETRY_SECS=30s` hasta que el backend confirme 2xx. Una vez confirmado, solo se reenvía si han pasado `REFERENCE_FRAME_MIN_INTERVAL_SECS=86400s` (24 h) Y la función `_scene_changed()` detecta ≥ `REFERENCE_FRAME_CHANGE_THRESHOLD=0.15` (15 %) de diferencia normalizada por iluminación. El backend guarda historial completo (sin UPSERT) para consultas históricas de heatmap.
+- **`_scene_changed(current_np, prev_np)`**: redimensiona a 64×36, normaliza por media para ignorar cambios de iluminación, y compara diferencia absoluta media.
 - **Stream mode helpers**: `init_stream_cameras(channels)`, `camera_frame_queues`, `_IS_STREAM_ENABLED`, `_draw_stream_overlays(frame_bgr, stream_tracks)`
 - **Label en stream**: muestra `G#<global_id>` (ReID cross-cámara, 12 chars hex) si el embedding ya fue procesado, o `...` mientras espera. Los handlers appendean al prefijo existente: ej. `G#a3f92c1b8d04 | male_adult | 87%`. El `track_id` local ya no aparece en el stream.
 - **Stream verbose output** (`_slog`, `_C`): cuando `NX_STREAM_ENABLED=true`, imprime líneas coloreadas a stdout (visibles en `docker logs -f`) por cada evento relevante: `DETECCIÓN` (tras ReID), `DEMOGRAFÍA` (clasificación edad/género), `EMPLEADO` (reconocimiento facial exitoso), `ROSTRO Desconocido` (cara vista sin match, una vez por track), y `[API]` (cada POST exitoso al backend). Desactivar colores ANSI con `NO_COLOR=1`. Sin overhead en producción.

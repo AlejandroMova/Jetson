@@ -6,6 +6,25 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## SSIM para detección de cambio visual en reference frames
+
+**Descripción:** Reemplazar la métrica actual de diferencia media normalizada en `_scene_changed()` por SSIM (Structural Similarity Index) de scikit-image o OpenCV. SSIM es más robusto ante ruido de sensor y pequeñas variaciones locales que no reflejan un cambio estructural real de la escena.
+
+**Por qué sería mejor:** La métrica actual (diferencia de píxeles normalizada por iluminación media) puede disparar falsos positivos si hay objetos en movimiento en el borde del frame (sombras, reflejos). SSIM mide similitud estructural y es menos sensible a estas perturbaciones locales, reduciendo reenvíos innecesarios.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/probes.py`
+- Función: `_scene_changed()` (la comparación de la miniatura 64×36 con `np.abs(a/mean_a - b/mean_b).mean()`)
+- Descripción: calcular `ssim(small_a, prev_np)` y disparar cuando `1 - ssim < REFERENCE_FRAME_CHANGE_THRESHOLD`.
+
+**Tech stack propuesto:**
+- Librería: `scikit-image >= 0.21` (función `skimage.metrics.structural_similarity`) o `cv2.quality.QualitySSIM_compute` (OpenCV contrib)
+- Integración: reemplazo directo de la comparación numpy en `_scene_changed()`, sin cambios en el resto del pipeline.
+
+**Consideraciones:** scikit-image agrega ~80 MB a la imagen Docker. OpenCV contrib está disponible en la imagen base de DeepStream. Esfuerzo estimado: 1 h.
+
+---
+
 ## Detección de Caídas (`fall_detection`) — removido del MVP, pendiente reintegración
 
 **Descripción:** Detecta cuando una persona cae al suelo mediante estimación de pose. Aplica 3 reglas geométricas: ángulo del torso > 45°, bbox más ancho que alto, caderas al nivel de los tobillos. Emite alerta si ≥ 2/3 reglas se cumplen. Cooldown de 4 segundos por persona.

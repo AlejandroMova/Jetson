@@ -80,7 +80,7 @@ Return `HTTP 200` or `201` for success. Any non-2xx is logged by the Jetson but 
 | `POST` | `/api/events` | Every person/alert event | Per event |
 | `POST` | `/api/analytics` | Aggregated snapshot per camera | Every 60s (hogar: 3600s) |
 | `POST` | `/api/crops` | Person image crop for dataset | Up to 5 per track |
-| `POST` | `/api/cameras/reference-frame` | Empty background frame | Once per camera at startup |
+| `POST` | `/api/cameras/reference-frame` | Empty background frame | On startup (retry every 30 s until 2xx) + on scene change (≥15 % diff, min 24 h interval) |
 | `WS` | `/ws/positions` | Real-time position telemetry | Persistent; message every 10s/camera |
 
 ### Common fields on every `/api/events` payload
@@ -363,7 +363,10 @@ pixel_y = round(y_norm * frame_height)
 
 ### `POST /api/cameras/reference-frame` — background image
 
-Sent once per camera at startup, on the first frame with zero detections.
+Sent when the scene is empty (zero detections) and one of the following conditions is met:
+
+1. **Startup / retry**: no confirmed frame yet for this camera — retried every 30 s until the backend returns 2xx.
+2. **Scene change detected**: at least 24 h have elapsed since the last confirmed frame AND the current frame differs ≥ 15 % from the stored baseline (after normalizing for illumination), indicating a physical layout change (e.g. products rearranged).
 
 ```json
 {
@@ -377,7 +380,7 @@ Sent once per camera at startup, on the first frame with zero detections.
 }
 ```
 
-Store as the heatmap background for this camera. All normalized positions from `/ws/positions` are relative to this `width × height`.
+The backend **inserts** a new row on every call (no UPSERT). Historical heatmap queries use `timestamp <= query_end ORDER BY timestamp DESC LIMIT 1` to find the background that was valid at any point in time. All normalized positions from `/ws/positions` are relative to the `width × height` of the frame valid for that period.
 
 ---
 

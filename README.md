@@ -506,7 +506,7 @@ Message: { type: "positions_snapshot", camera_id, timestamp, positions: [{track_
 pixel_x = x_norm × frame_width
 pixel_y = y_norm × frame_height
 ```
-Overlay on the `reference-frame` image the pipeline sends at startup for accurate heatmap rendering.
+Overlay on the `reference-frame` image the pipeline sends when the scene is empty (and re-sends when the layout changes significantly) for accurate heatmap rendering.
 
 **Why WebSocket instead of REST:** WebSocket keeps a single TCP connection open. For 6 cameras × 6 snapshots/min = 36 messages/min, REST adds ~300 bytes HTTP overhead per request. WebSocket adds 2-10 bytes. Reconnects automatically with exponential backoff (1s → 2s → ... → 30s).
 

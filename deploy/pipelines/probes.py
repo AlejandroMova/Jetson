@@ -138,6 +138,19 @@ FACE_SAMPLE_INTERVAL: int  = 30
 # ── Analytics ─────────────────────────────────────────────────────────────────
 ANALYTICS_SEND_INTERVAL_SECS: float = 60.0
 
+# ── Reference frame ───────────────────────────────────────────────────────────
+# Tiempo mínimo entre reintentos cuando el backend no ha confirmado el frame.
+REFERENCE_FRAME_RETRY_SECS: float = 30.0
+# Mínimo 24 h entre reenvíos — alineado con la granularidad de día del calendario del frontend.
+REFERENCE_FRAME_MIN_INTERVAL_SECS: float = 86_400.0
+# Fracción de diferencia normalizada (0.0-1.0) que dispara un nuevo frame de referencia.
+# 0.15 ≈ 15 % de los píxeles cambian significativamente tras normalizar por iluminación media.
+REFERENCE_FRAME_CHANGE_THRESHOLD: float = 0.15
+# Brillo mínimo aceptable (media de píxeles en gris, escala 0-255).
+# Frames por debajo de este valor (ej. noche, cámara tapada) se descartan como fondo.
+# 30/255 ≈ 12 % de brillo máximo — rechaza negro puro y escenas casi a oscuras.
+REFERENCE_FRAME_MIN_BRIGHTNESS: float = 30.0
+
 # ── Crop capture ──────────────────────────────────────────────────────────────
 CROPS_DIR: str            = "crops"
 CROP_SAMPLE_INTERVAL: int = 15
@@ -395,6 +408,9 @@ class NxApiClient:
             "X-API-Key": api_key,
         })
         self._worker_thread: Optional[threading.Thread] = None
+        # Callbacks invocados desde el worker thread tras un 2xx exitoso.
+        # Clave: endpoint exacto (ej. "/api/cameras/reference-frame").
+        self._success_callbacks: Dict[str, "Callable[[dict], None]"] = {}
 
     def start(self):
         """Arranca el hilo worker que drena la cola de peticiones HTTP."""
@@ -415,6 +431,18 @@ class NxApiClient:
             self._worker_thread.join(timeout=5)
         self._session.close()
         logger.info("NxApiClient detenido.")
+
+    def register_success_callback(self, endpoint: str, cb: "Callable[[dict], None]") -> None:
+        """Registra un callback invocado por el worker thread cuando el endpoint retorna 2xx.
+
+        El callback recibe el payload original enviado. Se llama desde el hilo worker,
+        por lo que debe ser thread-safe y no bloquear.
+
+        Args:
+            endpoint: Ruta exacta, ej. "/api/cameras/reference-frame".
+            cb:       Función que acepta el dict del payload enviado.
+        """
+        self._success_callbacks[endpoint] = cb
 
     def enqueue(self, method: str, endpoint: str, payload: Optional[dict] = None):
         """Encola una petición HTTP sin bloquear. Descarta con warning si la cola está llena."""
@@ -452,6 +480,13 @@ class NxApiClient:
                     f"{method} {endpoint}  ",
                     f"{_C.get('bold', '')}{resp.status_code}{_C.get('reset', '')}",
                 )
+            # Invocar callback de éxito si está registrado para este endpoint.
+            cb = self._success_callbacks.get(endpoint)
+            if cb is not None:
+                try:
+                    cb(payload or {})
+                except Exception as exc:
+                    logger.warning("Success callback error (%s): %s", endpoint, exc)
         except requests.exceptions.Timeout:
             logger.warning("Timeout: %s %s", method, url)
         except requests.exceptions.HTTPError as e:
@@ -1020,6 +1055,36 @@ def init_workers(
     else:
         logger.info("WS_BASE_URL not set — position WebSocket disabled.")
 
+    # ── Callback de confirmación de reference frame ───────────────────────────
+    def _on_reference_frame_confirmed(payload: dict) -> None:
+        """Llamado por el worker de NxApiClient cuando el backend confirma (2xx) el frame.
+
+        Almacena el frame como baseline para la detección de cambio visual futura.
+        Se ejecuta en el hilo worker del NxApiClient, no en el probe de GStreamer.
+
+        Args:
+            payload: Payload original enviado al backend (incluye image_b64 y camera_id).
+        """
+        cam = payload.get("camera_id", "")
+        b64 = payload.get("image_b64", "")
+        if not cam or not b64:
+            return
+        try:
+            buf  = base64.b64decode(b64)
+            arr  = np.frombuffer(buf, dtype=np.uint8)
+            gray = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                return
+            # Reducir a 64×36 float32 para comparaciones futuras con _scene_changed().
+            small = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
+            _reference_frame_confirmed_np[cam] = small
+            _reference_frame_confirmed_ts[cam] = time.monotonic()
+            logger.info("Frame de referencia confirmado por backend: camera=%s", cam)
+        except Exception as exc:
+            logger.warning("Error procesando confirmación de reference frame camera=%s: %s", cam, exc)
+
+    api_client.register_success_callback("/api/cameras/reference-frame", _on_reference_frame_confirmed)
+
 
 def start_workers() -> None:
     """Start all workers. Call after pipeline.set_state(PLAYING)."""
@@ -1056,6 +1121,52 @@ _HANDLER_REGISTRY = {
 }
 
 
+def _frame_is_bright_enough(frame_np: "np.ndarray") -> bool:
+    """Devuelve True si el frame tiene suficiente iluminación para usarse como fondo.
+
+    Descarta frames nocturnos, cámaras tapadas o escenas casi a oscuras que
+    resultarían en un fondo negro inútil para el heatmap.
+
+    La comprobación es barata: convierte a gris y calcula la media sobre una
+    miniatura 64×36 (2 304 píxeles), no sobre el frame completo.
+
+    Args:
+        frame_np: Frame BGR o gris del probe (ya en RAM).
+
+    Returns:
+        True si la media de brillo (0-255) supera REFERENCE_FRAME_MIN_BRIGHTNESS.
+    """
+    gray = frame_np if frame_np.ndim == 2 else cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA)
+    return float(small.mean()) >= REFERENCE_FRAME_MIN_BRIGHTNESS
+
+
+def _scene_changed(current_np: "np.ndarray", prev_np: "np.ndarray") -> bool:
+    """Compara el frame actual con el último frame de referencia confirmado.
+
+    Normaliza por iluminación media antes de comparar, de modo que un simple
+    cambio de luz (día/noche) no dispare un reenvío. Solo los cambios estructurales
+    (productos reordenados, zona reorganizada) superan el umbral.
+
+    Args:
+        current_np: Frame BGR o gris full-res del probe (ya en RAM).
+        prev_np:    Último frame confirmado almacenado en _reference_frame_confirmed_np
+                    — siempre gris, 64×36, float32.
+
+    Returns:
+        True si la diferencia normalizada supera REFERENCE_FRAME_CHANGE_THRESHOLD.
+    """
+    # Convertir a gris si viene en BGR y reducir a miniatura para cómputo rápido.
+    gray = current_np if current_np.ndim == 2 else cv2.cvtColor(current_np, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+    # Normalizar por iluminación media (evita falsos positivos por cambio de luz).
+    mean_a = small.mean() or 1.0
+    mean_b = prev_np.mean() or 1.0
+    diff = np.abs(small / mean_a - prev_np / mean_b).mean()
+    return diff > REFERENCE_FRAME_CHANGE_THRESHOLD
+
+
 def init_handlers(pipeline_capabilities: List[str]) -> None:
     """Instancia y registra los handlers activos según las capacidades del pipeline."""
     global _active_handlers, _face_handler
@@ -1085,7 +1196,16 @@ def init_handlers(pipeline_capabilities: List[str]) -> None:
 _active_tracks: Dict[Tuple[int, int], _TrackState] = {}
 _crop_counts: Dict[int, int] = {}
 _crop_last_frame: Dict[int, int] = {}
-_reference_frame_sent: Dict[int, bool] = {}
+
+# ── Reference frame state ─────────────────────────────────────────────────────
+# Frame confirmado por el backend (grayscale 64×36 float32) por camera_id.
+# None significa que aún no se recibió confirmación 2xx del backend.
+_reference_frame_confirmed_np: Dict[str, "np.ndarray"] = {}
+# Timestamp monotónico del último 2xx confirmado por cámara.
+_reference_frame_confirmed_ts: Dict[str, float] = {}
+# Timestamp monotónico del último intento de envío (para controlar el retry).
+_reference_frame_last_attempt: Dict[int, float] = {}
+
 _analytics: Dict[int, Dict] = {}
 _analytics_last_sent: Dict[int, float] = {}
 
@@ -1523,19 +1643,6 @@ def osd_sink_pad_buffer_probe(_pad, info):
         # ── Expirar tracks perdidos ───────────────────────────────────────────
         _expire_lost_tracks(pad_index, frame_num, visible_ids)
 
-        # ── Frame de referencia (escena vacía) ────────────────────────────────
-        if (not _reference_frame_sent.get(pad_index, False)
-                and frame_np is not None
-                and len(visible_ids) == 0
-                and frame_meta.num_obj_meta == 0):
-            fh, fw = frame_np.shape[:2]
-            _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            frame_b64 = base64.b64encode(buf).decode("utf-8")
-            api_client.post_reference_frame(camera_id, frame_num, frame_b64, fw, fh)
-            _reference_frame_sent[pad_index] = True
-            logger.info("Frame de referencia enviado camera=%s (frame=%d, %dx%d)",
-                        camera_id, frame_num, fw, fh)
-
         # ── Posiciones para heatmaps ──────────────────────────────────────────
         if _ws_client is not None and visible_ids and frame_np is not None:
             fh, fw = frame_np.shape[:2]
@@ -1556,5 +1663,41 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 "gender_female": 0, "age_gender_classes": {},
             }
             _analytics_last_sent[pad_index] = now
+
+        # ── Frame de referencia: retry hasta confirmar + detección de cambio ──
+        # Solo se evalúa cuando la escena está vacía y tiene suficiente iluminación.
+        # Frames nocturnos o con cámara tapada se descartan para no enviar un fondo negro.
+        if (frame_np is not None
+                and len(visible_ids) == 0
+                and frame_meta.num_obj_meta == 0
+                and _frame_is_bright_enough(frame_np)):
+            _ref_confirmed_np = _reference_frame_confirmed_np.get(camera_id)
+            _ref_confirmed_ts = _reference_frame_confirmed_ts.get(camera_id, 0.0)
+            _ref_last_attempt = _reference_frame_last_attempt.get(pad_index, 0.0)
+
+            # Caso 1 — nunca confirmado: reintentar cada REFERENCE_FRAME_RETRY_SECS.
+            _needs_initial = (
+                _ref_confirmed_np is None
+                and now - _ref_last_attempt >= REFERENCE_FRAME_RETRY_SECS
+            )
+            # Caso 2 — ya confirmado: verificar si la escena cambió significativamente
+            # y han pasado al menos 24 h desde el último frame confirmado.
+            _needs_update = (
+                _ref_confirmed_np is not None
+                and now - _ref_confirmed_ts >= REFERENCE_FRAME_MIN_INTERVAL_SECS
+                and _scene_changed(frame_np, _ref_confirmed_np)
+            )
+
+            if _needs_initial or _needs_update:
+                fh, fw = frame_np.shape[:2]
+                _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                frame_b64 = base64.b64encode(buf).decode("utf-8")
+                api_client.post_reference_frame(camera_id, frame_num, frame_b64, fw, fh)
+                _reference_frame_last_attempt[pad_index] = now
+                reason = "inicial/retry" if _needs_initial else "cambio visual detectado"
+                logger.info(
+                    "Frame de referencia encolado camera=%s frame=%d %dx%d [%s]",
+                    camera_id, frame_num, fw, fh, reason,
+                )
 
     return Gst.PadProbeReturn.OK

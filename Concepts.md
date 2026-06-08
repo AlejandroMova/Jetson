@@ -145,10 +145,15 @@ Cuando el probe quiere enviar un evento, hace esto:
 En paralelo, el hilo worker de `NxApiClient`:
 4. Saca el item de la cola
 5. Hace el `POST /api/events` al backend (timeout 5 s)
-6. Si el backend está caído, lo logea y descarta — el pipeline nunca falla por esto
+6. Si el backend retorna 2xx: invoca el callback registrado para ese endpoint (si existe)
+7. Si el backend está caído, lo logea y descarta — el pipeline nunca falla por esto
 
 El probe **nunca espera** la respuesta HTTP. Si el backend está caído, los eventos se descartan
 silenciosamente (la cola tiene límite de 512 items).
+
+**Callbacks de éxito por endpoint:** `register_success_callback(endpoint, cb)` permite registrar una función
+que se invoca desde el worker thread cuando el backend confirma 2xx. Actualmente se usa para el reference frame:
+cuando el backend confirma la recepción, se almacena el frame como baseline para detectar cambios futuros.
 
 - Clase completa: [probes.py línea 406](deploy/pipelines/probes.py#L406)
 - Todos los métodos `post_*`: [probes.py desde línea 520](deploy/pipelines/probes.py#L520)
