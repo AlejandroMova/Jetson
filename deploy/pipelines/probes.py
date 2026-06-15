@@ -1,60 +1,60 @@
 """
-probes.py — NX Computing AI | Edge Inference Core
+GStreamer probe for DeepStream metadata extraction and REST API delivery.
 
-Probe de GStreamer para extracción de metadatos DeepStream y envío a API REST.
-Importado por app.py y app_video_testing.py.
+Imported by app.py and app_video_testing.py.
 
-Arquitectura:
-  PGIE (PeopleNet, gie-id=1) detecta person/bag/face en el frame completo.
-  Handlers opcionales (uno por capability activa) procesan cada persona detectada.
-  FaceRecognizer y AppearanceWorker corren en hilos de fondo (patrón queue+thread).
+Architecture:
+  PGIE (PeopleNet, gie-id=1) detects person/bag/face in the full frame.
+  Optional handlers (one per active capability) process each detected person.
+  FaceRecognizer and AppearanceWorker run on background threads (queue+thread pattern).
 
 Stream mode (NX_STREAM_ENABLED=true):
-  En stream mode el pipeline inserta nvmultistreamtiler (640×360) después del probe
-  analytics. Un segundo probe (tiled_overlay_probe) dibuja bboxes sobre el frame
-  tileado y lo sirve vía MjpegServer (:8080/viewer/all). Cero overhead en producción.
+  The pipeline inserts nvmultistreamtiler (640x360) after the analytics probe.
+  A second probe (tiled_overlay_probe) draws bboxes on the tiled frame and serves
+  it via MjpegServer (:8080/viewer/all). Zero overhead in production.
 
-Para agregar un nuevo modelo:
-  1. Crear una clase que implemente process(obj_meta, frame_num, frame_np).
-  2. Añadirla a _HANDLER_REGISTRY bajo su capability name.
-  3. Si necesita un worker async, agregarlo en init_workers() y wirearlo en init_handlers().
-  4. Añadir la entrada en SGIE_CONFIGS en app.py (o None si es Python worker).
+How to add a new model:
+  1. Create a class implementing process(obj_meta, frame_num, frame_np).
+  2. Add it to _HANDLER_REGISTRY under its capability name.
+  3. If it needs an async worker, add it in init_workers() and wire it in init_handlers().
+  4. Add the entry to SGIE_CONFIGS in app.py (or None if it's a Python worker).
 """
+import base64
+import json
+import logging
+import os
+import queue
+import subprocess
+import threading
+import time
+import uuid
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
-import pyds
-import json
-import queue
-import logging
-import threading
-import time
-import uuid
-import base64
-import os
-from datetime import datetime, timezone
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-
-import numpy as np
 import cv2
+import numpy as np
+import pyds
 import requests
 
 logger = logging.getLogger(__name__)
 
-# ==============================================================================
-# CONFIGURACIÓN
-# ==============================================================================
-JETSON_ID: str    = os.environ.get("JETSON_ID",  os.uname().nodename)
+
+# ── Environment config ────────────────────────────────────────────────────────
+
+JETSON_ID: str = os.environ.get("JETSON_ID", os.uname().nodename)
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "http://localhost:8000")
-API_KEY: str      = os.environ.get("API_KEY",    "your-api-key")
+API_KEY: str = os.environ.get("API_KEY", "your-api-key")
 
 
 def _get_tailscale_ip() -> Optional[str]:
     """Return the Tailscale IPv4 address of this device, or None if unavailable."""
-    import subprocess
     try:
         result = subprocess.run(
             ["tailscale", "ip", "-4"],
@@ -63,38 +63,38 @@ def _get_tailscale_ip() -> Optional[str]:
         ip = result.stdout.strip()
         return ip if ip else None
     except Exception:
+        # Tailscale not installed or not running — non-fatal, field is optional.
         return None
 
 
 TAILSCALE_IP: Optional[str] = _get_tailscale_ip()
 
-# Mapa pad_index → número de canal real del DVR.
-# Se inicializa desde app.py llamando a init_channel_map(cfg.channels).
+# pad_index → real DVR channel number.
+# Populated from app.py by calling init_channel_map(cfg.channels).
 _channel_map: Dict[int, int] = {}
 
-# Sector del cliente: "comercio" | "industrial" | "hogar"
 _JETSON_SECTOR: str = "comercio"
 
-# Pad indices que corresponden a cámaras de entrada/salida
+# Pad indices for entry/exit cameras — used to tag person_entry/exit events.
 _entry_exit_pads: set = set()
 
-# Tipo de cámara: pad indices externos y flags de conteo por tipo
-_external_pads:   set  = set()
-_count_internal:  bool = True
-_count_external:  bool = True
+# Camera type classification — controls which cameras contribute to analytics counts.
+_external_pads: set = set()
+_count_internal: bool = True
+_count_external: bool = True
 
 
-def init_channel_map(channels: list):
-    """Llamar desde app.py después de load_config(), antes de arrancar el pipeline."""
+def init_channel_map(channels: list) -> None:
+    """Call from app.py after load_config(), before starting the pipeline."""
     global _channel_map
     _channel_map = {idx: ch for idx, ch in enumerate(channels)}
     logger.info("Channel map: %s", _channel_map)
 
 
 def init_sector(sector: str) -> None:
-    """Configura el sector del cliente: 'comercio', 'industrial' o 'hogar'.
+    """Set the client sector: 'comercio', 'industrial', or 'hogar'.
 
-    El sector afecta el tipo de evento emitido por face_recognition
+    The sector controls the event type emitted by face_recognition
     (employee_seen vs known_person_seen).
     """
     global _JETSON_SECTOR
@@ -103,16 +103,18 @@ def init_sector(sector: str) -> None:
 
 
 def init_entry_exit_pads(pad_indices: set) -> None:
-    """Define qué pad indices corresponden a cámaras de entrada/salida del local."""
+    """Define which pad indices correspond to entry/exit cameras."""
     global _entry_exit_pads
     _entry_exit_pads = pad_indices
     logger.info("Entry/exit pad indices: %s", pad_indices)
 
 
-def init_camera_types(external_pad_indices: set, count_internal: bool, count_external: bool) -> None:
-    """Configura qué cámaras son externas y si se deben contar sus personas."""
+def init_camera_types(
+    external_pad_indices: set, count_internal: bool, count_external: bool
+) -> None:
+    """Configure which cameras are external and whether to count their detections."""
     global _external_pads, _count_internal, _count_external
-    _external_pads  = external_pad_indices
+    _external_pads = external_pad_indices
     _count_internal = count_internal
     _count_external = count_external
     logger.info(
@@ -122,70 +124,70 @@ def init_camera_types(external_pad_indices: set, count_internal: bool, count_ext
 
 
 def _camera_id_for(pad_index: int) -> str:
-    """Devuelve un camera_id con el canal real, ej. 'jetson-nx-001-ch03'."""
+    """Return a camera_id using the real DVR channel number, e.g. 'jetson-nx-001-ch03'."""
     ch = _channel_map.get(pad_index, pad_index)
     return f"{JETSON_ID}-ch{ch:02d}"
 
+
 # ── GIE unique-ids ────────────────────────────────────────────────────────────
-PGIE_UNIQUE_ID: int      = 1   # PeopleNet
-SGIE_AGE_GENDER_ID: int  = 2   # ResNet-18 Pedestrian Attr
+PGIE_UNIQUE_ID: int = 1      # PeopleNet
+SGIE_AGE_GENDER_ID: int = 2  # ResNet-18 Pedestrian Attr
 
 # ── PGIE class ids ────────────────────────────────────────────────────────────
 PGIE_CLASS_PERSON: int = 0
-PGIE_CLASS_BAG:    int = 1
-PGIE_CLASS_FACE:   int = 2
+PGIE_CLASS_BAG: int = 1
+PGIE_CLASS_FACE: int = 2
 
 # ── Confidence thresholds ─────────────────────────────────────────────────────
-OSD_CONFIDENCE_THRESHOLD: float      = 0.30
-MIN_CLASSIFICATION_PROB: float       = 0.3
+OSD_CONFIDENCE_THRESHOLD: float = 0.30
+MIN_CLASSIFICATION_PROB: float = 0.3
 FACE_DET_CONFIDENCE_THRESHOLD: float = 0.40
 
 # ── Age/gender voting ─────────────────────────────────────────────────────────
 VOTE_SAMPLE_INTERVAL: int = 5
-VOTES_REQUIRED: int       = 10
-VOTE_MIN_WIDTH: int       = 64
-VOTE_MIN_HEIGHT: int      = 160
+VOTES_REQUIRED: int = 10
+VOTE_MIN_WIDTH: int = 64
+VOTE_MIN_HEIGHT: int = 160
 
 # ── Track lifecycle ───────────────────────────────────────────────────────────
 TRACK_LOST_TIMEOUT_FRAMES: int = 60
 
 # ── Face recognition ──────────────────────────────────────────────────────────
-FACE_SAMPLE_INTERVAL: int  = 30
+FACE_SAMPLE_INTERVAL: int = 30
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
 ANALYTICS_SEND_INTERVAL_SECS: float = 60.0
 
 # ── Reference frame ───────────────────────────────────────────────────────────
-# Tiempo mínimo entre reintentos cuando el backend no ha confirmado el frame.
+# Minimum time between retries when the backend has not confirmed the frame yet.
 REFERENCE_FRAME_RETRY_SECS: float = 30.0
-# Mínimo 24 h entre reenvíos — alineado con la granularidad de día del calendario del frontend.
+# Minimum 24h between resends — aligned with the frontend calendar's day granularity.
 REFERENCE_FRAME_MIN_INTERVAL_SECS: float = 86_400.0
-# Fracción de diferencia normalizada (0.0-1.0) que dispara un nuevo frame de referencia.
-# 0.15 ≈ 15 % de los píxeles cambian significativamente tras normalizar por iluminación media.
+# Normalized diff fraction (0.0-1.0) that triggers a new reference frame send.
+# 0.15 ≈ 15% of pixels changed significantly after normalizing for mean illumination.
 REFERENCE_FRAME_CHANGE_THRESHOLD: float = 0.15
-# Brillo mínimo aceptable (media de píxeles en gris, escala 0-255).
-# Frames por debajo de este valor (ej. noche, cámara tapada) se descartan como fondo.
-# 30/255 ≈ 12 % de brillo máximo — rechaza negro puro y escenas casi a oscuras.
+# Minimum acceptable brightness (mean pixel value in grayscale, 0-255).
+# Frames below this value (night, covered camera) are discarded as background.
+# 30/255 ≈ 12% of max brightness — rejects pure black and near-dark scenes.
 REFERENCE_FRAME_MIN_BRIGHTNESS: float = 30.0
 
 # ── Crop capture ──────────────────────────────────────────────────────────────
-CROPS_DIR: str            = "crops"
+CROPS_DIR: str = "crops"
 CROP_SAMPLE_INTERVAL: int = 15
-CROP_MAX_PER_PERSON: int  = 5
-CROP_MIN_WIDTH: int       = 48
-CROP_MIN_HEIGHT: int      = 96
+CROP_MAX_PER_PERSON: int = 5
+CROP_MIN_WIDTH: int = 48
+CROP_MIN_HEIGHT: int = 96
 # Frames to wait for an appearance embedding before emitting person_entry anyway.
 # 30 frames ≈ 1 second — enough for OSNet on CPU even under queue pressure.
 ENTRY_EMIT_DEADLINE_FRAMES: int = 30
 
 
-# ==============================================================================
-# STREAM MODE — activo solo cuando NX_STREAM_ENABLED=true
-# ==============================================================================
+# ── Stream mode — active only when NX_STREAM_ENABLED=true ────────────────────
 
 _IS_STREAM_ENABLED: bool = os.getenv("NX_STREAM_ENABLED", "false").lower() == "true"
 
-# ANSI colors para stream logs. Desactivar con NO_COLOR=1 (útil para grep en logs sin escapes).
+# ANSI color codes for stream logs. Disable with NO_COLOR=1 (useful for grepping
+# docker logs without escape sequences). Empty dict = no-op for _C.get() calls.
 _NO_COLOR: bool = os.getenv("NO_COLOR", "0") == "1"
 _C: dict = {} if (_NO_COLOR or not _IS_STREAM_ENABLED) else {
     "reset":   "\033[0m",
@@ -199,30 +201,29 @@ _C: dict = {} if (_NO_COLOR or not _IS_STREAM_ENABLED) else {
 
 
 def _slog(*parts: str) -> None:
-    """Imprime una línea de log coloreado a stdout cuando stream mode está activo.
+    """Print a colored log line to stdout when stream mode is active.
 
-    Visible en `docker logs -f`. flush=True es necesario para que las líneas
-    aparezcan inmediatamente sin buffer en el contexto de Docker.
-    Solo emite output si NX_STREAM_ENABLED=true — cero overhead en producción.
+    Visible in `docker logs -f`. flush=True is required for immediate output
+    without Docker buffering. Zero output in production (NX_STREAM_ENABLED=false).
     """
     if _IS_STREAM_ENABLED:
         print("".join(parts) + _C.get("reset", ""), flush=True)
 
 
-# Acumulador para el resumen periódico de analytics_snapshot.
-# _send() corre en el hilo worker de NxApiClient — el lock protege acceso concurrente.
+# Accumulator for the periodic analytics_snapshot summary line.
+# _send() runs in the NxApiClient worker thread — the lock guards concurrent access.
 _analytics_slog_cameras: list = []
-_analytics_slog_last_t: Optional[float] = None  # None = timer no iniciado; arranca en el primer call
-_ANALYTICS_SLOG_INTERVAL: float = 60.0  # segundos entre líneas de resumen
+_analytics_slog_last_t: Optional[float] = None  # None = timer not started; starts on first call
+_ANALYTICS_SLOG_INTERVAL: float = 60.0
 _analytics_slog_lock = threading.Lock()
 
 
 def _accumulate_analytics_slog(camera_id: str) -> None:
-    """Acumula cámaras con analytics_snapshot exitoso y emite una línea resumen cada 60s.
+    """Accumulate cameras with a successful analytics_snapshot and emit a summary line every 60s.
 
-    El timer arranca en el primer call real (no en el import), para no verse afectado
-    por el tiempo de carga de modelos. La primera línea se emite ~60s después de que
-    el pipeline empieza a procesar, con todas las cámaras ya acumuladas.
+    The timer starts on the first real call (not at import time) to avoid being
+    skewed by model load time. The first line fires ~60s after the pipeline starts,
+    with all cameras already accumulated.
     """
     global _analytics_slog_last_t
     cams_to_log = None
@@ -231,7 +232,7 @@ def _accumulate_analytics_slog(camera_id: str) -> None:
             _analytics_slog_cameras.append(camera_id)
         now = time.monotonic()
         if _analytics_slog_last_t is None:
-            # Primera llamada: iniciar el timer sin flushear todavía.
+            # First call — start the timer without flushing yet.
             _analytics_slog_last_t = now
         elif now - _analytics_slog_last_t >= _ANALYTICS_SLOG_INTERVAL:
             _analytics_slog_last_t = now
@@ -245,38 +246,39 @@ def _accumulate_analytics_slog(camera_id: str) -> None:
         )
 
 
-# Queue de frames tileados para MjpegServer (poblada por tiled_overlay_probe)
+# Tiled frame queue for MjpegServer, populated by tiled_overlay_probe.
 tiled_frame_queue: queue.Queue = queue.Queue(maxsize=1)
 
-# Grid del tiler — seteado por init_stream_grid() desde app.py antes de arrancar
+# Tiler grid dimensions — set by init_stream_grid() from app.py before pipeline start.
 _stream_tiler_cols: int = 1
 _stream_tiler_rows: int = 1
 _stream_cell_w: int = 640
 _stream_cell_h: int = 360
 
-# Labels de tracks activos — Probe A (osd_sink_pad_buffer_probe) escribe,
-# Probe B (tiled_overlay_probe) lee. Seguro: ambos probes corren en el mismo hilo GStreamer.
-_track_labels: dict = {}   # track_id → {"label": str, "fall": bool}
+# Track labels written by Probe A (osd_sink_pad_buffer_probe) and read by Probe B
+# (tiled_overlay_probe). Safe: both probes run on the same GStreamer thread.
+_track_labels: dict = {}  # track_id → {"label": str, "fall": bool}
 
-# Mapeo de display: global_id (hex12) → número corto (1, 2, 3...). Solo para stream, no afecta API.
+# Display ID mapping: global_id (hex12) → short display number (1, 2, 3...).
+# Stream-only — does not affect global_id or API payloads.
 _display_ids: dict[str, int] = {}
 _display_id_counter: int = 0
 
 
 def init_stream_grid(cols: int, rows: int, cell_w: int, cell_h: int) -> None:
-    """Setea las dimensiones del grid del tiler. Llamar desde app.py después de crear el tiler."""
+    """Set tiler grid dimensions. Call from app.py after creating the tiler element."""
     global _stream_tiler_cols, _stream_tiler_rows, _stream_cell_w, _stream_cell_h
     _stream_tiler_cols = cols
     _stream_tiler_rows = rows
     _stream_cell_w = cell_w
     _stream_cell_h = cell_h
-    logger.info("[Stream] Grid: %dx%d tiles de %dx%d px", cols, rows, cell_w, cell_h)
+    logger.info("[Stream] Grid: %dx%d tiles of %dx%d px", cols, rows, cell_w, cell_h)
 
 
 def _draw_tiled_overlays(frame_bgr: np.ndarray, tracks: list) -> None:
-    """Dibuja bboxes y labels sobre frame_bgr in-place (coordenadas ya en espacio tileado).
+    """Draw bboxes and labels on frame_bgr in-place (coordinates already in tiled space).
 
-    tracks: lista de {"bbox_tiled": (x, y, w, h), "label": str, "fall": bool}.
+    tracks: list of {"bbox_tiled": (x, y, w, h), "label": str, "fall": bool}.
     """
     for t in tracks:
         x1, y1, w, h = t["bbox_tiled"]
@@ -297,12 +299,11 @@ def _draw_tiled_overlays(frame_bgr: np.ndarray, tracks: list) -> None:
 
 
 def tiled_overlay_probe(_pad, info):
-    """Probe B — adjuntado al src pad del nvmultistreamtiler (solo en stream mode).
+    """Probe B — attached to the nvmultistreamtiler src pad (stream mode only).
 
-    Recibe el frame compuesto 640×360 RGBA. Lee _track_labels para obtener los
-    labels ya calculados por Probe A, mapea las coordenadas de cada bbox al espacio
-    tileado usando la geometría del grid, dibuja bboxes+labels y encola el frame
-    en tiled_frame_queue para que MjpegServer lo sirva como MJPEG.
+    Receives the composited 640x360 RGBA frame. Reads _track_labels for labels
+    computed by Probe A, maps each bbox to tiled space using the grid geometry,
+    draws bboxes+labels, and pushes the frame to tiled_frame_queue for MjpegServer.
     """
     gst_buffer = info.get_buffer()
     if gst_buffer is None:
@@ -314,10 +315,10 @@ def tiled_overlay_probe(_pad, info):
 
     cols = _stream_tiler_cols
     rows = _stream_tiler_rows
-    cw   = _stream_cell_w
-    ch   = _stream_cell_h
+    cw = _stream_cell_w
+    ch = _stream_cell_h
 
-    # El tiler produce un único frame compuesto (batch_id=0)
+    # The tiler produces a single composited frame (batch_id=0).
     frame_meta = None
     for fm in _iter_pyds_list(batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast):
         frame_meta = fm
@@ -325,32 +326,30 @@ def tiled_overlay_probe(_pad, info):
     if frame_meta is None:
         return Gst.PadProbeReturn.OK
 
-    # Leer frame RGBA del tiler (640×360 → pequeño, GPU→CPU rápido)
     try:
         n_frame = pyds.get_nvds_buf_surface(hash(gst_buffer), frame_meta.batch_id)
         frame_bgr = cv2.cvtColor(np.array(n_frame, copy=True, order='C'), cv2.COLOR_RGBA2BGR)
     except Exception:
+        # GPU surface read can fail transiently — drop the frame rather than crash.
         return Gst.PadProbeReturn.OK
 
-    # Recolectar tracks del frame tileado con coordenadas mapeadas
     overlay_tracks = []
     for obj_meta in _iter_pyds_list(frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast):
         if int(obj_meta.class_id) != PGIE_CLASS_PERSON:
             continue
         r = obj_meta.rect_params
-        # Centro del bbox en el frame tileado → índice de celda → pad_idx original
+        # Map bbox center to tile cell to identify the original stream.
         cx = int(r.left + r.width / 2)
         cy = int(r.top + r.height / 2)
-        tile_col = min(cx // cw, cols - 1)
-        tile_row = min(cy // ch, rows - 1)
-        # Obtener label calculado por Probe A para este track_id
+        tile_col = min(cx // cw, cols - 1)  # noqa: F841 — reserved for future per-stream logic
+        tile_row = min(cy // ch, rows - 1)  # noqa: F841
         track_id = int(obj_meta.object_id)
         info_dict = _track_labels.get(track_id, {})
         label = info_dict.get("label") or f"P#{track_id}"
         overlay_tracks.append({
             "bbox_tiled": (int(r.left), int(r.top), int(r.width), int(r.height)),
-            "label":      label,
-            "fall":       info_dict.get("fall", False),
+            "label": label,
+            "fall": info_dict.get("fall", False),
         })
 
     if overlay_tracks:
@@ -359,43 +358,40 @@ def tiled_overlay_probe(_pad, info):
     try:
         tiled_frame_queue.put_nowait(frame_bgr)
     except queue.Full:
-        pass  # MjpegServer no alcanzó a consumir — OK descartar frame anterior
+        pass  # MjpegServer did not consume in time — drop the older frame, not the new one.
 
     return Gst.PadProbeReturn.OK
 
 
-# ==============================================================================
-# 0. TRACK STATE
-# ==============================================================================
+# ── Track state ───────────────────────────────────────────────────────────────
 
 @dataclass
 class _TrackState:
-    """Estado por track activo. Vive en _active_tracks[track_id] desde el primer frame hasta el exit.
+    """Per-track state. Lives in _active_tracks[track_key] from first frame to exit.
 
-    Los campos de ReID (entry_emitted, entry_deadline, global_id, pending_bbox, pending_conf)
-    solo se usan cuando _reid_manager está activo (modelo OSNet encontrado).
+    The ReID fields (entry_emitted, entry_deadline, global_id, pending_bbox,
+    pending_conf) are only populated when _reid_manager is active (OSNet found).
     """
-    first_frame:       int
-    last_frame:        int
-    first_ts:          float
-    camera_id:         str
-    is_entry_exit_cam: bool          = False
-    appearance_sent:   bool          = False
-    entry_emitted:     bool          = False
-    entry_deadline:    int           = 0
-    global_id:         Optional[str] = None
-    pending_bbox:      Optional[dict] = None
-    pending_conf:      float          = 0.0
+    first_frame: int
+    last_frame: int
+    first_ts: float
+    camera_id: str
+    is_entry_exit_cam: bool = False
+    appearance_sent: bool = False
+    entry_emitted: bool = False
+    entry_deadline: int = 0
+    global_id: Optional[str] = None
+    pending_bbox: Optional[dict] = None
+    pending_conf: float = 0.0
 
 
-# ==============================================================================
-# 1. BUS CALL
-# ==============================================================================
+# ── GStreamer bus handler ─────────────────────────────────────────────────────
+
 def bus_call(_bus, message, loop):
-    """Maneja mensajes del bus GStreamer: EOS para salida limpia, WARNING y ERROR para logging."""
+    """Handle GStreamer bus messages: EOS for clean shutdown, WARNING and ERROR for logging."""
     t = message.type
     if t == Gst.MessageType.EOS:
-        logger.info("Fin del flujo de video (EOS).")
+        logger.info("End of video stream (EOS).")
         loop.quit()
     elif t == Gst.MessageType.WARNING:
         err, debug = message.parse_warning()
@@ -407,18 +403,17 @@ def bus_call(_bus, message, loop):
     return True
 
 
-# ==============================================================================
-# 2. CLIENTE DE API REST NO BLOQUEANTE
-# ==============================================================================
+# ── Non-blocking REST API client ──────────────────────────────────────────────
+
 class NxApiClient:
-    """
-    Envía peticiones HTTP al backend en un hilo de fondo independiente.
-    El probe de GStreamer solo hace enqueue() (O(1), sin I/O), garantizando
-    que las llamadas de red nunca impacten los FPS del pipeline.
+    """Send HTTP requests to the backend on a background thread.
+
+    The GStreamer probe only calls enqueue() (O(1), no I/O), guaranteeing
+    that network calls never affect pipeline FPS.
     """
 
     def __init__(self, base_url: str, api_key: str, max_queue_size: int = 512):
-        """Configura el cliente con keep-alive HTTP y cola FIFO."""
+        """Set up the client with HTTP keep-alive and a FIFO request queue."""
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
@@ -429,12 +424,12 @@ class NxApiClient:
             "X-API-Key": api_key,
         })
         self._worker_thread: Optional[threading.Thread] = None
-        # Callbacks invocados desde el worker thread tras un 2xx exitoso.
-        # Clave: endpoint exacto (ej. "/api/cameras/reference-frame").
+        # Callbacks invoked from the worker thread after a successful 2xx response.
+        # Key: exact endpoint path, e.g. "/api/cameras/reference-frame".
         self._success_callbacks: Dict[str, "Callable[[dict], None]"] = {}
 
-    def start(self):
-        """Arranca el hilo worker que drena la cola de peticiones HTTP."""
+    def start(self) -> None:
+        """Start the worker thread that drains the HTTP request queue."""
         self._running = True
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -442,38 +437,38 @@ class NxApiClient:
             name="nx-api-worker",
         )
         self._worker_thread.start()
-        logger.info("NxApiClient iniciado → %s", self._base_url)
+        logger.info("NxApiClient started → %s", self._base_url)
 
-    def stop(self):
-        """Señaliza al worker que pare, espera hasta 5 s y cierra la sesión HTTP."""
+    def stop(self) -> None:
+        """Signal the worker to stop, wait up to 5s, then close the HTTP session."""
         self._running = False
         self._queue.put(None)
         if self._worker_thread:
             self._worker_thread.join(timeout=5)
         self._session.close()
-        logger.info("NxApiClient detenido.")
+        logger.info("NxApiClient stopped.")
 
     def register_success_callback(self, endpoint: str, cb: "Callable[[dict], None]") -> None:
-        """Registra un callback invocado por el worker thread cuando el endpoint retorna 2xx.
+        """Register a callback invoked by the worker thread when an endpoint returns 2xx.
 
-        El callback recibe el payload original enviado. Se llama desde el hilo worker,
-        por lo que debe ser thread-safe y no bloquear.
+        The callback receives the original payload sent. It runs from the worker thread
+        and must be thread-safe and non-blocking.
 
         Args:
-            endpoint: Ruta exacta, ej. "/api/cameras/reference-frame".
-            cb:       Función que acepta el dict del payload enviado.
+            endpoint: Exact path, e.g. "/api/cameras/reference-frame".
+            cb: Function that accepts the sent payload dict.
         """
         self._success_callbacks[endpoint] = cb
 
-    def enqueue(self, method: str, endpoint: str, payload: Optional[dict] = None):
-        """Encola una petición HTTP sin bloquear. Descarta con warning si la cola está llena."""
+    def enqueue(self, method: str, endpoint: str, payload: Optional[dict] = None) -> None:
+        """Enqueue an HTTP request without blocking. Drops with a warning if the queue is full."""
         try:
             self._queue.put_nowait((method, endpoint, payload))
         except queue.Full:
-            logger.warning("Cola API llena — descartando: %s %s", method, endpoint)
+            logger.warning("API queue full — dropping: %s %s", method, endpoint)
 
-    def _worker_loop(self):
-        """Loop principal del hilo worker: consume la cola y envía peticiones HTTP al backend."""
+    def _worker_loop(self) -> None:
+        """Drain the request queue and send HTTP requests to the backend."""
         while self._running:
             try:
                 item = self._queue.get(timeout=1.0)
@@ -485,15 +480,15 @@ class NxApiClient:
             self._send(method, endpoint, payload)
             self._queue.task_done()
 
-    def _send(self, method: str, endpoint: str, payload: Optional[dict]):
-        """Envía la petición HTTP al backend. Timeout 5 s — errores se loguean, nunca se propagan."""
+    def _send(self, method: str, endpoint: str, payload: Optional[dict]) -> None:
+        """Send one HTTP request. 5s timeout — errors are logged, never propagated."""
         url = f"{self._base_url}{endpoint}"
         try:
             resp = self._session.request(method=method, url=url, json=payload, timeout=5)
             resp.raise_for_status()
             logger.debug("%s %s → %d", method, endpoint, resp.status_code)
             if endpoint == "/api/analytics":
-                # Analytics snapshots son uno por cámara cada 60s — agrupa en una línea resumen.
+                # Analytics snapshots are one per camera per 60s — group into a summary line.
                 _accumulate_analytics_slog((payload or {}).get("camera_id", "?"))
             else:
                 _slog(
@@ -501,7 +496,6 @@ class NxApiClient:
                     f"{method} {endpoint}  ",
                     f"{_C.get('bold', '')}{resp.status_code}{_C.get('reset', '')}",
                 )
-            # Invocar callback de éxito si está registrado para este endpoint.
             cb = self._success_callbacks.get(endpoint)
             if cb is not None:
                 try:
@@ -514,34 +508,32 @@ class NxApiClient:
             logger.error("HTTP %d: %s %s → %s",
                          e.response.status_code, method, url, e.response.text[:300])
         except requests.exceptions.ConnectionError:
-            logger.debug("Sin conexión: %s", url)
+            logger.debug("No connection: %s", url)
 
     def _base_event(self, event_type: str, camera_id: str, severity: str = "info") -> dict:
-        """Construye los campos comunes a todos los eventos del backend."""
+        """Build the fields common to all backend events."""
         return {
-            "event_id":  str(uuid.uuid4()),
-            "type":      event_type,
-            "sector":    _JETSON_SECTOR,
+            "event_id": str(uuid.uuid4()),
+            "type": event_type,
+            "sector": _JETSON_SECTOR,
             "jetson_id": JETSON_ID,
             "camera_id": camera_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "severity":  severity,
+            "severity": severity,
         }
-
-    # ── Eventos MVP ──────────────────────────────────────────────────────────
 
     def post_person_entry(self, camera_id: str, track_id: int, bbox: dict,
                           confidence: float, is_entry_exit_cam: bool,
                           global_id: Optional[str] = None,
                           is_return: bool = False) -> None:
-        """Emite person_entry. entry_type="return" si la persona ya fue vista antes."""
+        """Emit person_entry. entry_type='return' if the person was seen before."""
         payload = self._base_event("person_entry", camera_id)
         payload.update({
-            "track_id":             track_id,
-            "bbox":                 bbox,
-            "confidence":           round(confidence, 3),
+            "track_id": track_id,
+            "bbox": bbox,
+            "confidence": round(confidence, 3),
             "is_entry_exit_camera": is_entry_exit_cam,
-            "entry_type":           "return" if is_return else "new",
+            "entry_type": "return" if is_return else "new",
         })
         if global_id:
             payload["global_id"] = global_id
@@ -551,13 +543,13 @@ class NxApiClient:
                                    confidence: float, global_id: str,
                                    prev_camera_id: Optional[str],
                                    is_entry_exit_cam: bool) -> None:
-        """Emite person_channel_change cuando la misma persona cambia de cámara (ReID)."""
+        """Emit person_channel_change when the same person switches cameras (ReID)."""
         payload = self._base_event("person_channel_change", camera_id)
         payload.update({
-            "track_id":             track_id,
-            "bbox":                 bbox,
-            "confidence":           round(confidence, 3),
-            "global_id":            global_id,
+            "track_id": track_id,
+            "bbox": bbox,
+            "confidence": round(confidence, 3),
+            "global_id": global_id,
             "is_entry_exit_camera": is_entry_exit_cam,
         })
         if prev_camera_id:
@@ -567,11 +559,11 @@ class NxApiClient:
     def post_person_exit(self, camera_id: str, track_id: int,
                          dwell_seconds: float, is_entry_exit_cam: bool,
                          global_id: Optional[str] = None) -> None:
-        """Emite person_exit con el tiempo total de permanencia del track."""
+        """Emit person_exit with the total dwell time for the track."""
         payload = self._base_event("person_exit", camera_id)
         payload.update({
-            "track_id":             track_id,
-            "dwell_seconds":        round(dwell_seconds, 1),
+            "track_id": track_id,
+            "dwell_seconds": round(dwell_seconds, 1),
             "is_entry_exit_camera": is_entry_exit_cam,
         })
         if global_id:
@@ -580,45 +572,47 @@ class NxApiClient:
 
     def post_person_classified(self, camera_id: str, track_id: int,
                                bbox: dict, demographics: dict) -> None:
-        """Emite person_classified con el resultado de edad/género (tras VOTES_REQUIRED votos)."""
+        """Emit person_classified with age/gender result (after VOTES_REQUIRED votes)."""
         payload = self._base_event("person_classified", camera_id)
         payload.update({"track_id": track_id, "bbox": bbox, "demographics": demographics})
         self.enqueue("POST", "/api/events", payload)
 
     def post_person_appearance(self, camera_id: str, track_id: int,
                                appearance_vector: list) -> None:
-        """Emite person_appearance con el vector OSNet 512-dim L2-normalizado."""
+        """Emit person_appearance with the L2-normalized 512-dim OSNet vector."""
         payload = self._base_event("person_appearance", camera_id)
         payload.update({"track_id": track_id, "appearance_vector": appearance_vector})
         self.enqueue("POST", "/api/events", payload)
 
     def post_employee_seen(self, camera_id: str, employee_id: str, track_id: int,
                            similarity: float, bbox: dict) -> None:
-        """Emite employee_seen (o known_person_seen en hogar) cuando se identifica un rostro conocido."""
+        """Emit employee_seen (or known_person_seen in hogar sector) on a face match."""
         evt = "known_person_seen" if _JETSON_SECTOR == "hogar" else "employee_seen"
         payload = self._base_event(evt, camera_id)
         payload.update({
-            "track_id":   track_id,
-            "bbox":       bbox,
+            "track_id": track_id,
+            "bbox": bbox,
             "similarity": round(similarity, 3),
             "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id,
         })
         self.enqueue("POST", "/api/events", payload)
 
     def post_employee_presence(self, camera_id: str, employee_id: str, track_id: int) -> None:
-        """Emite employee_presence periódicamente para empleados en cámara (heartbeat)."""
+        """Emit employee_presence periodically for employees on camera (heartbeat)."""
         payload = self._base_event("employee_presence", camera_id)
-        payload.update({"track_id": track_id,
-                        "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id})
+        payload.update({
+            "track_id": track_id,
+            "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id,
+        })
         self.enqueue("POST", "/api/events", payload)
 
     def post_employee_exit(self, camera_id: str, employee_id: str,
                            track_id: int, dwell_seconds: float) -> None:
-        """Emite employee_exit (o known_person_exit en hogar) con tiempo de permanencia."""
+        """Emit employee_exit (or known_person_exit in hogar sector) with dwell time."""
         evt = "known_person_exit" if _JETSON_SECTOR == "hogar" else "employee_exit"
         payload = self._base_event(evt, camera_id)
         payload.update({
-            "track_id":     track_id,
+            "track_id": track_id,
             "dwell_seconds": round(dwell_seconds, 1),
             "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id,
         })
@@ -626,57 +620,59 @@ class NxApiClient:
 
     def post_unknown_person_alert(self, camera_id: str, track_id: int,
                                   face_snapshot_b64: str, bbox: dict) -> None:
-        """Emite unknown_person_alert (sector hogar) cuando se detecta un rostro no reconocido."""
+        """Emit unknown_person_alert (hogar sector) on an unrecognized face detection."""
         payload = self._base_event("unknown_person_alert", camera_id, "medium")
-        payload.update({"track_id": track_id, "bbox": bbox,
-                        "face_snapshot_b64": face_snapshot_b64})
+        payload.update({
+            "track_id": track_id,
+            "bbox": bbox,
+            "face_snapshot_b64": face_snapshot_b64,
+        })
         self.enqueue("POST", "/api/events", payload)
 
     def post_analytics_snapshot(self, camera_id: str, stats: dict,
                                 period_seconds: float = 60.0) -> None:
-        """Emite analytics_snapshot cada ANALYTICS_SEND_INTERVAL_SECS con conteos acumulados."""
+        """Emit analytics_snapshot every ANALYTICS_SEND_INTERVAL_SECS with accumulated counts."""
         payload = self._base_event("analytics_snapshot", camera_id)
         payload.update({"period_seconds": period_seconds, **stats})
         self.enqueue("POST", "/api/analytics", payload)
 
     def post_crop(self, camera_id: str, track_id: int, frame_num: int,
                   crop_b64: str, bbox: dict) -> None:
-        """Envía un crop de persona en base64 al endpoint /api/crops."""
+        """Send a base64-encoded person crop to /api/crops."""
         payload = {
             "camera_id": camera_id,
             "jetson_id": JETSON_ID,
-            "track_id":  track_id,
+            "track_id": track_id,
             "frame_num": frame_num,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "image_b64": crop_b64,
-            "bbox":      bbox,
+            "bbox": bbox,
         }
         self.enqueue("POST", "/api/crops", payload)
 
     def post_reference_frame(self, camera_id: str, frame_num: int,
                              frame_b64: str, width: int, height: int) -> None:
-        """Envía un frame de referencia (escena vacía) por cámara al backend."""
+        """Send a reference frame (empty scene) per camera to the backend."""
         payload = {
             "camera_id": camera_id,
             "jetson_id": JETSON_ID,
             "frame_num": frame_num,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "image_b64": frame_b64,
-            "width":     width,
-            "height":    height,
+            "width": width,
+            "height": height,
         }
         self.enqueue("POST", "/api/cameras/reference-frame", payload)
 
 
-# Instancia global — se inicializa en main() antes de arrancar el pipeline
+# Global instance — initialized in main() before starting the pipeline.
 api_client = NxApiClient(base_url=API_BASE_URL, api_key=API_KEY)
 
 
-# ==============================================================================
-# 3. HELPERS DE METADATOS DEEPSTREAM
-# ==============================================================================
+# ── DeepStream metadata helpers ───────────────────────────────────────────────
+
 def _iter_pyds_list(pyds_list, cast_fn):
-    """Generador seguro sobre listas enlazadas de pyds."""
+    """Safely iterate over a pyds linked list."""
     node = pyds_list
     while node is not None:
         try:
@@ -689,7 +685,7 @@ def _iter_pyds_list(pyds_list, cast_fn):
             return
 
 
-# Mapa de las 6 clases del modelo Pedestrian Attr → (género legible, grupo de edad legible)
+# Pedestrian Attr model outputs 6 classes — maps raw label → (display gender, display age group).
 _AGE_GENDER_LABEL_MAP: Dict[str, Tuple[str, str]] = {
     "female_adult":  ("Mujer",  "Adulta"),
     "female_senior": ("Mujer",  "Mayor"),
@@ -699,7 +695,7 @@ _AGE_GENDER_LABEL_MAP: Dict[str, Tuple[str, str]] = {
     "male_young":    ("Hombre", "Joven"),
 }
 
-# Mismo mapa pero para el payload de la API
+# Same mapping for API payloads.
 _AGE_GENDER_API_MAP: Dict[str, Tuple[str, str]] = {
     "female_adult":  ("female", "adult"),
     "female_senior": ("female", "senior"),
@@ -711,10 +707,11 @@ _AGE_GENDER_API_MAP: Dict[str, Tuple[str, str]] = {
 
 
 def _parse_age_gender(classifier_meta) -> Tuple[str, str, str, float]:
-    """Extrae el label y probabilidad del SGIE ResNet-18.
+    """Extract the label and probability from the ResNet-18 SGIE classifier metadata.
 
-    Retorna (raw_label, gender_display, age_display, prob).
-    Retorna ("", "", "", 0.0) si el modelo aún no infirió.
+    Returns:
+        Tuple of (raw_label, gender_display, age_display, prob).
+        Returns ("", "", "", 0.0) if the model has not yet run inference.
     """
     for label_info in _iter_pyds_list(
         classifier_meta.label_info_list, pyds.NvDsLabelInfo.cast
@@ -726,7 +723,7 @@ def _parse_age_gender(classifier_meta) -> Tuple[str, str, str, float]:
             gender_disp, age_disp = _AGE_GENDER_LABEL_MAP[raw]
             prob = min(float(label_info.result_prob), 1.0)
             return raw, gender_disp, age_disp, prob
-        logger.debug("SGIE label desconocido: %r (gie-id=%d)", raw,
+        logger.debug("Unknown SGIE label: %r (gie-id=%d)", raw,
                      classifier_meta.unique_component_id)
     return "", "", "", 0.0
 
@@ -735,8 +732,8 @@ def _set_osd_text(
     obj_meta,
     text: str,
     border_color: Tuple[float, float, float, float] = (0.2, 0.6, 1.0, 1.0),
-):
-    """Aplica estilo y texto al OSD de un objeto."""
+) -> None:
+    """Apply text and style to the OSD overlay for a detected object."""
     obj_meta.text_params.display_text = text
 
     fp = obj_meta.text_params.font_params
@@ -751,12 +748,10 @@ def _set_osd_text(
     obj_meta.rect_params.border_width = 2
 
 
-# ==============================================================================
-# 4. HANDLERS DE PIPELINE
-# ==============================================================================
+# ── Pipeline handlers ─────────────────────────────────────────────────────────
 
 class _HandlerResult:
-    """Resultado que un handler devuelve al probe para OSD y API."""
+    """Value returned by a handler to the probe for OSD update and API dispatch."""
     __slots__ = ("osd_text", "border_color", "event_type", "det_extra", "analytics_update")
 
     def __init__(
@@ -767,7 +762,7 @@ class _HandlerResult:
         det_extra: Optional[dict] = None,
         analytics_update: Optional[dict] = None,
     ):
-        """Construye el resultado del handler. event_type vacío = sin evento API adicional."""
+        """event_type empty means no additional API event is emitted."""
         self.osd_text = osd_text
         self.border_color = border_color
         self.event_type = event_type
@@ -776,23 +771,23 @@ class _HandlerResult:
 
 
 class _AgeGenderHandler:
-    """Clasificación de género y grupo de edad por votación sobre el SGIE ResNet-18.
+    """Classify gender and age group by voting over the ResNet-18 SGIE.
 
-    Acumula VOTES_REQUIRED muestras antes de fijar el resultado y emitir person_classified.
+    Accumulates VOTES_REQUIRED samples before locking the result and emitting
+    person_classified. Voting reduces false positives from single-frame noise.
     """
 
     def __init__(self):
-        """Inicializa dicts de caché y votación por track_id."""
         self._cache: Dict[int, Tuple[str, str, str, float]] = {}
         self._votes: Dict[int, List[str]] = {}
         self._vote_last_frame: Dict[int, int] = {}
 
     def process(self, obj_meta, frame_num: int, frame_np=None) -> Optional[_HandlerResult]:
-        """Acumula votos del SGIE y devuelve HandlerResult cuando hay suficientes votos."""
+        """Accumulate SGIE votes and return a HandlerResult once enough votes are in."""
         p_track_id = int(obj_meta.object_id)
         r = obj_meta.rect_params
 
-        # Filtro de tamaño mínimo — personas muy lejanas producen clasificaciones ruidosas
+        # Persons too small in frame produce noisy classifications — skip until large enough.
         if int(r.width) < VOTE_MIN_WIDTH or int(r.height) < VOTE_MIN_HEIGHT:
             if p_track_id in self._cache:
                 raw, gender_disp, age_disp, prob = self._cache[p_track_id]
@@ -803,7 +798,6 @@ class _AgeGenderHandler:
                 )
             return None
 
-        # Si ya está bloqueado en caché, devolver el resultado sin volver a inferir
         if p_track_id in self._cache:
             raw, gender_disp, age_disp, prob = self._cache[p_track_id]
             prefix = str(obj_meta.text_params.display_text) or "..."
@@ -812,7 +806,6 @@ class _AgeGenderHandler:
                 border_color=(0.0, 1.0, 0.0, 1.0),
             )
 
-        # Leer resultado del SGIE si hay classifier_meta disponible
         last = self._vote_last_frame.get(p_track_id, -VOTE_SAMPLE_INTERVAL)
         if frame_num - last < VOTE_SAMPLE_INTERVAL:
             return None
@@ -835,19 +828,17 @@ class _AgeGenderHandler:
                     osd_text=f"{prefix} | Analizando ({n}/{VOTES_REQUIRED})",
                     border_color=(0.2, 0.6, 1.0, 1.0),
                 )
-            # Suficientes votos: bloquear con la moda
-            from collections import Counter
+            # Enough votes — lock the winner by majority.
             winner = Counter(votes).most_common(1)[0][0]
             winner_gd, winner_ad = _AGE_GENDER_LABEL_MAP.get(winner, ("?", "?"))
             winner_prob = votes.count(winner) / len(votes)
             self._cache[p_track_id] = (winner, winner_gd, winner_ad, winner_prob)
             gender_api, age_api = _AGE_GENDER_API_MAP.get(winner, ("unknown", "unknown"))
-            event_type = "person_classified"
             det_extra = {
                 "demographics": {
-                    "gender":     gender_api,
-                    "age_group":  age_api,
-                    "label":      winner,
+                    "gender": gender_api,
+                    "age_group": age_api,
+                    "label": winner,
                     "confidence": round(winner_prob, 3),
                 }
             }
@@ -859,7 +850,7 @@ class _AgeGenderHandler:
             return _HandlerResult(
                 osd_text=f"{prefix} | {winner_gd} | {winner_ad} {winner_prob:.0%}",
                 border_color=(0.0, 1.0, 0.0, 1.0),
-                event_type=event_type,
+                event_type="person_classified",
                 det_extra=det_extra,
                 analytics_update=analytics,
             )
@@ -874,23 +865,23 @@ class _AgeGenderHandler:
 class _FaceRecognitionHandler:
     """Face recognition via async FaceRecognizer (InsightFace ArcFace).
 
-    Recibe detecciones de cara de PeopleNet class 2 (face), extrae crop, encola
-    al worker y emite eventos sector-aware (employee_seen, unknown_person_alert, etc.).
+    Receives face detections from PeopleNet class 2 (face), extracts crops,
+    enqueues to the worker, and emits sector-aware events (employee_seen,
+    unknown_person_alert, etc.).
 
-    Este handler NO está en _HANDLER_REGISTRY — se despacha separadamente porque
-    procesa objetos de cara (class_id=2), no personas del loop principal.
+    Not in _HANDLER_REGISTRY — dispatched separately because it processes
+    face objects (class_id=2), not the main person loop.
     """
     PRESENCE_HEARTBEAT_SECS: float = 30.0
 
     def __init__(self, worker):
-        """Configura el handler con el FaceRecognizer worker."""
         self._worker = worker
         self._last_sample: Dict[int, int] = {}
         self._cache: Dict[int, Tuple[str, float]] = {}
         self._identity_reported: Set[int] = set()
         self._last_heartbeat: Dict[int, float] = {}
         self._unknown_alerted: Set[int] = set()
-        # Rastrea qué tracks ya recibieron una línea ROSTRO Desconocido en stream log.
+        # Tracks that already received a stream log line for an unknown face — one per track.
         self._unknown_face_logged: Set[int] = set()
 
     def process_face(
@@ -901,7 +892,7 @@ class _FaceRecognitionHandler:
         persons_meta: list,
         camera_id: str,
     ) -> None:
-        """Procesa una cara detectada por PeopleNet (class_id=2): extrae crop, encola y emite eventos."""
+        """Process a face detected by PeopleNet (class_id=2): extract crop, enqueue, emit events."""
         if self._worker is None or frame_np is None:
             return
         if face_obj_meta.confidence < FACE_DET_CONFIDENCE_THRESHOLD:
@@ -944,7 +935,7 @@ class _FaceRecognitionHandler:
         if identity is None:
             return
 
-        # identity key is now a UUID string (or "Unknown" if below threshold)
+        # identity_key is a backend-assigned UUID string (or "Unknown" if below threshold).
         identity_key, conf = identity
         display_name = self._worker.get_display_name(identity_key)
         now = time.monotonic()
@@ -952,7 +943,7 @@ class _FaceRecognitionHandler:
         if identity_key != "Unknown":
             if parent_track_id not in self._identity_reported:
                 self._identity_reported.add(parent_track_id)
-                # identity_key is the backend-assigned UUID — used in events for FK join
+                # identity_key is the backend UUID — used in events for FK join.
                 api_client.post_employee_seen(camera_id, identity_key, parent_track_id, conf, bbox)
                 _slog(
                     f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
@@ -965,7 +956,7 @@ class _FaceRecognitionHandler:
                 api_client.post_employee_presence(camera_id, identity_key, parent_track_id)
                 self._last_heartbeat[parent_track_id] = now
         else:
-            # Cara no reconocida — loguear una vez por track en stream mode.
+            # Log once per track in stream mode.
             if parent_track_id not in self._unknown_face_logged:
                 self._unknown_face_logged.add(parent_track_id)
                 _slog(
@@ -981,10 +972,10 @@ class _FaceRecognitionHandler:
                 api_client.post_unknown_person_alert(camera_id, parent_track_id, face_b64, bbox)
 
     def on_track_lost(self, track_id: int, dwell_seconds: float) -> None:
-        """Llamado desde _expire_lost_tracks. Emite employee_exit / known_person_exit."""
+        """Called from _expire_lost_tracks. Emits employee_exit / known_person_exit."""
         identity = self._cache.get(track_id)
         if identity and identity[0] != "Unknown":
-            identity_key, _ = identity  # UUID string assigned by the backend
+            identity_key, _ = identity  # backend-assigned UUID
             state = _active_tracks.get(
                 next((k for k in _active_tracks if k[1] == track_id), (None, None))
             )
@@ -996,7 +987,7 @@ class _FaceRecognitionHandler:
         self._unknown_alerted.discard(track_id)
 
     def get_identity(self, track_id: int) -> Optional[Tuple[str, float]]:
-        """Devuelve (nombre, similitud) si hay identidad reconocida, o None."""
+        """Return (name, similarity) if an identity has been recognized, else None."""
         result = self._worker.get_result(track_id) if self._worker else None
         if result:
             self._cache[track_id] = result
@@ -1016,19 +1007,63 @@ class _FaceRecognitionHandler:
         return None
 
 
-# ==============================================================================
-# 5. WORKER GLOBALS + LIFECYCLE
-# ==============================================================================
+# ── Probe state globals ───────────────────────────────────────────────────────
 
-_face_recognizer    = None  # FaceRecognizer (face_recognition)
-_appearance_worker  = None  # AppearanceWorker — embeddings 512-dim por persona
-_reid_manager       = None  # ReIdManager — DB local cross-cámara
-_ws_client          = None  # WsPositionClient (WebSocket de posiciones / heatmaps)
+_active_tracks: Dict[Tuple[int, int], _TrackState] = {}
+_crop_counts: Dict[int, int] = {}
+_crop_last_frame: Dict[int, int] = {}
+
+# Confirmed reference frame (grayscale 64x36 float32) per camera_id.
+# None means no 2xx confirmation received from the backend yet.
+_reference_frame_confirmed_np: Dict[str, "np.ndarray"] = {}
+# Monotonic timestamp of the last backend-confirmed frame per camera_id.
+_reference_frame_confirmed_ts: Dict[str, float] = {}
+# Monotonic timestamp of the last send attempt per pad_index (controls retry pacing).
+_reference_frame_last_attempt: Dict[int, float] = {}
+
+_analytics: Dict[int, Dict] = {}
+_analytics_last_sent: Dict[int, float] = {}
+
+
+def _on_reference_frame_confirmed(payload: dict) -> None:
+    """Called by NxApiClient worker thread when the backend confirms a reference frame (2xx).
+
+    Stores the confirmed frame as the baseline for future visual-change detection.
+    Runs on the NxApiClient worker thread, not the GStreamer probe thread.
+
+    Args:
+        payload: Original payload sent to the backend (includes image_b64 and camera_id).
+    """
+    cam = payload.get("camera_id", "")
+    b64 = payload.get("image_b64", "")
+    if not cam or not b64:
+        return
+    try:
+        buf = base64.b64decode(b64)
+        arr = np.frombuffer(buf, dtype=np.uint8)
+        gray = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            return
+        # Resize to 64x36 float32 for fast comparisons with _scene_changed().
+        small = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
+        _reference_frame_confirmed_np[cam] = small
+        _reference_frame_confirmed_ts[cam] = time.monotonic()
+        logger.info("Reference frame confirmed by backend: camera=%s", cam)
+    except Exception as exc:
+        logger.warning("Error processing reference frame confirmation camera=%s: %s", cam, exc)
+
+
+# ── Async worker globals + lifecycle ──────────────────────────────────────────
+
+_face_recognizer = None     # FaceRecognizer (InsightFace ArcFace)
+_appearance_worker = None   # AppearanceWorker — 512-dim embeddings per person
+_reid_manager = None        # ReIdManager — local cross-camera identity DB
+_ws_client = None           # WsPositionClient (position/heatmap WebSocket)
 _jetson_sync_client = None  # JetsonSyncClient (Socket.IO face roster sync)
 
-# Buffer de posiciones: pad_index → list of {track_id, x_norm, y_norm}
+# Position buffer: pad_index → list of {track_id, x_norm, y_norm}
 _position_buffer: Dict[int, List[dict]] = {}
-_position_last_sent: Dict[int, float]  = {}
+_position_last_sent: Dict[int, float] = {}
 POSITION_SEND_INTERVAL: float = 10.0
 
 
@@ -1040,19 +1075,19 @@ def init_workers(
     api_key: str = "",
     reid_gallery_size: int = 10,
 ) -> None:
-    """Instancia los workers async según las capacidades activas del pipeline.
+    """Instantiate async workers based on active pipeline capabilities.
 
-    Workers creados según capacidades:
-      - AppearanceWorker + ReIdManager: siempre (si existe el modelo OSNet)
-      - FaceRecognizer: si 'face_recognition' está en pipeline_capabilities
-      - WsPositionClient: si WS_BASE_URL está configurado (heatmaps)
-      - JetsonSyncClient: si face_recognition activo y API_BASE_URL configurado
+    Workers initialized per capability:
+      - AppearanceWorker + ReIdManager: always (if OSNet model exists on disk)
+      - FaceRecognizer: if 'face_recognition' is in pipeline_capabilities
+      - WsPositionClient: if ws_base_url is configured (heatmaps)
+      - JetsonSyncClient: if face_recognition is active and API_BASE_URL is set
     """
     global _face_recognizer, _appearance_worker, _reid_manager, _ws_client, _jetson_sync_client
 
-    # AppearanceWorker + ReIdManager — siempre activo si existe el modelo OSNet.
     osnet_path = str(Path(model_dir) / "osnet" / "osnet_x0_25_market1501.onnx")
     if Path(osnet_path).exists():
+        # Deferred — AppearanceWorker/ReIdManager are optional; not installed if OSNet is absent.
         from appearance_worker import AppearanceWorker
         from reid_manager import ReIdManager
         _appearance_worker = AppearanceWorker(osnet_path)
@@ -1064,6 +1099,7 @@ def init_workers(
                        "Run: python3 tools/download_models.py --reid", osnet_path)
 
     if "face_recognition" in pipeline_capabilities:
+        # Deferred — InsightFace is a large optional dependency not needed in other packages.
         from face_recognizer import FaceRecognizer
         _face_recognizer = FaceRecognizer(
             db_path=face_db_path,
@@ -1072,9 +1108,8 @@ def init_workers(
             api_key=api_key,
         )
 
-        # JetsonSyncClient — Socket.IO listener for face_update events from backend.
-        # When the backend activates or revokes an employee, this triggers a roster pull.
         if API_BASE_URL:
+            # Deferred — only needed when face_recognition is active.
             from jetson_sync_client import JetsonSyncClient
             _jetson_sync_client = JetsonSyncClient(
                 api_base_url=API_BASE_URL,
@@ -1084,8 +1119,8 @@ def init_workers(
         else:
             logger.info("API_BASE_URL not set — JetsonSyncClient disabled (no face roster push).")
 
-    # WebSocket de posiciones para heatmaps en el backend
     if ws_base_url:
+        # Deferred — WsPositionClient is only needed when heatmap telemetry is configured.
         from ws_client import WsPositionClient
         _ws_client = WsPositionClient(
             ws_url=ws_base_url,
@@ -1095,35 +1130,9 @@ def init_workers(
     else:
         logger.info("WS_BASE_URL not set — position WebSocket disabled.")
 
-    # ── Callback de confirmación de reference frame ───────────────────────────
-    def _on_reference_frame_confirmed(payload: dict) -> None:
-        """Llamado por el worker de NxApiClient cuando el backend confirma (2xx) el frame.
-
-        Almacena el frame como baseline para la detección de cambio visual futura.
-        Se ejecuta en el hilo worker del NxApiClient, no en el probe de GStreamer.
-
-        Args:
-            payload: Payload original enviado al backend (incluye image_b64 y camera_id).
-        """
-        cam = payload.get("camera_id", "")
-        b64 = payload.get("image_b64", "")
-        if not cam or not b64:
-            return
-        try:
-            buf  = base64.b64decode(b64)
-            arr  = np.frombuffer(buf, dtype=np.uint8)
-            gray = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-            if gray is None:
-                return
-            # Reducir a 64×36 float32 para comparaciones futuras con _scene_changed().
-            small = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
-            _reference_frame_confirmed_np[cam] = small
-            _reference_frame_confirmed_ts[cam] = time.monotonic()
-            logger.info("Frame de referencia confirmado por backend: camera=%s", cam)
-        except Exception as exc:
-            logger.warning("Error procesando confirmación de reference frame camera=%s: %s", cam, exc)
-
-    api_client.register_success_callback("/api/cameras/reference-frame", _on_reference_frame_confirmed)
+    api_client.register_success_callback(
+        "/api/cameras/reference-frame", _on_reference_frame_confirmed
+    )
 
 
 def start_workers() -> None:
@@ -1139,22 +1148,20 @@ def start_workers() -> None:
 
 
 def stop_workers() -> None:
-    """Detiene todos los workers y persiste el estado del ReIdManager a disco."""
+    """Stop all workers and persist ReIdManager state to disk."""
     if _jetson_sync_client is not None:
         _jetson_sync_client.stop()
     if _appearance_worker is not None:
         _appearance_worker.stop()
     if _reid_manager is not None:
-        _reid_manager.flush()   # escribir reid_db.json antes de cerrar
+        _reid_manager.flush()  # write reid_db.json before shutdown
     if _face_recognizer is not None:
         _face_recognizer.stop()
     if _ws_client is not None:
         _ws_client.stop()
 
 
-# ==============================================================================
-# 6. HANDLER REGISTRY + INIT
-# ==============================================================================
+# ── Handler registry ──────────────────────────────────────────────────────────
 
 _active_handlers: List = []
 _face_handler: Optional[_FaceRecognitionHandler] = None
@@ -1166,19 +1173,18 @@ _HANDLER_REGISTRY = {
 
 
 def _frame_is_bright_enough(frame_np: "np.ndarray") -> bool:
-    """Devuelve True si el frame tiene suficiente iluminación para usarse como fondo.
+    """Return True if the frame has enough illumination to use as a background reference.
 
-    Descarta frames nocturnos, cámaras tapadas o escenas casi a oscuras que
-    resultarían en un fondo negro inútil para el heatmap.
+    Rejects night frames, covered cameras, and near-dark scenes that would produce
+    a useless black background for heatmap queries.
 
-    La comprobación es barata: convierte a gris y calcula la media sobre una
-    miniatura 64×36 (2 304 píxeles), no sobre el frame completo.
+    Checks a 64x36 thumbnail (2,304 pixels) rather than the full frame.
 
     Args:
-        frame_np: Frame BGR o gris del probe (ya en RAM).
+        frame_np: BGR or grayscale frame from the probe (already in RAM).
 
     Returns:
-        True si la media de brillo (0-255) supera REFERENCE_FRAME_MIN_BRIGHTNESS.
+        True if mean brightness (0-255) exceeds REFERENCE_FRAME_MIN_BRIGHTNESS.
     """
     gray = frame_np if frame_np.ndim == 2 else cv2.cvtColor(frame_np, cv2.COLOR_BGR2GRAY)
     small = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA)
@@ -1186,25 +1192,24 @@ def _frame_is_bright_enough(frame_np: "np.ndarray") -> bool:
 
 
 def _scene_changed(current_np: "np.ndarray", prev_np: "np.ndarray") -> bool:
-    """Compara el frame actual con el último frame de referencia confirmado.
+    """Compare the current frame against the last confirmed reference frame.
 
-    Normaliza por iluminación media antes de comparar, de modo que un simple
-    cambio de luz (día/noche) no dispare un reenvío. Solo los cambios estructurales
-    (productos reordenados, zona reorganizada) superan el umbral.
+    Normalizes by mean illumination before comparing, so a lighting change
+    (day/night cycle) does not trigger a resend. Only structural changes
+    (rearranged products, reorganized zones) exceed the threshold.
 
     Args:
-        current_np: Frame BGR o gris full-res del probe (ya en RAM).
-        prev_np:    Último frame confirmado almacenado en _reference_frame_confirmed_np
-                    — siempre gris, 64×36, float32.
+        current_np: BGR or grayscale full-res frame from the probe.
+        prev_np: Last confirmed frame in _reference_frame_confirmed_np
+                 — always grayscale, 64x36, float32.
 
     Returns:
-        True si la diferencia normalizada supera REFERENCE_FRAME_CHANGE_THRESHOLD.
+        True if normalized difference exceeds REFERENCE_FRAME_CHANGE_THRESHOLD.
     """
-    # Convertir a gris si viene en BGR y reducir a miniatura para cómputo rápido.
     gray = current_np if current_np.ndim == 2 else cv2.cvtColor(current_np, cv2.COLOR_BGR2GRAY)
     small = cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
 
-    # Normalizar por iluminación media (evita falsos positivos por cambio de luz).
+    # Normalize by mean illumination to suppress false positives from lighting changes.
     mean_a = small.mean() or 1.0
     mean_b = prev_np.mean() or 1.0
     diff = np.abs(small / mean_a - prev_np / mean_b).mean()
@@ -1212,7 +1217,7 @@ def _scene_changed(current_np: "np.ndarray", prev_np: "np.ndarray") -> bool:
 
 
 def init_handlers(pipeline_capabilities: List[str]) -> None:
-    """Instancia y registra los handlers activos según las capacidades del pipeline."""
+    """Instantiate and register active handlers based on pipeline capabilities."""
     global _active_handlers, _face_handler
     _active_handlers = []
     _face_handler = None
@@ -1220,8 +1225,7 @@ def init_handlers(pipeline_capabilities: List[str]) -> None:
     for cap in pipeline_capabilities:
         cls = _HANDLER_REGISTRY.get(cap)
         if cls:
-            handler = cls()
-            _active_handlers.append(handler)
+            _active_handlers.append(cls())
 
         if cap == "face_recognition" and _face_recognizer is not None:
             _face_handler = _FaceRecognitionHandler(_face_recognizer)
@@ -1233,29 +1237,10 @@ def init_handlers(pipeline_capabilities: List[str]) -> None:
     logger.info("Active handlers: %s", names if names else ["(none — people_counting only)"])
 
 
-# ==============================================================================
-# 7. PROBE PRINCIPAL
-# ==============================================================================
-
-_active_tracks: Dict[Tuple[int, int], _TrackState] = {}
-_crop_counts: Dict[int, int] = {}
-_crop_last_frame: Dict[int, int] = {}
-
-# ── Reference frame state ─────────────────────────────────────────────────────
-# Frame confirmado por el backend (grayscale 64×36 float32) por camera_id.
-# None significa que aún no se recibió confirmación 2xx del backend.
-_reference_frame_confirmed_np: Dict[str, "np.ndarray"] = {}
-# Timestamp monotónico del último 2xx confirmado por cámara.
-_reference_frame_confirmed_ts: Dict[str, float] = {}
-# Timestamp monotónico del último intento de envío (para controlar el retry).
-_reference_frame_last_attempt: Dict[int, float] = {}
-
-_analytics: Dict[int, Dict] = {}
-_analytics_last_sent: Dict[int, float] = {}
-
+# ── Probe helpers ─────────────────────────────────────────────────────────────
 
 def _get_analytics(pad_index: int) -> Dict:
-    """Retorna (creando si no existe) el dict de analytics acumulados para una cámara."""
+    """Return (creating if absent) the accumulated analytics dict for a camera."""
     if pad_index not in _analytics:
         _analytics[pad_index] = {
             "person_count": 0, "gender_male": 0,
@@ -1265,7 +1250,7 @@ def _get_analytics(pad_index: int) -> Dict:
 
 
 def _get_analytics_last_sent(pad_index: int) -> float:
-    """Retorna el timestamp del último envío de analytics para esta cámara."""
+    """Return the timestamp of the last analytics send for this camera."""
     if pad_index not in _analytics_last_sent:
         _analytics_last_sent[pad_index] = time.monotonic()
     return _analytics_last_sent[pad_index]
@@ -1275,7 +1260,7 @@ def _accumulate_positions(
     pad_index: int, camera_id: str, persons_meta: list,
     frame_width: int, frame_height: int, frame_num: int,
 ) -> None:
-    """Acumula centroides normalizados y envía snapshot de posiciones cada POSITION_SEND_INTERVAL s."""
+    """Accumulate normalized centroids and flush a position snapshot every POSITION_SEND_INTERVAL s."""
     buf = _position_buffer.setdefault(pad_index, [])
     for obj in persons_meta:
         r = obj.rect_params
@@ -1298,7 +1283,7 @@ def _save_and_send_crop(
     frame_num: int,
     bbox: dict,
 ) -> None:
-    """Guarda un crop en disco y lo envía al backend vía API."""
+    """Save a person crop to disk and send it to the backend via API."""
     person_dir = Path(CROPS_DIR) / camera_id / str(track_id)
     person_dir.mkdir(parents=True, exist_ok=True)
     filepath = person_dir / f"frame_{frame_num:06d}.jpg"
@@ -1308,9 +1293,8 @@ def _save_and_send_crop(
     api_client.post_crop(camera_id, track_id, frame_num, crop_b64, bbox)
 
 
-def _expire_lost_tracks(pad_index: int, frame_num: int,
-                        visible_ids: Set[int]) -> None:
-    """Emite person_exit para tracks no vistos por TRACK_LOST_TIMEOUT_FRAMES frames."""
+def _expire_lost_tracks(pad_index: int, frame_num: int, visible_ids: Set[int]) -> None:
+    """Emit person_exit for tracks not seen within TRACK_LOST_TIMEOUT_FRAMES frames."""
     expired = [
         key for key, state in _active_tracks.items()
         if key[0] == pad_index
@@ -1322,7 +1306,7 @@ def _expire_lost_tracks(pad_index: int, frame_num: int,
         track_id = key[1]
         dwell = time.monotonic() - state.first_ts
 
-        # Si el entry event fue diferido (ReID) y nunca se emitió, emitirlo ahora
+        # If entry was deferred (ReID) and never emitted, emit it now before the exit.
         if not state.entry_emitted:
             api_client.post_person_entry(
                 state.camera_id, track_id,
@@ -1370,18 +1354,18 @@ def _handle_appearance_reid(
     frame_np,
     pad_index: int,
 ) -> None:
-    """Handle AppearanceWorker + ReIdManager para un track visible.
+    """Drive AppearanceWorker + ReIdManager for a visible track.
 
-    Con ReID activo: difiere person_entry hasta tener embedding; emite
-    person_entry (new/return) o person_channel_change según el match.
-    Sin ReID: envía el vector de apariencia al backend para re-ID server-side.
+    With ReID active: defers person_entry until the embedding is ready, then emits
+    person_entry (new/return) or person_channel_change based on the match result.
+    Without ReID: sends the appearance vector to the backend for server-side re-ID.
     """
     if _appearance_worker is None:
         return
 
     state = _active_tracks[track_key]
 
-    # ── Consumir embedding disponible ────────────────────────────────────────
+    # ── Consume available embedding ───────────────────────────────────────────
     vec = _appearance_worker.get_result(p_track_id, pad_index)
     if vec is not None:
         _appearance_worker.clear_result(p_track_id, pad_index)
@@ -1405,7 +1389,8 @@ def _handle_appearance_reid(
                     f"  prev={prev_camera}" if prev_camera else "",
                 )
 
-                # Same-camera re-detection → tratar como return, no channel_change
+                # Same-camera re-detection: demote to person_return to avoid a spurious
+                # channel_change when the tracker loses and re-detects on the same camera.
                 if event_type == "channel_change" and prev_camera == camera_id:
                     event_type = "person_return"
 
@@ -1425,16 +1410,16 @@ def _handle_appearance_reid(
                         )
                         _get_analytics(pad_index)["person_count"] += 1
             else:
-                # Legacy: enviar vector al backend para re-ID server-side
+                # Legacy: send vector to backend for server-side re-ID.
                 api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
 
         elif state.global_id is not None and _reid_manager is not None:
-            # Embeddings posteriores: actualizar DB para mantener el vector fresco
+            # Subsequent embeddings — update the gallery to keep the vector fresh.
             _reid_manager.update_embedding(state.global_id, vec)
 
-    # ── Enqueue crops para el worker ─────────────────────────────────────────
+    # ── Enqueue crop for the appearance worker ────────────────────────────────
     if (frame_np is not None
-            and bbox["width"]  >= CROP_MIN_WIDTH
+            and bbox["width"] >= CROP_MIN_WIDTH
             and bbox["height"] >= CROP_MIN_HEIGHT):
         needs_crop = (
             frame_num == state.first_frame
@@ -1449,7 +1434,7 @@ def _handle_appearance_reid(
             if crop.size > 0:
                 _appearance_worker.enqueue(crop, p_track_id, pad_index, frame_num)
 
-    # ── Deadline fallback: emitir entry si el embedding no llegó ─────────────
+    # ── Deadline fallback: emit entry if embedding never arrived ──────────────
     if (_reid_manager is not None
             and not state.entry_emitted
             and frame_num >= state.entry_deadline):
@@ -1468,7 +1453,9 @@ def _handle_appearance_reid(
 
 
 def _should_count_camera(pad_index: int) -> bool:
-    """Return True si los analytics de esta cámara deben procesarse."""
+    # NOTE: this function duplicates the inline camera-type guard in osd_sink_pad_buffer_probe.
+    # Consider replacing the inline block with a call to this function.
+    """Return True if analytics for this camera should be processed."""
     is_external = pad_index in _external_pads
     if is_external and not _count_external:
         return False
@@ -1477,15 +1464,13 @@ def _should_count_camera(pad_index: int) -> bool:
     return True
 
 
-# ==============================================================================
-# 8. PROBE ÚNICO — OSD + ANALYTICS + STREAM OVERLAY
-# ==============================================================================
+# ── Main GStreamer probe ───────────────────────────────────────────────────────
 
 def osd_sink_pad_buffer_probe(_pad, info):
-    """Probe único en caps_rgba src-pad (frames RGBA full-res por cámara, sin tiler).
+    """Single probe on the caps_rgba src-pad (full-res RGBA frames per camera, no tiler).
 
-    Lazy frame read: solo copia GPU→CPU cuando un worker necesita pixels o
-    cuando stream mode está activo (para dibujar bboxes y servir MJPEG).
+    Lazy frame read: GPU->CPU copy only when a worker needs pixels or when the
+    scene is empty and it's time to capture a reference frame (at most every 30s).
     """
     gst_buffer = info.get_buffer()
     if not gst_buffer:
@@ -1497,12 +1482,11 @@ def osd_sink_pad_buffer_probe(_pad, info):
     for frame_meta in _iter_pyds_list(
         batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast
     ):
-        frame_num         = frame_meta.frame_num
-        pad_index         = frame_meta.pad_index
-        camera_id         = _camera_id_for(pad_index)
+        frame_num = frame_meta.frame_num
+        pad_index = frame_meta.pad_index
+        camera_id = _camera_id_for(pad_index)
         is_entry_exit_cam = pad_index in _entry_exit_pads
 
-        # Cortocircuitar si este tipo de cámara no debe contar
         _is_external_cam = pad_index in _external_pads
         if _is_external_cam and not _count_external:
             continue
@@ -1510,8 +1494,8 @@ def osd_sink_pad_buffer_probe(_pad, info):
             continue
 
         # ── Lazy frame read ───────────────────────────────────────────────────
-        # GPU→CPU copy solo cuando face_recognizer o appearance_worker necesitan crops.
-        # Stream mode (tiler) no requiere frame aquí — Probe B lo lee del tiler output.
+        # GPU->CPU copy only when face_recognizer or appearance_worker needs crops.
+        # In stream mode the tiled frame is read by Probe B from the tiler output, not here.
         frame_np = None
         _needs_pixel = False
 
@@ -1530,15 +1514,15 @@ def osd_sink_pad_buffer_probe(_pad, info):
                            for k, s in _active_tracks.items() if k[0] == pad_index)
                 )
 
-        # Escena vacía: decodificar píxeles solo cuando toca capturar reference frame.
-        # Sin esto frame_np queda None y el reference frame nunca se envía.
-        # Overhead: un GPU→CPU copy cada ≥30 s (sin confirmar) o ≥24 h (ya confirmado).
+        # Empty scene: decode pixels only when a reference frame capture is due.
+        # Without this check frame_np stays None and no reference frame is ever sent.
+        # Overhead: at most one GPU->CPU copy every 30s (unconfirmed) or 24h (confirmed).
         if not _needs_pixel and frame_meta.num_obj_meta == 0:
             _rc_confirmed = _reference_frame_confirmed_np.get(camera_id)
-            _rc_ts        = _reference_frame_confirmed_ts.get(camera_id, 0.0)
-            _rc_attempt   = _reference_frame_last_attempt.get(pad_index, 0.0)
-            _now_rc       = time.monotonic()
-            _needs_pixel  = (
+            _rc_ts = _reference_frame_confirmed_ts.get(camera_id, 0.0)
+            _rc_attempt = _reference_frame_last_attempt.get(pad_index, 0.0)
+            _now_rc = time.monotonic()
+            _needs_pixel = (
                 (_rc_confirmed is None
                  and _now_rc - _rc_attempt >= REFERENCE_FRAME_RETRY_SECS)
                 or (_rc_confirmed is not None
@@ -1552,11 +1536,11 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 frame_np = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGR)
             except Exception as e:
                 if frame_num % 30 == 0:
-                    logger.warning("get_nvds_buf_surface fallo frame=%d: %s", frame_num, e)
+                    logger.warning("get_nvds_buf_surface failed frame=%d: %s", frame_num, e)
 
-        # ── Separar personas y caras ──────────────────────────────────────────
+        # ── Separate persons and faces ────────────────────────────────────────
         persons_meta: List = []
-        face_metas:   List = []
+        face_metas: List = []
         for obj_meta in _iter_pyds_list(
             frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast
         ):
@@ -1569,14 +1553,13 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     and int(obj_meta.class_id) == PGIE_CLASS_FACE):
                 face_metas.append(obj_meta)
 
-        # ── Face recognition: procesar detecciones de cara ───────────────────
         if _face_handler and face_metas and frame_np is not None:
             for face_obj_meta in face_metas:
                 _face_handler.process_face(
                     face_obj_meta, frame_num, frame_np, persons_meta, camera_id
                 )
 
-        # ── Tracks de personas ────────────────────────────────────────────────
+        # ── Person track processing ───────────────────────────────────────────
         visible_ids: Set[int] = set()
 
         for obj_meta in persons_meta:
@@ -1584,9 +1567,9 @@ def osd_sink_pad_buffer_probe(_pad, info):
             visible_ids.add(p_track_id)
             r = obj_meta.rect_params
             bbox = {
-                "left":   max(0, int(r.left)),
-                "top":    max(0, int(r.top)),
-                "width":  int(r.width),
+                "left": max(0, int(r.left)),
+                "top": max(0, int(r.top)),
+                "width": int(r.width),
                 "height": int(r.height),
             }
 
@@ -1620,8 +1603,8 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 frame_num, frame_np, pad_index,
             )
 
-            # OSD base label — número corto de display si el ReID ya resolvió, "..." si espera.
-            # _display_ids es solo para el stream; no toca global_id ni los payloads de API.
+            # OSD label: short display number once ReID resolves, "..." while waiting.
+            # _display_ids is stream-only and does not affect global_id or API payloads.
             state = _active_tracks[track_key]
             if state.global_id:
                 global _display_id_counter
@@ -1633,7 +1616,6 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 base_label = "..."
             _set_osd_text(obj_meta, base_label, border_color=(0.2, 0.6, 1.0, 1.0))
 
-            # ── Handler dispatch ──────────────────────────────────────────────
             for handler in _active_handlers:
                 result = handler.process(obj_meta, frame_num, frame_np=frame_np)
                 if result is None:
@@ -1649,9 +1631,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                         f"track={p_track_id:<4} ",
                         f"{gd} | {ad}  conf={demo.get('confidence', 0.0):.0%}",
                     )
-                    api_client.post_person_classified(
-                        camera_id, p_track_id, bbox, demo
-                    )
+                    api_client.post_person_classified(camera_id, p_track_id, bbox, demo)
                     an = _get_analytics(pad_index)
                     au = result.analytics_update
                     if "age_gender_classes" in au:
@@ -1660,7 +1640,6 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     if "gender_key" in au:
                         an[au["gender_key"]] += 1
 
-            # ── Face identity overlay ─────────────────────────────────────────
             if _face_handler:
                 identity = _face_handler.get_identity(p_track_id)
                 if identity:
@@ -1673,7 +1652,6 @@ def osd_sink_pad_buffer_probe(_pad, info):
                             border_color=(0.2, 1.0, 0.4, 1.0),
                         )
 
-            # ── Crop capture ──────────────────────────────────────────────────
             if frame_np is not None:
                 last_crop = _crop_last_frame.get(p_track_id, -CROP_SAMPLE_INTERVAL)
                 count = _crop_counts.get(p_track_id, 0)
@@ -1690,33 +1668,30 @@ def osd_sink_pad_buffer_probe(_pad, info):
                         _crop_counts[p_track_id] = count + 1
                         _crop_last_frame[p_track_id] = frame_num
 
-            # Guardar label final en _track_labels para que Probe B lo lea en el tiler.
-            # str() es necesario: display_text en pyds es un tipo ctypes, no Python str.
+            # str() required: display_text in pyds is a ctypes type, not a Python str.
             if _IS_STREAM_ENABLED:
                 raw = obj_meta.text_params.display_text
                 _track_labels[p_track_id] = {
                     "label": str(raw) if raw else f"P#{p_track_id}",
-                    "fall":  False,
+                    "fall": False,
                 }
 
-        # ── Expirar tracks perdidos ───────────────────────────────────────────
         _expire_lost_tracks(pad_index, frame_num, visible_ids)
 
-        # ── Posiciones para heatmaps ──────────────────────────────────────────
         if _ws_client is not None and visible_ids and frame_np is not None:
             fh, fw = frame_np.shape[:2]
             _accumulate_positions(pad_index, camera_id, persons_meta, fw, fh, frame_num)
 
-        # ── Analytics snapshot periódico ──────────────────────────────────────
+        # ── Periodic analytics snapshot ───────────────────────────────────────
         now = time.monotonic()
         if now - _get_analytics_last_sent(pad_index) >= ANALYTICS_SEND_INTERVAL_SECS:
             an = _get_analytics(pad_index)
             api_client.post_analytics_snapshot(camera_id, {
-                "people_count":       an["person_count"],
-                "gender_male":        an["gender_male"],
-                "gender_female":      an["gender_female"],
+                "people_count": an["person_count"],
+                "gender_male": an["gender_male"],
+                "gender_female": an["gender_female"],
                 "age_gender_classes": an["age_gender_classes"],
-                "tailscale_ip":       TAILSCALE_IP,
+                "tailscale_ip": TAILSCALE_IP,
             }, period_seconds=ANALYTICS_SEND_INTERVAL_SECS)
             _analytics[pad_index] = {
                 "person_count": 0, "gender_male": 0,
@@ -1724,10 +1699,10 @@ def osd_sink_pad_buffer_probe(_pad, info):
             }
             _analytics_last_sent[pad_index] = now
 
-        # ── Frame de referencia: retry hasta confirmar + detección de cambio ──
-        # Solo se evalúa cuando no hay personas y hay suficiente iluminación.
-        # Bolsos u otros objetos estáticos (clase BAG/FACE de PeopleNet) son parte
-        # del fondo y no deben bloquear el envío; solo se excluyen frames nocturnos.
+        # ── Reference frame: retry until confirmed + visual change detection ──
+        # Only evaluated when no persons are visible and the frame is bright enough.
+        # Non-person objects (bags, faces without a body — PeopleNet BAG/FACE classes)
+        # are part of the background and do not block the send; only dark frames are excluded.
         if (frame_np is not None
                 and len(visible_ids) == 0
                 and _frame_is_bright_enough(frame_np)):
@@ -1735,13 +1710,13 @@ def osd_sink_pad_buffer_probe(_pad, info):
             _ref_confirmed_ts = _reference_frame_confirmed_ts.get(camera_id, 0.0)
             _ref_last_attempt = _reference_frame_last_attempt.get(pad_index, 0.0)
 
-            # Caso 1 — nunca confirmado: reintentar cada REFERENCE_FRAME_RETRY_SECS.
+            # Case 1 — never confirmed: retry every REFERENCE_FRAME_RETRY_SECS.
             _needs_initial = (
                 _ref_confirmed_np is None
                 and now - _ref_last_attempt >= REFERENCE_FRAME_RETRY_SECS
             )
-            # Caso 2 — ya confirmado: verificar si la escena cambió significativamente
-            # y han pasado al menos 24 h desde el último frame confirmado.
+            # Case 2 — already confirmed: resend only if the scene changed significantly
+            # and at least 24h have passed since the last confirmed frame.
             _needs_update = (
                 _ref_confirmed_np is not None
                 and now - _ref_confirmed_ts >= REFERENCE_FRAME_MIN_INTERVAL_SECS
@@ -1754,9 +1729,9 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 frame_b64 = base64.b64encode(buf).decode("utf-8")
                 api_client.post_reference_frame(camera_id, frame_num, frame_b64, fw, fh)
                 _reference_frame_last_attempt[pad_index] = now
-                reason = "inicial/retry" if _needs_initial else "cambio visual detectado"
+                reason = "initial/retry" if _needs_initial else "visual change detected"
                 logger.info(
-                    "Frame de referencia encolado camera=%s frame=%d %dx%d [%s]",
+                    "Reference frame queued camera=%s frame=%d %dx%d [%s]",
                     camera_id, frame_num, fw, fh, reason,
                 )
 
