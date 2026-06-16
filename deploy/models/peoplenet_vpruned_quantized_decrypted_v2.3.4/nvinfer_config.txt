@@ -32,5 +32,5 @@ cluster-mode=2
 # pgie_pre_cluster_threshold) sin tocar este archivo.
 [class-attrs-all]
 topk=20
-nms-iou-threshold=0.35
+nms-iou-threshold=0.20
 pre-cluster-threshold=0.3
