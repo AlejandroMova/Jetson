@@ -179,9 +179,9 @@ class FaceRecognizer:
         for item in items:
             uid = str(item.get("employee_id", ""))
             name = item.get("name", uid)
-            emb = item.get("embedding", [])
-            if uid and emb:
-                new_raw[uid] = {"name": name, "embeddings": [emb]}
+            embs = item.get("embeddings", [])
+            if uid and embs:
+                new_raw[uid] = {"name": name, "embeddings": embs}
 
         try:
             Path(self._db_path).write_text(json.dumps(new_raw, indent=2))
