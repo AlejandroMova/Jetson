@@ -291,10 +291,17 @@ def main():
       7. Correr el GLib.MainLoop hasta EOS o error
       8. Parar workers, cliente API y pipeline al salir
     """
+
+    
     cfg = load_config()
     cfg.log_summary()
+
     _validate_pipeline_models(cfg.pipeline)
-    init_channel_map(cfg.channels)
+    # only active channels
+    active_channels = [ch for ch in cfg.channels if ch not in cfg.external_channels] if not cfg.count_external else cfg.channels
+
+    init_channel_map(active_channels)
+
     init_sector(cfg.sector)
     init_entry_exit_pads(cfg.entry_exit_pad_indices())
     init_camera_types(cfg.external_pad_indices(), cfg.count_internal, cfg.count_external)
@@ -535,10 +542,10 @@ def main():
                 elapsed = time.monotonic() - _pipeline_start_time
                 if (not _exit_for_rediscover[0]
                         and elapsed < _STARTUP_WINDOW_S
-                        and len(_failed_sources) >= len(cfg.channels)):
+                        and len(_failed_sources) >= len(active_channels)):
                     logger.warning(
                         "[DVR] Todos los %d streams fallaron en %.0f s — probablemente el DVR cambió de IP",
-                        len(cfg.channels), elapsed,
+                        len(active_channels), elapsed,
                     )
                     import threading as _th
                     _th.Thread(target=_try_rediscover_dvr, name="dvr-rediscover", daemon=True).start()

@@ -126,7 +126,14 @@ class ClientConfig:
     def rtsp_urls(self) -> List[str]:
         """Build one RTSP URL per active channel."""
         urls = []
-        for ch in self.channels:
+        # actual channels, we check if count_external is false, if it is, we only add "internal cameras"
+        actual_channels = []
+        # if we dont count external cameras
+        if not self.count_external: 
+            actual_channels = [ch for ch in self.channels if ch not in self.external_channels]
+        else: 
+            actual_channels = self.channels
+        for ch in actual_channels:
             url = (
                 self.rtsp_url_pattern
                 .replace("{user}",     self.dvr_user)
@@ -170,6 +177,12 @@ class ClientConfig:
 
     def entry_exit_pad_indices(self) -> set:
         """Return the pad indices that correspond to entry/exit cameras."""
+        if not self.count_external: 
+            active_channels = [ch for ch in self.channels if ch not in self.external_channels]
+            return {
+                idx for idx, ch in enumerate(active_channels)
+                if ch in self.entry_exit_channels
+            }
         return {
             idx for idx, ch in enumerate(self.channels)
             if ch in self.entry_exit_channels
@@ -177,6 +190,8 @@ class ClientConfig:
 
     def external_pad_indices(self) -> set:
         """Return pad indices for channels marked as external (rest are internal by default)."""
+        if not self.count_external: 
+            return set()
         return {idx for idx, ch in enumerate(self.channels) if ch in self.external_channels}
 
 
