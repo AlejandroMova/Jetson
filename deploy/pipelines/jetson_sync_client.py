@@ -10,6 +10,8 @@ Architecture: same lifecycle pattern as WsPositionClient (start/stop).
   - python-socketio Client manages the connection and a background thread.
   - On "face_update": sync is dispatched to a separate thread so the socketio
     event loop is never blocked by the HTTP pull + file write.
+  - A periodic timer fires every SYNC_PERIOD_HOURS (default 4 h) regardless of
+    Socket.IO events, so missed face_update notifications are self-healed.
 
 Why Socket.IO and not polling:
   - The backend (Railway cloud) cannot initiate HTTP connections to Jetsons
@@ -17,12 +19,19 @@ Why Socket.IO and not polling:
     so the backend can push through the existing persistent channel.
   - Polling every minute would add unnecessary load and delay; this approach
     triggers sync immediately on employee activation with zero wasted requests.
+  - The periodic timer is a safety net only — not a replacement for event-driven sync.
 """
 import logging
 import threading
+import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# Default interval for the periodic full-roster sync.
+# Covers the case where a face_update Socket.IO event was missed while the
+# Jetson was offline or the connection was temporarily broken.
+_DEFAULT_SYNC_PERIOD_HOURS = 4
 
 
 class JetsonSyncClient:
@@ -41,35 +50,49 @@ class JetsonSyncClient:
         api_base_url: str,
         api_key: str,
         sync_callback: Callable[[str, str], None],
+        sync_period_hours: float = _DEFAULT_SYNC_PERIOD_HOURS,
     ):
         """Configura el cliente de sync. La conexión se establece en start().
 
         Args:
-            api_base_url:   HTTP base URL del backend (e.g. https://api.nxcomputing.com).
-            api_key:        API key del Jetson (raw, sin hash).
-            sync_callback:  Función llamada en hilo separado cuando llega face_update.
-                            Firma: callback(action: str, employee_id: str).
+            api_base_url:       HTTP base URL del backend (e.g. https://api.nxcomputing.com).
+            api_key:            API key del Jetson (raw, sin hash).
+            sync_callback:      Función llamada en hilo separado cuando llega face_update.
+                                Firma: callback(action: str, employee_id: str).
+            sync_period_hours:  Intervalo del sync periódico de seguridad (default 4 h).
+                                Independiente de los eventos face_update.
         """
         self._api_base_url = api_base_url.rstrip("/")
         self._api_key = api_key
         self._sync_callback = sync_callback
+        self._sync_period_secs = sync_period_hours * 3600
         self._sio = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._periodic_thread: Optional[threading.Thread] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Arranca el hilo de conexión al backend. La conexión Socket.IO se establece asíncronamente."""
+        """Arranca el hilo Socket.IO y el hilo de sync periódico."""
         self._running = True
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="jetson-sync-client"
         )
         self._thread.start()
-        logger.info("[JetsonSyncClient] starting → %s/jetson", self._api_base_url)
+
+        self._periodic_thread = threading.Thread(
+            target=self._periodic_sync_loop, daemon=True, name="jetson-sync-periodic"
+        )
+        self._periodic_thread.start()
+
+        logger.info(
+            "[JetsonSyncClient] starting → %s/jetson (sync periódico cada %.0f h)",
+            self._api_base_url, self._sync_period_secs / 3600,
+        )
 
     def stop(self) -> None:
-        """Desconecta Socket.IO y espera a que el hilo pare (máximo 5 s)."""
+        """Desconecta Socket.IO y espera a que los hilos paren (máximo 5 s cada uno)."""
         self._running = False
         if self._sio is not None:
             try:
@@ -78,7 +101,32 @@ class JetsonSyncClient:
                 pass
         if self._thread:
             self._thread.join(timeout=5)
+        if self._periodic_thread:
+            self._periodic_thread.join(timeout=5)
         logger.info("[JetsonSyncClient] stopped.")
+
+    # ── Periodic sync loop ────────────────────────────────────────────────────
+
+    def _periodic_sync_loop(self) -> None:
+        """Dispara un sync completo cada sync_period_hours como red de seguridad.
+
+        Corre en su propio hilo daemon para no bloquear el event loop de Socket.IO.
+        Duerme en intervalos de 60 s para responder rápido a stop() sin usar signals.
+        El primer sync se omite aquí porque on_connect ya lo hace al arrancar.
+        """
+        elapsed = 0.0
+        while self._running:
+            time.sleep(60)
+            elapsed += 60
+            if not self._running:
+                break
+            if elapsed >= self._sync_period_secs:
+                elapsed = 0.0
+                logger.info("[JetsonSyncClient] sync periódico — jalando roster completo del backend.")
+                threading.Thread(
+                    target=self._sync_callback, args=("sync", ""),
+                    daemon=True, name="face-sync-periodic",
+                ).start()
 
     # ── Internal connection thread ─────────────────────────────────────────────
 
@@ -150,7 +198,6 @@ class JetsonSyncClient:
                 # python-socketio ya gestiona reconexión; si estamos aquí es porque
                 # falló el connect() inicial — esperar un poco antes de reintentar.
                 if self._running:
-                    import time
                     time.sleep(5)
             finally:
                 # Asegurarse de que el socket quede en estado limpio para el próximo intento.
