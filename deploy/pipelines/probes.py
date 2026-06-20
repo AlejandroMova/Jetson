@@ -171,6 +171,16 @@ REFERENCE_FRAME_CHANGE_THRESHOLD: float = 0.15
 # 30/255 ≈ 12% of max brightness — rejects pure black and near-dark scenes.
 REFERENCE_FRAME_MIN_BRIGHTNESS: float = 30.0
 
+# we wait until we have certain frames without a person, this to prevent that we 
+# consider a frame "empty" from people, when in reality there was a lack of detection 
+# for a few frames
+# consider FPS
+MIN_REFERENCE_FRAME_SPACE: int = 30
+# we initialize the frame space, from 0 and we add them up every frame that there are no people
+# once the frame is sent, restart from 0 
+CURRENT_FRAME_SPACE: dict[str, int] = {}
+
+
 # ── Crop capture ──────────────────────────────────────────────────────────────
 CROPS_DIR: str = "crops"
 CROP_SAMPLE_INTERVAL: int = 15
@@ -1652,7 +1662,9 @@ def osd_sink_pad_buffer_probe(_pad, info):
                             border_color=(0.2, 1.0, 0.4, 1.0),
                         )
 
+            # if there is a frame
             if frame_np is not None:
+
                 last_crop = _crop_last_frame.get(p_track_id, -CROP_SAMPLE_INTERVAL)
                 count = _crop_counts.get(p_track_id, 0)
                 if (count < CROP_MAX_PER_PERSON
@@ -1703,6 +1715,11 @@ def osd_sink_pad_buffer_probe(_pad, info):
         # Only evaluated when no persons are visible and the frame is bright enough.
         # Non-person objects (bags, faces without a body — PeopleNet BAG/FACE classes)
         # are part of the background and do not block the send; only dark frames are excluded.
+
+        # if there are people, reset the count
+        global CURRENT_FRAME_SPACE
+        if (len(visible_ids) != 0): 
+            CURRENT_FRAME_SPACE[camera_id] = 0
         if (frame_np is not None
                 and len(visible_ids) == 0
                 and _frame_is_bright_enough(frame_np)):
@@ -1710,6 +1727,10 @@ def osd_sink_pad_buffer_probe(_pad, info):
             _ref_confirmed_ts = _reference_frame_confirmed_ts.get(camera_id, 0.0)
             _ref_last_attempt = _reference_frame_last_attempt.get(pad_index, 0.0)
 
+
+            # Add to CURRENT_FRAME_SPACE
+            CURRENT_FRAME_SPACE[camera_id] = CURRENT_FRAME_SPACE.get(camera_id, 0) + 1
+            
             # Case 1 — never confirmed: retry every REFERENCE_FRAME_RETRY_SECS.
             _needs_initial = (
                 _ref_confirmed_np is None
@@ -1723,7 +1744,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                 and _scene_changed(frame_np, _ref_confirmed_np)
             )
 
-            if _needs_initial or _needs_update:
+            if (_needs_initial or _needs_update) and CURRENT_FRAME_SPACE[camera_id] >= MIN_REFERENCE_FRAME_SPACE:
                 fh, fw = frame_np.shape[:2]
                 _, buf = cv2.imencode(".jpg", frame_np, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 frame_b64 = base64.b64encode(buf).decode("utf-8")
@@ -1734,5 +1755,6 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     "Reference frame queued camera=%s frame=%d %dx%d [%s]",
                     camera_id, frame_num, fw, fh, reason,
                 )
+                CURRENT_FRAME_SPACE[camera_id] = 0
 
     return Gst.PadProbeReturn.OK
