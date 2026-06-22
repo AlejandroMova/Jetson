@@ -54,6 +54,7 @@ cd NX-JETSON/deploy
 #    --stream-type sub        → use DVR sub-stream (960×544) for 16-camera deployments
 sudo bash setup.sh \
   --client <client_name> \
+  --hostname jetson-<client_name> \
   --package comercio_total \
   --authkey <tailscale-key> \
   --dvr-user admin \
@@ -63,6 +64,7 @@ sudo bash setup.sh \
 # 16-camera deployment (sub-stream to avoid NVDEC overload):
 sudo bash setup.sh \
   --client <client_name> \
+  --hostname jetson-<client_name> \
   --package industrial_basico \
   --stream-type sub \
   --authkey <tailscale-key> \

@@ -25,7 +25,8 @@
 #    Clonar el repo manualmente antes de correr este script:
 #    git clone https://<token>@github.com/AlejandroMova/NX-JETSON.git
 #    cd NX-JETSON/deploy
-#    sudo bash setup.sh --authkey <key> --client <nombre> --dvr-user admin --dvr-pass <pass>
+#    sudo bash setup.sh --client <nombre> --hostname jetson-<nombre> --package <paquete> \
+#      --authkey <key> --dvr-user admin --dvr-pass <pass> --api-key <token>
 # ============================================================
 
 set -eo pipefail
