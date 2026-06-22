@@ -126,14 +126,14 @@ class ClientConfig:
     def rtsp_urls(self) -> List[str]:
         """Build one RTSP URL per active channel."""
         urls = []
-        # actual channels, we check if count_external is false, if it is, we only add "internal cameras"
-        actual_channels = []
+        # active channels, we check if count_external is false, if it is, we only add "internal cameras"
+        active_channels = []
         # if we dont count external cameras
         if not self.count_external: 
-            actual_channels = [ch for ch in self.channels if ch not in self.external_channels]
+            active_channels = [ch for ch in self.channels if ch not in self.external_channels]
         else: 
-            actual_channels = self.channels
-        for ch in actual_channels:
+            active_channels = self.channels
+        for ch in active_channels:
             url = (
                 self.rtsp_url_pattern
                 .replace("{user}",     self.dvr_user)

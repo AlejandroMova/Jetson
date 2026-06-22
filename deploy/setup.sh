@@ -16,13 +16,16 @@
 #    --compose     Nombre del archivo compose (default: docker-compose.yml)
 #    --hostname    Nombre visible en Tailscale (default: hostname actual)
 #    --stream-type Tipo de stream RTSP: main (1080p, default) | sub (960×544, 16+ cámaras)
+#    --dvr-user    Usuario del DVR (escribe clients/<client>/.env con DVR_USER)
+#    --dvr-pass    Contraseña del DVR (escribe clients/<client>/.env con DVR_PASS)
 #    --no-vnc      Omite la instalación de VNC
 #    --no-docker   Omite docker compose
 #
 #  Prerequisito:
 #    Clonar el repo manualmente antes de correr este script:
 #    git clone https://<token>@github.com/AlejandroMova/NX-JETSON.git
-#    cd NX-JETSON && sudo bash setup.sh --authkey <key>
+#    cd NX-JETSON/deploy
+#    sudo bash setup.sh --authkey <key> --client <nombre> --dvr-user admin --dvr-pass <pass>
 # ============================================================
 
 set -eo pipefail
@@ -67,6 +70,8 @@ WORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # ── Parse args ──────────────────────────────────────────────
 NX_API_KEY=""
 ENTRY_EXIT_CHANNELS=""
+DVR_USER=""
+DVR_PASS=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -78,6 +83,8 @@ while [[ $# -gt 0 ]]; do
     --api-key)             NX_API_KEY="$2";           shift 2 ;;
     --entry-exit-channels) ENTRY_EXIT_CHANNELS="$2";  shift 2 ;;
     --stream-type)         NX_STREAM_TYPE="$2";       shift 2 ;;
+    --dvr-user)            DVR_USER="$2";             shift 2 ;;
+    --dvr-pass)            DVR_PASS="$2";             shift 2 ;;
     --no-vnc)              SKIP_VNC=true;             shift ;;
     --no-docker)           SKIP_DOCKER=true;          shift ;;
     *) die "Flag desconocido: $1" ;;
@@ -85,6 +92,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -ne 0 ]] && die "Corre con sudo"
+
+# ── Verificar conectividad a internet ───────────────────────────────────────
+log "Verificando conexión a internet..."
+if ! ping -c 1 -W 5 8.8.8.8 &>/dev/null && ! ping -c 1 -W 5 1.1.1.1 &>/dev/null; then
+  die "Sin conexión a internet. Verifica que el Jetson esté conectado a ethernet antes de continuar."
+fi
+ok "Internet disponible"
+
+# ── Dependencias ligeras del host (no Docker) ────────────────
+# ruamel.yaml: necesario para actualizar config.yaml del cliente desde el host
+pip3 install -q ruamel.yaml 2>/dev/null \
+  || apt-get install -y python3-ruamel.yaml -qq 2>/dev/null \
+  || warn "No se pudo instalar ruamel.yaml — la actualización de config.yaml podría fallar"
 
 echo -e "\n${BOLD}══════════════════════════════════════════${NC}"
 echo -e "${BOLD}   NX Computing — Jetson Setup v2.5       ${NC}"
@@ -342,7 +362,37 @@ else
   warn "O escríbelo manualmente: echo 'demo' | sudo tee /etc/nx_client"
 fi
 
-# ── .env — crear siempre si no existe ─────────────────────────────────────────
+# ── Credenciales DVR → clients/<client>/.env ───────────────────────────────────
+_client_for_env=$(cat /etc/nx_client 2>/dev/null || echo "$NX_CLIENT")
+if [[ -n "$_client_for_env" ]]; then
+  CLIENT_ENV_FILE="${WORK_DIR}/clients/${_client_for_env}/.env"
+  mkdir -p "${WORK_DIR}/clients/${_client_for_env}"
+  if [[ -n "$DVR_USER" || -n "$DVR_PASS" ]]; then
+    # Escribir / actualizar credenciales pasadas por flags
+    touch "$CLIENT_ENV_FILE"
+    [[ -n "$DVR_USER" ]] && {
+      grep -q "^DVR_USER=" "$CLIENT_ENV_FILE" \
+        && sed -i "s|^DVR_USER=.*|DVR_USER=${DVR_USER}|" "$CLIENT_ENV_FILE" \
+        || echo "DVR_USER=${DVR_USER}" >> "$CLIENT_ENV_FILE"
+    }
+    [[ -n "$DVR_PASS" ]] && {
+      grep -q "^DVR_PASS=" "$CLIENT_ENV_FILE" \
+        && sed -i "s|^DVR_PASS=.*|DVR_PASS=${DVR_PASS}|" "$CLIENT_ENV_FILE" \
+        || echo "DVR_PASS=${DVR_PASS}" >> "$CLIENT_ENV_FILE"
+    }
+    chmod 600 "$CLIENT_ENV_FILE"
+    ok "Credenciales DVR guardadas en ${CLIENT_ENV_FILE}"
+  elif [[ ! -f "$CLIENT_ENV_FILE" ]]; then
+    warn "No se encontraron credenciales DVR en ${CLIENT_ENV_FILE}"
+    warn "La auto-detección de canales será omitida. Para configurarlas:"
+    warn "  sudo bash setup.sh --dvr-user admin --dvr-pass <pass> --client ${_client_for_env}"
+    warn "  o manualmente: echo 'DVR_USER=admin' | sudo tee ${CLIENT_ENV_FILE}"
+  else
+    ok "Credenciales DVR ya existen en ${CLIENT_ENV_FILE}"
+  fi
+fi
+
+# ── .env raíz — crear siempre si no existe ─────────────────────────────────────
 ENV_FILE="${WORK_DIR}/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
   cp "${WORK_DIR}/.env.example" "$ENV_FILE"
@@ -480,19 +530,19 @@ _download_models() {
   fi
 
   # ── OSNet-x0.25 (siempre activo — cross-camera re-ID) ───────
+  # Corre dentro del container donde torch/torchreid ya están disponibles
+  # (evita instalar multi-GB en el host y problemas de wheels aarch64)
   OSNET_DEST="${WORK_DIR}/models/osnet/osnet_x0_25_market1501.onnx"
   if [[ -f "$OSNET_DEST" ]]; then
     ok "OSNet ya descargado — skip"
   else
-    log "Instalando torch + torchreid para exportar OSNet (una sola vez)..."
-    pip3 install --quiet 'numpy<2' torch torchvision gdown tensorboard h5py scipy imageio tabulate termcolor onnxscript torchreid \
-      || warn "pip3 install torch torchreid falló — verifica tu conexión"
     mkdir -p "${WORK_DIR}/models/osnet"
-    chown "$USER" "${WORK_DIR}/models/osnet"
-    log "Exportando OSNet-x0.25 desde torchreid pretrained (Market-1501)..."
-    python3 "${WORK_DIR}/tools/download_models.py" --reid \
+    chown "$REAL_USER" "${WORK_DIR}/models/osnet"
+    log "Exportando OSNet-x0.25 dentro del container (torchreid pretrained Market-1501)..."
+    $COMPOSE_CMD -f "$COMPOSE_FILE" run --rm deepstream \
+        python3 tools/download_models.py --reid \
       && ok "OSNet exportado" \
-      || warn "Fallo al exportar OSNet. Corre manualmente: pip3 install torchreid && python3 tools/download_models.py --reid"
+      || warn "Fallo al exportar OSNet. Corre manualmente: docker compose run --rm deepstream python3 tools/download_models.py --reid"
   fi
 
 }
@@ -532,9 +582,9 @@ if [[ "$SKIP_DOCKER" == false ]]; then
 
     # ── 6b. Auto-identificar DVR (patrón URL + resolución) ───
     CLIENT_NAME=$(cat /etc/nx_client 2>/dev/null || echo "")
-    ENV_FILE="${WORK_DIR}/clients/${CLIENT_NAME}/.env"
+    CLIENT_ENV_FILE="${WORK_DIR}/clients/${CLIENT_NAME}/.env"
 
-    if [[ -n "$CLIENT_NAME" && -f "$ENV_FILE" && "$DVR_IP" != "no encontrado" ]]; then
+    if [[ -n "$CLIENT_NAME" && -f "$CLIENT_ENV_FILE" && "$DVR_IP" != "no encontrado" ]]; then
       # Crear directorio y config.yaml mínimo si no existen
       CLIENT_DIR="${WORK_DIR}/clients/${CLIENT_NAME}"
       mkdir -p "$CLIENT_DIR"
@@ -568,9 +618,10 @@ CFGEOF
     else
       if [[ -z "$CLIENT_NAME" ]]; then
         warn "Sin /etc/nx_client — saltando identificación de DVR. Usa --client <nombre>"
-      elif [[ ! -f "$ENV_FILE" ]]; then
-        warn "Sin credenciales DVR en ${ENV_FILE} — saltando identificación de DVR."
-        warn "Crea el archivo y corre: docker compose run --rm deepstream python3 tools/identify_dvr.py --update-config"
+      elif [[ ! -f "$CLIENT_ENV_FILE" ]]; then
+        warn "Sin credenciales DVR en ${CLIENT_ENV_FILE} — saltando identificación de DVR."
+        warn "Pásalas como flags: sudo bash setup.sh --dvr-user admin --dvr-pass <pass>"
+        warn "O crea el archivo: echo 'DVR_USER=admin' | sudo tee ${CLIENT_ENV_FILE}"
       fi
     fi
 

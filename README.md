@@ -44,32 +44,33 @@ NX-JETSON/
 git clone https://github.com/AlejandroMova/NX-JETSON.git
 cd NX-JETSON/deploy
 
-# 2. Create client credentials (DVR login)
-cp clients/demo/.env.example clients/<client_name>/.env
-nano clients/<client_name>/.env     # fill DVR_USER and DVR_PASS
-
-# 3. Create API credentials (NX backend token)
-cp .env.example .env
-nano .env                           # fill API_KEY and API_BASE_URL
-
-# 4. Run setup — does everything automatically:
-#    installs Docker + Tailscale, detects DVR IP, builds image,
-#    identifies DVR URL pattern, detects active channels, starts pipeline.
-#    --package sets the contracted tier (writes /etc/nx_pipeline).
-#    --stream-type sub  →  use DVR sub-stream (960×544) for 16-camera deployments.
+# 2. Run setup — does everything automatically:
+#    checks internet, installs Tailscale + SSH + VNC, scans for DVR on port 554,
+#    builds Docker image, detects DVR URL pattern, detects active channels,
+#    downloads OSNet model, starts pipeline.
+#    --dvr-user / --dvr-pass  → DVR login (creates clients/<client>/.env automatically)
+#    --api-key                → NX backend token (writes to .env)
+#    --package                → contracted tier (writes /etc/nx_pipeline + config.yaml)
+#    --stream-type sub        → use DVR sub-stream (960×544) for 16-camera deployments
 sudo bash setup.sh \
   --client <client_name> \
   --package comercio_total \
-  --authkey <tailscale-key>
+  --authkey <tailscale-key> \
+  --dvr-user admin \
+  --dvr-pass <dvr-password> \
+  --api-key <nx-api-token>
 
 # 16-camera deployment (sub-stream to avoid NVDEC overload):
 sudo bash setup.sh \
   --client <client_name> \
   --package industrial_basico \
   --stream-type sub \
-  --authkey <tailscale-key>
+  --authkey <tailscale-key> \
+  --dvr-user admin \
+  --dvr-pass <dvr-password> \
+  --api-key <nx-api-token>
 
-# 5. Inspect the live pipeline from your laptop (QA Visual — see section below)
+# 3. Inspect the live pipeline from your laptop (QA Visual — see section below)
 ./qa.sh
 ```
 

@@ -623,7 +623,9 @@ WebSocket persistente hacia el backend. Envía snapshots de posiciones normaliza
 - Construye la imagen Docker (`docker build`)
 - Lanza el pipeline (`docker compose up -d`)
 
-Flags principales: `--client`, `--package`, `--authkey`, `--api-key`, `--stream-type {main|sub}`, `--entry-exit-channels`, `--no-vnc`, `--no-docker`.
+Flags principales: `--client`, `--package`, `--authkey`, `--api-key`, `--dvr-user`, `--dvr-pass`, `--stream-type {main|sub}`, `--entry-exit-channels`, `--no-vnc`, `--no-docker`.
+
+`--dvr-user` / `--dvr-pass` crean `clients/<client>/.env` automáticamente (antes era un paso manual previo al script). Si no se pasan y el archivo no existe, el setup advierte y omite la detección automática del DVR.
 
 **`update.sh`** (~5 KB)
 Actualización inteligente. Hace `git pull`, detecta si cambiaron el Dockerfile o requirements.txt, y solo reconstruye la imagen si es necesario. Reinicia el pipeline.
