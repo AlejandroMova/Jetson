@@ -16,8 +16,10 @@ models/insightface/
 # MoveNet ONNX (downloaded by tools/download_models.py)
 models/movenet/
 
-# OSNet ONNX (downloaded by tools/download_models.py — hosted in GitHub Releases)
-models/osnet/
+# OSNet binaries — downloaded/compiled per device, not tracked
+# The nvinfer config (.txt) IS tracked so it deploys via git pull
+models/osnet/*.onnx
+models/osnet/*.trt
 
 # Person crops dataset
 crops/
