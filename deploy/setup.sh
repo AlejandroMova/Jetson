@@ -530,16 +530,16 @@ _download_models() {
     fi
   fi
 
-  # ── OSNet-x0.25 (siempre activo — cross-camera re-ID) ───────
-  # Corre dentro del container donde torch/torchreid ya están disponibles
-  # (evita instalar multi-GB en el host y problemas de wheels aarch64)
-  OSNET_DEST="${WORK_DIR}/models/osnet/osnet_x0_25_market1501.onnx"
+  # ── OSNet-x1.0 (always active — cross-camera re-ID) ────────
+  # Runs inside the container where torch/torchreid are already installed
+  # (avoids multi-GB install on host and aarch64 wheel issues)
+  OSNET_DEST="${WORK_DIR}/models/osnet/osnet_x1_0_market1501.onnx"
   if [[ -f "$OSNET_DEST" ]]; then
     ok "OSNet ya descargado — skip"
   else
     mkdir -p "${WORK_DIR}/models/osnet"
     chown "$REAL_USER" "${WORK_DIR}/models/osnet"
-    log "Exportando OSNet-x0.25 dentro del container (torchreid pretrained Market-1501)..."
+    log "Exportando OSNet-x1.0 dentro del container (torchreid pretrained Market-1501)..."
     $COMPOSE_CMD -f "$COMPOSE_FILE" run --rm deepstream \
         python3 tools/download_models.py --reid \
       && ok "OSNet exportado" \

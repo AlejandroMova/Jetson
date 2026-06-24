@@ -665,6 +665,29 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 
 ---
 
+## Fine-tuning de OSNet-x1.0 con datos propios del cliente
+
+**Descripción:** Fine-tunear el checkpoint OSNet-x1.0 (Market-1501) con crops reales extraídos de las cámaras del cliente. El modelo genérico fue entrenado en datasets de benchmarks de investigación; las cámaras fijas de un comercio tienen condiciones mucho más acotadas (iluminación constante, ángulos fijos, ropa cotidiana), lo que hace que un modelo fine-tuneado en el dominio específico supere al genérico incluso con pocos datos.
+
+**Por qué sería mejor:** OSNet-x1.0 pre-entrenado alcanza ~94% Rank-1 en Market-1501 (benchmark de investigación), pero en producción con cámaras de DVR y condiciones reales el accuracy efectivo puede ser menor. Con 500–1000 pares etiquetados del propio cliente se puede obtener un modelo que supere ese número en el dominio real, reduciendo falsas identidades cross-cámara.
+
+**Reemplazaría:**
+- Archivo: `deploy/models/osnet/osnet_x1_0_market1501.onnx`
+- Descripción: el ONNX actual (pre-entrenado en Market-1501) se reemplaza por uno fine-tuneado en datos propios; la integración en `AppearanceWorker` no cambia.
+
+**Tech stack propuesto:**
+- Framework: FastReID (Meta AI Research, Apache 2.0) — zoo de modelos + pipeline de entrenamiento con triplet loss y batch hard mining
+- Datos: crops extraídos del tracker DeepStream + etiquetado manual de identidades entre cámaras (~500–1000 pares es suficiente para fine-tuning)
+- Export: `torch.onnx.export()` desde el checkpoint fine-tuneado, mismo formato que el actual (opset 11, input NCHW 3×256×128, output (batch, 512))
+- Entrenamiento: en máquina dev con GPU (RTX 3060+), no en el Jetson
+
+**Consideraciones:**
+- El etiquetado de pares es el cuello de botella: necesita que una persona aparezca en al menos dos cámaras y que un operador confirme que es la misma. Herramienta sugerida: script de CLI que muestre crops lado a lado y pida confirmación (s/n).
+- El fine-tuning no requiere datos de mil personas distintas — con 50–100 identidades únicas vistas en múltiples cámaras es suficiente para ajustar el espacio de embeddings al dominio.
+- El ONNX exportado es drop-in: reemplaza `osnet_x1_0_market1501.onnx` sin ningún cambio de código.
+- FastReID soporta exportar directamente desde su pipeline de entrenamiento con `--export-onnx`.
+- Esfuerzo estimado: 1 día de recolección de datos + etiquetado + 2–4 horas de entrenamiento.
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 #   0.60 → recommended: good recall with few false positives after (pad,track_id) fix
 #   0.55 → marginal; use only if 0.60 still misses cross-camera matches
 #   0.45 → too low: causes false positives (different people matching same global_id)
-SIMILARITY_THRESHOLD:      float = 0.75
+SIMILARITY_THRESHOLD:      float = 0.60
 PRESENCE_WINDOW_S:         float = 300.0  # 5 min — within this, camera switch = channel_change
 REID_TTL_S:                float = 3600.0 # 1 hour — global_id expires if unseen for this long
 SAVE_INTERVAL_S:           float = 30.0   # persist to disk at most every N seconds

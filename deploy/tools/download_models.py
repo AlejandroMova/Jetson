@@ -59,16 +59,17 @@ def _progress(block, block_size, total):
 
 def download_osnet(dest_dir: Path):
     """
-    OSNet-x0.25 (torchreid / KaiyangZhou), Apache 2.0.
+    OSNet-x1.0 (torchreid / KaiyangZhou), Apache 2.0.
     Input: NCHW float32 RGB ImageNet-normalized, 3×256×128.
     Output: (batch, 512) float32 embedding (AppearanceWorker L2-normalizes it).
 
-    Exported on-the-fly from torchreid pretrained Market-1501 weights.
-    Run this script natively on the Jetson (not inside Docker):
-      pip3 install torchreid
-      python3 tools/download_models.py --reid
+    OSNet-x1.0 achieves ~94% Rank-1 on Market-1501 vs ~82% for the x0.25 variant.
+    At 2.2M params it remains lightweight and fits on GPU alongside PeopleNet.
+
+    Must be exported inside the Docker container where torch/torchreid are installed:
+      docker compose run --rm deepstream python3 tools/download_models.py --reid
     """
-    dest = dest_dir / "osnet" / "osnet_x0_25_market1501.onnx"
+    dest = dest_dir / "osnet" / "osnet_x1_0_market1501.onnx"
     if dest.exists():
         logger.info("OSNet already exists — skipping.")
         return
@@ -79,13 +80,12 @@ def download_osnet(dest_dir: Path):
         import torchreid  # noqa: F401
     except ImportError as exc:
         logger.error("Missing dependency: %s", exc)
-        logger.error("Install with:  pip3 install torchreid")
-        logger.error("Then re-run outside Docker: python3 tools/download_models.py --reid")
+        logger.error("Run inside container: docker compose run --rm deepstream python3 tools/download_models.py --reid")
         sys.exit(1)
 
-    logger.info("Exporting OSNet-x0.25 from torchreid pretrained weights (Market-1501)...")
+    logger.info("Exporting OSNet-x1.0 from torchreid pretrained weights (Market-1501)...")
     try:
-        model = torchreid.models.build_model("osnet_x0_25", num_classes=1, pretrained=True)
+        model = torchreid.models.build_model("osnet_x1_0", num_classes=1, pretrained=True)
         model.eval()
         dummy = torch.randn(1, 3, 256, 128)
         torch.onnx.export(
@@ -129,7 +129,7 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Download NX optional model files")
     parser.add_argument("--reid", action="store_true",
-                        help="Download OSNet-x0.25 ONNX for cross-camera re-ID")
+                        help="Export OSNet-x1.0 ONNX for cross-camera re-ID")
     parser.add_argument("--fall-detection", action="store_true",
                         help="Download MoveNet ONNX for fall detection (Hogar only)")
     parser.add_argument("--all", action="store_true",

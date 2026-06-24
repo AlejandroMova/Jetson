@@ -1,7 +1,7 @@
 """
 appearance_worker.py — NX Computing AI | Cross-Camera Re-ID Worker
 
-Runs OSNet-x0.25 ONNX in a background thread to generate 512-dim L2-normalized
+Runs OSNet-x1.0 ONNX in a background thread to generate 512-dim L2-normalized
 appearance embeddings for each detected person. Used for cross-camera re-ID by the backend.
 
 Architecture: same non-blocking queue pattern as PoseWorker / NxApiClient.
@@ -12,10 +12,11 @@ Architecture: same non-blocking queue pattern as PoseWorker / NxApiClient.
 Input: BGR crop of any size (resized internally to 128×256)
 Output: 512-dim float32 vector, L2-normalized (cosine sim = dot product)
 
-Model: OSNet-x0.25 from torchreid (KaiyangZhou), Apache 2.0 license
+Model: OSNet-x1.0 from torchreid (KaiyangZhou), Apache 2.0 license
+       ~94% Rank-1 on Market-1501 (vs ~82% for x0.25). 2.2M params.
        Input: NCHW float32, RGB, ImageNet-normalized, 3×256×128
        Output: (1, 512) float32
-Download: python3 tools/download_models.py --reid
+Export: docker compose run --rm deepstream python3 tools/download_models.py --reid
 """
 import logging
 import queue
@@ -128,10 +129,17 @@ class AppearanceWorker:
             self._queue.task_done()
 
     def _load_model(self):
-        """Carga el modelo OSNet ONNX en CPU. Retorna la sesión ONNX o None si falla."""
+        """Load OSNet ONNX model. Returns the ONNX session or None on failure.
+
+        GPU is safe here because start() is always called after pipeline.set_state(PLAYING),
+        which means TensorRT has already initialized its CUDA context. ONNX Runtime will
+        share the same CUDA device without conflict. Falls back to CPU automatically if
+        GPU memory is insufficient.
+        """
         try:
             import onnxruntime as ort
-            providers = ["CPUExecutionProvider"]  # CPU para no competir con TRT por la GPU
+            # GPU first — TRT already owns the CUDA context by the time start() is called
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             sess = ort.InferenceSession(self._model_path, providers=providers)
             logger.info("OSNet ONNX loaded (providers: %s)", sess.get_providers())
             return sess

@@ -1095,7 +1095,7 @@ def init_workers(
     """
     global _face_recognizer, _appearance_worker, _reid_manager, _ws_client, _jetson_sync_client
 
-    osnet_path = str(Path(model_dir) / "osnet" / "osnet_x0_25_market1501.onnx")
+    osnet_path = str(Path(model_dir) / "osnet" / "osnet_x1_0_market1501.onnx")
     if Path(osnet_path).exists():
         # Deferred — AppearanceWorker/ReIdManager are optional; not installed if OSNet is absent.
         from appearance_worker import AppearanceWorker

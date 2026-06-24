@@ -159,7 +159,7 @@ Removidas del MVP por falta de modelos entrenados. Ver `Future.md` para el plan 
 | **PeopleNet v2.3.4** | ONNX → TRT INT8 | Detección de personas, bolsas, rostros class 2 (PGIE) | Siempre activo |
 | **ResNet-18 Pedestrian Attributes** | ONNX → TRT FP16 | Clasificación edad/género (SGIE) | `age_gender` |
 | **InsightFace buffalo_l (ArcFace)** | ONNX (CPU/GPU) | Embeddings faciales 512-dim para re-ID | `face_recognition` |
-| **OSNet-x0.25** | ONNX | Appearance vectors 512-dim para re-ID entre cámaras | Siempre activo (si existe) |
+| **OSNet-x1.0** | ONNX | Appearance vectors 512-dim para re-ID entre cámaras (~94% Rank-1 Market-1501) | Siempre activo (si existe) |
 
 ### Librerías Python
 | Librería | Uso |
@@ -595,7 +595,7 @@ Worker thread para reconocimiento facial. Carga `known_faces.json` (dos formatos
 Worker Socket.IO que mantiene conexión persistente al namespace `/jetson` del backend. Autentica con `X-API-Key` en el dict `auth` de Socket.IO. En `face_update` recibido: despacha `sync_callback(action, employee_id)` en hilo separado (sin bloquear el event loop). También dispara un sync en `on_connect` para sincronizar si el Jetson estuvo offline. Reconexión automática gestionada por python-socketio.
 
 **`appearance_worker.py`** (~139 líneas)
-Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x0.25 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Crop enviado al worker en 3 momentos: (1) primer frame del track, (2) cada 15 frames hasta recibir la primera embedding, (3) cada 90 frames después del primer match para mantener el DB fresco. El resultado es consumido y limpiado (`clear_result`) por `_handle_appearance_reid()` en `probes.py`.
+Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x1.0 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Usa `CUDAExecutionProvider` con fallback automático a CPU — GPU es seguro porque `start()` se llama después de `pipeline.set_state(PLAYING)`, cuando TRT ya inicializó su contexto CUDA. Crop enviado al worker en 3 momentos: (1) primer frame del track, (2) cada 15 frames hasta recibir la primera embedding, (3) cada 90 frames después del primer match para mantener el DB fresco. El resultado es consumido y limpiado (`clear_result`) por `_handle_appearance_reid()` en `probes.py`.
 
 **`reid_manager.py`** (~235 líneas)
 Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con **galería de embeddings**, timestamps y cámara actual. Cada `global_id` almacena hasta `GALLERY_MAX_SIZE=5` vectores que representan distintos ángulos/poses. El matching usa `max(query @ emb_i for emb_i in gallery)`. API pública:
