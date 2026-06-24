@@ -7,8 +7,12 @@ Usage:
   python tools/download_models.py --fall-detection
   python tools/download_models.py --reid --github-token <token>
   python tools/download_models.py --all --github-token <token>
+
+The GitHub token is extracted automatically by setup.sh from the git remote URL
+(the same token used to clone the repo). For manual runs, pass it with --github-token.
 """
 import argparse
+import json
 import logging
 import sys
 import urllib.request

@@ -78,11 +78,12 @@ StreamServer (:8080) consume camera_frame_queues y sirve /stream/<cam_id>
 > **Sin tiler.** El probe recibe frames RGBA full-res por cámara. En stream mode (`NX_STREAM_ENABLED=true`), el probe también dibuja bboxes sobre el frame y lo encola en `camera_frame_queues` para `StreamServer`.
 
 **Workers async (Python threads, no bloquean el pipeline):**
-- `AppearanceWorker` — OSNet-x0.25 ONNX, re-ID entre cámaras
 - `FaceRecognizer` — InsightFace buffalo_l, reconocimiento facial; claves UUID del backend
 - `JetsonSyncClient` — Socket.IO /jetson namespace; recibe face_update del backend y llama sync_from_backend()
 - `NxApiClient` — cola async para REST API backend
 - `WsPositionClient` — telemetría de posiciones / heatmaps en tiempo real
+
+> **OSNet re-ID:** los embeddings 512-dim se extraen directamente del SGIE `sgie-appearance` (gie-id=3) vía `NvDsInferTensorMeta` — síncronos, sin worker Python, sin queue. `ReIdManager` sigue corriendo en el probe thread.
 
 **Paquetes (definen qué capacidades se activan):**
 | Sector | Paquetes | Capacidades |
@@ -109,14 +110,14 @@ Identifica cuando la misma persona aparece en cámaras distintas usando embeddin
 - `person_entry` (`entry_type: "return"`) — misma persona, reapareció tras > 5 min de ausencia
 - `person_channel_change` — misma persona, cambió de cámara dentro de la ventana de presencia (≤5 min)
 
-La emisión de `person_entry` se **difiere** hasta que el embedding esté listo (deadline 30 frames / ~1 s a 30fps). Si el embedding no llega, se emite con `global_id: null`.
+La emisión de `person_entry` se **difiere** hasta que el embedding esté listo (deadline 30 frames / ~1 s a 30fps como fallback de seguridad). Con el SGIE el embedding llega en el mismo frame — el fallback solo aplica si el bbox nunca supera el mínimo de 32×32 px del SGIE.
 
-- **Embedding:** OSNet-x0.25 ONNX — vectores 512-dim L2-normalizados. `AppearanceWorker` (Python thread). Clave interna: `(pad_index, track_id)` — los track IDs son locales por cámara en DeepStream, por lo que la clave debe incluir el índice del stream.
+- **Embedding:** OSNet-x1.0 — vectores 512-dim L2-normalizados, extraídos **directamente del SGIE DeepStream** (gie-id=3) vía `NvDsInferTensorMeta` en el probe. Sin `AppearanceWorker`, sin Python thread, sin cola. DeepStream gestiona el crop y el engine TRT.
 - **Matching:** max-similitud coseno ≥ 0.55 sobre **galería de hasta 5 embeddings** por persona. `ReIdManager` — O(N×K) con K≤5, vectorizable con numpy. Nuevos ángulos se añaden a la galería solo si son suficientemente distintos a los existentes (sim < 0.85); cuando la galería está llena se reemplaza el miembro menos informativo.
 - **Same-camera re-detection:** si `channel_change` ocurre con `prev_camera == camera_id` (tracker pierde y re-detecta en la misma cámara), se demota a `person_return` para no emitir un evento de cambio de cámara espurio.
 - **Persistencia:** `deploy/reid_db.json` — sobrevive reinicios; TTL 1 hora sin actividad
 - **Ventana de presencia:** 5 min (configurable en `reid_manager.py` como `PRESENCE_WINDOW_S`)
-- Se activa automáticamente si el modelo existe en `models/osnet/`
+- Se activa automáticamente si el ONNX existe en `models/osnet/` (el engine TRT se compila en el primer arranque, ~2 min extra)
 
 ### Edad y Género (`age_gender`) — ✅ Activo
 Clasifica a cada persona detectada en una de 6 categorías: female_young, female_adult, female_senior, male_young, male_adult, male_senior. Requiere al menos 10 muestras del SGIE antes de confirmar la clasificación (sistema de votación para reducir falsos positivos).
@@ -159,12 +160,12 @@ Removidas del MVP por falta de modelos entrenados. Ver `Future.md` para el plan 
 | **PeopleNet v2.3.4** | ONNX → TRT INT8 | Detección de personas, bolsas, rostros class 2 (PGIE) | Siempre activo |
 | **ResNet-18 Pedestrian Attributes** | ONNX → TRT FP16 | Clasificación edad/género (SGIE) | `age_gender` |
 | **InsightFace buffalo_l (ArcFace)** | ONNX (CPU/GPU) | Embeddings faciales 512-dim para re-ID | `face_recognition` |
-| **OSNet-x1.0** | ONNX | Appearance vectors 512-dim para re-ID entre cámaras (~94% Rank-1 Market-1501) | Siempre activo (si existe) |
+| **OSNet-x1.0** | ONNX → TRT FP32 | Appearance vectors 512-dim para re-ID entre cámaras (~94% Rank-1 Market-1501) — SGIE gie-id=3 | Siempre activo (si ONNX existe) |
 
 ### Librerías Python
 | Librería | Uso |
 |----------|-----|
-| **onnxruntime** (GPU/aarch64) | Inferencia ONNX para OSNet, ArcFace |
+| **onnxruntime** (CPU/aarch64) | Inferencia ONNX para InsightFace ArcFace (face recognition) |
 | **insightface ≥ 0.7.3** | Pipeline de reconocimiento facial (detección + embedding) |
 | **opencv-python-headless** | Manipulación de imágenes, crops, resize |
 | **numpy** | Operaciones vectoriales, normalización de embeddings |
@@ -308,7 +309,7 @@ Criterios para evaluar nuevas tecnologías:
 Antes de implementar cualquier cambio, revisar:
 - **GPU memory**: ¿El nuevo modelo cabe junto con PeopleNet + tracker + SGIEs activos? (Orin Nano tiene 8GB unificados)
 - **NVDEC load**: ¿La resolución y cantidad de streams sigue dentro del límite documentado en `config_loader.py`?
-- **GIE unique IDs**: Cada nvinfer necesita un `gie-unique-id` único (1=PeopleNet, 2=AgeGender; el 3 está reservado para uso futuro — FaceDetectIR fue eliminado)
+- **GIE unique IDs**: Cada nvinfer necesita un `gie-unique-id` único (1=PeopleNet, 2=AgeGender, 3=OSNet appearance SGIE)
 - **Track ID namespace**: Los `track_id` son locales por cámara; el triplete `(jetson_id, camera_id, track_id)` es el key global
 - **Queue sizes**: Los workers tienen queues con límite; agregar más workers reduce throughput disponible
 - **Docker image size**: Agregar dependencias pesadas al `Dockerfile.jetson` aumenta tiempo de rebuild en campo
@@ -549,8 +550,8 @@ Cada vez que se agrega, elimina o cambia un campo configurable en `config_loader
 
 ### `deploy/pipelines/` — Núcleo del pipeline
 
-**`app.py`** (~270 líneas)
-Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **Sin tiler** — el path siempre es `caps_rgba → probe → fakesink`; el probe recibe frames RGBA full-res por cámara. Sin `nvdsosd`. Maneja el ciclo de vida de workers async (start/stop). Si `NX_STREAM_ENABLED=true`: inicializa `camera_frame_queues` y arranca `StreamServer` en :8080 antes de iniciar el pipeline.
+**`app.py`** (~300 líneas)
+Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **Sin tiler** — el path siempre es `caps_rgba → probe → fakesink`; el probe recibe frames RGBA full-res por cámara. Sin `nvdsosd`. Maneja el ciclo de vida de workers async (start/stop). Si `NX_STREAM_ENABLED=true`: inicializa `camera_frame_queues` y arranca `StreamServer` en :8080 antes de iniciar el pipeline. El OSNet SGIE (`sgie-appearance`, gie-id=3) se agrega condicionalmente si `models/osnet/osnet_x1_0_market1501.onnx` existe en disco — independiente de `cfg.pipeline`.
 
 **`app_video_testing.py`** (~230 líneas)
 Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + decodebin` en lugar de `rtspsrc`. `decodebin` detecta el codec automáticamente. Las dimensiones del streammux se detectan con `cv2.VideoCapture` antes de construir el pipeline. Acepta `--capabilities`, `--client`, `--input` y `--no-loop` por CLI. Sink: siempre `fakesink` (mismo que producción). Si `NX_STREAM_ENABLED=true`: arranca `StreamServer` en :8080 para ver la inferencia sobre el video.
@@ -558,7 +559,8 @@ Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + decodebin` en 
 **`probes.py`** (~900 líneas)
 El motor central de analytics. Probe único (`osd_sink_pad_buffer_probe`) en `caps_rgba src-pad` (frames full-res por cámara, sin tiler).
 - `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea). Soporta callbacks de éxito por endpoint (`register_success_callback`) invocados desde el worker thread cuando el backend confirma 2xx.
-- `_AgeGenderHandler`: acumula 10 votes del SGIE antes de confirmar clasificación; emite `person_classified`
+- `_AgeGenderHandler`: acumula 10 votes del SGIE (gie-id=2) antes de confirmar clasificación; emite `person_classified`
+- `_extract_osnet_embedding(obj_meta)`: lee el tensor 512-dim del SGIE OSNet (gie-id=3) desde `NvDsInferTensorMeta` — síncrono, sin thread. `_handle_appearance_reid()` lo llama por cada persona visible y lo pasa a `ReIdManager`.
 - `_FaceRecognitionHandler`: cruza detecciones de cara de PeopleNet (class_id=2) con el `FaceRecognizer`; emite `employee_seen/presence/exit` o `unknown_person_alert`
 - `osd_sink_pad_buffer_probe`: probe único. Lazy frame read: GPU→CPU solo cuando workers necesitan pixels, `NX_STREAM_ENABLED=true`, o la escena está vacía y toca capturar reference frame (a lo sumo cada 30 s). Al final del loop de cámara, si stream mode activo: dibuja bboxes+labels con OpenCV y empuja a `camera_frame_queues[camera_id]`.
 - **Reference frame — retry + cambio visual + filtro de brillo**: se evalúa cuando no hay personas visibles (`visible_ids` vacío) y el frame tiene suficiente iluminación (`_frame_is_bright_enough()`, media ≥ `REFERENCE_FRAME_MIN_BRIGHTNESS=30.0`/255 — rechaza frames nocturnos). El primer frame válido se envía y se reintenta cada `REFERENCE_FRAME_RETRY_SECS=30s` hasta confirmar 2xx. Una vez confirmado, solo se reenvía si han pasado `REFERENCE_FRAME_MIN_INTERVAL_SECS=86400s` (24 h) Y `_scene_changed()` detecta ≥ `REFERENCE_FRAME_CHANGE_THRESHOLD=0.15` (15 %) de diferencia normalizada por iluminación. **Importante:** el lazy frame read solo decodifica el frame cuando las condiciones de tiempo se cumplen (≥30 s sin confirmar, ó ≥24 h desde último confirmado) — no en cada frame vacío. Objetos no-persona detectados por PeopleNet (bolsos, caras sin cuerpo, `PGIE_CLASS_BAG`/`PGIE_CLASS_FACE`) no bloquean el reference frame. El backend guarda historial completo (INSERT, no UPSERT) para que las consultas históricas de heatmap usen el fondo correcto para cualquier período.
@@ -594,8 +596,6 @@ Worker thread para reconocimiento facial. Carga `known_faces.json` (dos formatos
 **`jetson_sync_client.py`** (~100 líneas)
 Worker Socket.IO que mantiene conexión persistente al namespace `/jetson` del backend. Autentica con `X-API-Key` en el dict `auth` de Socket.IO. En `face_update` recibido: despacha `sync_callback(action, employee_id)` en hilo separado (sin bloquear el event loop). También dispara un sync en `on_connect` para sincronizar si el Jetson estuvo offline. Reconexión automática gestionada por python-socketio.
 
-**`appearance_worker.py`** (~139 líneas)
-Worker thread para generación de embeddings de apariencia. Ejecuta OSNet-x1.0 ONNX (entrada 128×256), genera vector 512-dim L2-normalizado por persona. Usa `CUDAExecutionProvider` con fallback automático a CPU — GPU es seguro porque `start()` se llama después de `pipeline.set_state(PLAYING)`, cuando TRT ya inicializó su contexto CUDA. Crop enviado al worker en 3 momentos: (1) primer frame del track, (2) cada 15 frames hasta recibir la primera embedding, (3) cada 90 frames después del primer match para mantener el DB fresco. El resultado es consumido y limpiado (`clear_result`) por `_handle_appearance_reid()` en `probes.py`.
 
 **`reid_manager.py`** (~235 líneas)
 Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con **galería de embeddings**, timestamps y cámara actual. Cada `global_id` almacena hasta `GALLERY_MAX_SIZE=5` vectores que representan distintos ángulos/poses. El matching usa `max(query @ emb_i for emb_i in gallery)`. API pública:
@@ -660,6 +660,11 @@ Script daemon instalado por `setup.sh` como servicio systemd `nx-dvr-watchdog` e
 **`resnet_age_gender_FB2/`**
 - `config_infer.txt`: Config para SGIE de edad/género. `gie-unique-id=2`, FP16, opera sobre `class-ids=0` (personas) del PGIE.
 - `custom_softmax_parser.so`: Plugin C++ compilado por `docker-entrypoint.sh` para parsear salida softmax del clasificador.
+
+**`osnet/`**
+- `config_infer_sgie_osnet.txt`: Config para SGIE OSNet appearance. `gie-unique-id=3`, FP32, `process-mode=2`, opera sobre `class-ids=0` (personas) del PGIE. `output-tensor-meta=1` expone el tensor para lectura en el probe. El engine `.trt` se genera automáticamente en el primer arranque.
+- `osnet_x1_0_market1501.onnx`: Modelo descargado por `setup.sh` vía `download_models.py --reid`. No está en git.
+- `osnet_x1_0_market1501.trt`: Engine TRT compilado por DeepStream al arrancar por primera vez. No está en git.
 
 **`facedetect_ir/`** — ⚠️ No usado actualmente. El SGIE FaceDetectIR fue eliminado; la detección de rostros usa PeopleNet class_id=2 directamente. El directorio y su `config_infer.txt` se conservan como referencia pero no se cargan en `app.py`.
 

@@ -167,7 +167,7 @@ class ReIdManager:
                 logger.debug("ReID: new person global_id=%s sim_floor=%.3f", gid, best_sim)
                 self._maybe_save()
                 return gid, EVENT_NEW_PERSON, None
-
+            # TODO revisar si no poner esto en un else, porque acabamos de poner el tiempo que lo encontramos, no tiene sentido tiempo absent de una persona nueva
             entry = self._db[best_gid]
             time_absent = now - entry.last_seen_ts
             prev_camera  = entry.camera_id

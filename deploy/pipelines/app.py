@@ -54,7 +54,8 @@ _NVINFER_PATH_KEYS = frozenset({
     "int8-calib-file", "tlt-encoded-model", "custom-lib-path",
 })
 SGIE_CONFIGS = {
-    "age_gender":      str(_MODELS_DIR / "resnet_age_gender_FB2/config_infer.txt"),
+    "age_gender":       str(_MODELS_DIR / "resnet_age_gender_FB2/config_infer.txt"),
+    "appearance":       str(_MODELS_DIR / "osnet/config_infer_sgie_osnet.txt"),
     "face_recognition": None,  # PeopleNet class 2 (face) detections fed directly to worker
 }
 
@@ -379,6 +380,28 @@ def main():
             sgie.set_property("interval", cfg.sgie_interval)
         sgie_elements.append(sgie)
         logger.info("SGIE loaded: %s → %s", cap, cfg_path)
+
+    # ── OSNet SGIE (appearance re-ID) — activo si el ONNX existe en disco ────────
+    # No es una capacidad en cfg.pipeline; se activa igual que hoy: si el modelo está presente.
+    _osnet_onnx = _MODELS_DIR / "osnet" / "osnet_x1_0_market1501.onnx"
+    _osnet_cfg  = _MODELS_DIR / "osnet" / "config_infer_sgie_osnet.txt"
+    if _osnet_onnx.exists() and _osnet_cfg.exists():
+        sgie_appearance = Gst.ElementFactory.make("nvinfer", "sgie-appearance")
+        if not sgie_appearance:
+            logger.error("Could not create nvinfer element for OSNet SGIE.")
+            sys.exit(1)
+        sgie_appearance.set_property("config-file-path", str(_osnet_cfg))
+        if cfg.sgie_interval >= 0:
+            sgie_appearance.set_property("interval", cfg.sgie_interval)
+        sgie_elements.append(sgie_appearance)
+        logger.info("OSNet SGIE cargado (gie-id=3, appearance re-ID) → %s", _osnet_cfg)
+    else:
+        logger.warning(
+            "OSNet ONNX no encontrado en %s — appearance SGIE desactivado. "
+            "Correr: docker compose run --rm deepstream "
+            "python3 tools/download_models.py --reid --github-token $TOKEN",
+            _osnet_onnx,
+        )
 
     if not sgie_elements:
         logger.info("No SGIEs loaded — running people_counting only")

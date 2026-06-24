@@ -6,7 +6,8 @@ Imported by app.py and app_video_testing.py.
 Architecture:
   PGIE (PeopleNet, gie-id=1) detects person/bag/face in the full frame.
   Optional handlers (one per active capability) process each detected person.
-  FaceRecognizer and AppearanceWorker run on background threads (queue+thread pattern).
+  FaceRecognizer runs on a background thread (queue+thread pattern).
+  OSNet embeddings are read synchronously from the SGIE (gie-id=3) via NvDsInferTensorMeta.
 
 Stream mode (NX_STREAM_ENABLED=true):
   The pipeline inserts nvmultistreamtiler (640x360) after the analytics probe.
@@ -20,6 +21,7 @@ How to add a new model:
   4. Add the entry to SGIE_CONFIGS in app.py (or None if it's a Python worker).
 """
 import base64
+import ctypes
 import json
 import logging
 import os
@@ -132,6 +134,7 @@ def _camera_id_for(pad_index: int) -> str:
 # ── GIE unique-ids ────────────────────────────────────────────────────────────
 PGIE_UNIQUE_ID: int = 1      # PeopleNet
 SGIE_AGE_GENDER_ID: int = 2  # ResNet-18 Pedestrian Attr
+OSNET_GIE_ID: int = 3        # OSNet-x1.0 appearance SGIE — 512-dim embedding per person
 
 # ── PGIE class ids ────────────────────────────────────────────────────────────
 PGIE_CLASS_PERSON: int = 0
@@ -1066,7 +1069,6 @@ def _on_reference_frame_confirmed(payload: dict) -> None:
 # ── Async worker globals + lifecycle ──────────────────────────────────────────
 
 _face_recognizer = None     # FaceRecognizer (InsightFace ArcFace)
-_appearance_worker = None   # AppearanceWorker — 512-dim embeddings per person
 _reid_manager = None        # ReIdManager — local cross-camera identity DB
 _ws_client = None           # WsPositionClient (position/heatmap WebSocket)
 _jetson_sync_client = None  # JetsonSyncClient (Socket.IO face roster sync)
@@ -1088,25 +1090,24 @@ def init_workers(
     """Instantiate async workers based on active pipeline capabilities.
 
     Workers initialized per capability:
-      - AppearanceWorker + ReIdManager: always (if OSNet model exists on disk)
+      - ReIdManager: always (if OSNet ONNX exists on disk — SGIE handles the inference)
       - FaceRecognizer: if 'face_recognition' is in pipeline_capabilities
       - WsPositionClient: if ws_base_url is configured (heatmaps)
       - JetsonSyncClient: if face_recognition is active and API_BASE_URL is set
     """
-    global _face_recognizer, _appearance_worker, _reid_manager, _ws_client, _jetson_sync_client
+    global _face_recognizer, _reid_manager, _ws_client, _jetson_sync_client
 
     osnet_path = str(Path(model_dir) / "osnet" / "osnet_x1_0_market1501.onnx")
     if Path(osnet_path).exists():
-        # Deferred — AppearanceWorker/ReIdManager are optional; not installed if OSNet is absent.
-        from appearance_worker import AppearanceWorker
+        # ReIdManager stores and matches 512-dim embeddings across cameras.
+        # The embeddings themselves come from the OSNet SGIE (app.py), not a Python worker.
         from reid_manager import ReIdManager
-        _appearance_worker = AppearanceWorker(osnet_path)
         reid_db_path = str(Path(model_dir).parent / "reid_db.json")
         _reid_manager = ReIdManager(db_path=reid_db_path, gallery_max_size=reid_gallery_size)
         logger.info("ReIdManager active — DB: %s", reid_db_path)
     else:
-        logger.warning("OSNet model not found at %s — appearance vectors and local ReID disabled. "
-                       "Run: python3 tools/download_models.py --reid", osnet_path)
+        logger.warning("OSNet model not found at %s — appearance SGIE and local ReID disabled. "
+                       "Run: python3 tools/download_models.py --reid --github-token $TOKEN", osnet_path)
 
     if "face_recognition" in pipeline_capabilities:
         # Deferred — InsightFace is a large optional dependency not needed in other packages.
@@ -1147,8 +1148,6 @@ def init_workers(
 
 def start_workers() -> None:
     """Start all workers. Call after pipeline.set_state(PLAYING)."""
-    if _appearance_worker is not None:
-        _appearance_worker.start()
     if _face_recognizer is not None:
         _face_recognizer.start()
     if _ws_client is not None:
@@ -1161,8 +1160,6 @@ def stop_workers() -> None:
     """Stop all workers and persist ReIdManager state to disk."""
     if _jetson_sync_client is not None:
         _jetson_sync_client.stop()
-    if _appearance_worker is not None:
-        _appearance_worker.stop()
     if _reid_manager is not None:
         _reid_manager.flush()  # write reid_db.json before shutdown
     if _face_recognizer is not None:
@@ -1337,8 +1334,6 @@ def _expire_lost_tracks(pad_index: int, frame_num: int, visible_ids: Set[int]) -
         _crop_counts.pop(track_id, None)
         _crop_last_frame.pop(track_id, None)
         _track_labels.pop(track_id, None)
-        if _appearance_worker is not None:
-            _appearance_worker.clear_result(track_id, pad_index)
         for handler in _active_handlers:
             _cleanup_handler_cache(handler, track_id)
         logger.debug("Track lost: pad=%d track=%d dwell=%.1fs global=%s",
@@ -1353,6 +1348,49 @@ def _cleanup_handler_cache(handler, track_id: int) -> None:
             d.pop(track_id, None)
 
 
+def _extract_osnet_embedding(obj_meta) -> Optional[np.ndarray]:
+    """Read the 512-dim OSNet embedding from the SGIE tensor attached to this object.
+
+    DeepStream attaches one NvDsUserMeta per SGIE to each detected object when
+    output-tensor-meta=1 is set in the nvinfer config. Each entry in obj_user_meta_list
+    has a meta_type field — NVDSINFER_TENSOR_OUTPUT_META identifies it as nvinfer output.
+    We additionally filter by unique_id == OSNET_GIE_ID (3) to distinguish OSNet from
+    other SGIEs (AgeGender is gie-id=2 and also attaches tensor metadata).
+
+    Returns an L2-normalized float32 (512,) vector, or None if:
+    - The SGIE has not yet processed this object (first frame latency).
+    - The bbox is smaller than input-object-min-width/height=32 in the nvinfer config.
+    """
+    l_user = obj_meta.obj_user_meta_list
+    while l_user is not None:
+        try:
+            user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+        except StopIteration:
+            break
+
+        # Check that this user metadata entry is an nvinfer tensor output
+        if user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
+            tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+
+            # Filter by gie-unique-id to get only the OSNet output (not AgeGender)
+            if tensor_meta.unique_id == OSNET_GIE_ID:
+                # Layer 0 is the single output blob "output" — shape (512,) per object
+                layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
+                ptr = ctypes.cast(
+                    pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float)
+                )
+                # Copy out of DeepStream-managed memory before the buffer is recycled
+                emb = np.ctypeslib.as_array(ptr, shape=(512,)).copy()
+                norm = np.linalg.norm(emb)
+                return emb / norm if norm > 0 else emb
+
+        try:
+            l_user = l_user.next
+        except StopIteration:
+            break
+    return None
+
+
 def _handle_appearance_reid(
     track_key: Tuple[int, int],
     p_track_id: int,
@@ -1361,93 +1399,82 @@ def _handle_appearance_reid(
     confidence: float,
     is_entry_exit_cam: bool,
     frame_num: int,
-    frame_np,
     pad_index: int,
+    obj_meta,
 ) -> None:
-    """Drive AppearanceWorker + ReIdManager for a visible track.
+    """Drive ReIdManager for a visible track using the OSNet SGIE embedding.
 
-    With ReID active: defers person_entry until the embedding is ready, then emits
-    person_entry (new/return) or person_channel_change based on the match result.
-    Without ReID: sends the appearance vector to the backend for server-side re-ID.
+    Reads the 512-dim appearance vector synchronously from NvDsInferTensorMeta —
+    no background thread, no queue, no frame_np copy. The embedding arrives in the
+    same frame as the detection (SGIE runs before the probe). Defers person_entry
+    until the first embedding arrives; falls back after ENTRY_EMIT_DEADLINE_FRAMES
+    if the SGIE never fires (bbox consistently below min-width/height threshold).
     """
-    if _appearance_worker is None:
+    if _reid_manager is None:
         return
 
     state = _active_tracks[track_key]
 
-    # ── Consume available embedding ───────────────────────────────────────────
-    vec = _appearance_worker.get_result(p_track_id, pad_index)
+    # ── Read embedding from OSNet SGIE metadata (synchronous) ─────────────────
+    # The SGIE runs before the probe in the GStreamer pipeline, so the tensor is
+    # already attached to obj_meta when we get here. Returns None if the bbox was
+    # below the min-size threshold in the nvinfer config (32×32 px).
+    vec = _extract_osnet_embedding(obj_meta)
+
     if vec is not None:
-        _appearance_worker.clear_result(p_track_id, pad_index)
-
         if not state.appearance_sent:
+            # ── First embedding for this track — run ReID match ───────────────
+            # match_or_create() compares vec against the gallery and returns:
+            #   global_id  — cross-camera UUID for this person
+            #   event_type — "new" | "person_return" | "channel_change"
+            #   prev_camera — camera where this person was last seen (or None)
             state.appearance_sent = True
+            global_id, event_type, prev_camera = _reid_manager.match_or_create(
+                vec, camera_id
+            )
+            state.global_id = global_id
+            logger.info("ReID track=%d cam=%s → %s gid=%s prev=%s",
+                        p_track_id, camera_id, event_type, global_id, prev_camera)
+            _slog(
+                f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
+                f"{_C.get('bold', '')}DETECCIÓN{_C.get('reset', '')}  ",
+                f"track={p_track_id:<4} ",
+                f"gid={_C.get('green', '')}{global_id[:8]}{_C.get('reset', '')}  ",
+                f"tipo={_C.get('yellow', '')}{event_type}{_C.get('reset', '')}",
+                f"  prev={prev_camera}" if prev_camera else "",
+            )
 
-            if _reid_manager is not None:
-                global_id, event_type, prev_camera = _reid_manager.match_or_create(
-                    vec, camera_id
-                )
-                state.global_id = global_id
-                logger.info("ReID track=%d cam=%s → %s gid=%s prev=%s",
-                            p_track_id, camera_id, event_type, global_id, prev_camera)
-                _slog(
-                    f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
-                    f"{_C.get('bold', '')}DETECCIÓN{_C.get('reset', '')}  ",
-                    f"track={p_track_id:<4} ",
-                    f"gid={_C.get('green', '')}{global_id[:8]}{_C.get('reset', '')}  ",
-                    f"tipo={_C.get('yellow', '')}{event_type}{_C.get('reset', '')}",
-                    f"  prev={prev_camera}" if prev_camera else "",
-                )
+            # Same-camera re-detection: demote to person_return to avoid a spurious
+            # channel_change when the tracker loses and re-detects on the same camera.
+            if event_type == "channel_change" and prev_camera == camera_id:
+                event_type = "person_return"
 
-                # Same-camera re-detection: demote to person_return to avoid a spurious
-                # channel_change when the tracker loses and re-detects on the same camera.
-                if event_type == "channel_change" and prev_camera == camera_id:
-                    event_type = "person_return"
+            if not state.entry_emitted:
+                state.entry_emitted = True
+                if event_type == "channel_change":
+                    api_client.post_person_channel_change(
+                        camera_id, p_track_id, bbox, confidence,
+                        global_id, prev_camera, is_entry_exit_cam,
+                    )
+                else:
+                    api_client.post_person_entry(
+                        camera_id, p_track_id, bbox, confidence,
+                        is_entry_exit_cam,
+                        global_id=global_id,
+                        is_return=(event_type == "person_return"),
+                    )
+                    _get_analytics(pad_index)["person_count"] += 1
 
-                if not state.entry_emitted:
-                    state.entry_emitted = True
-                    if event_type == "channel_change":
-                        api_client.post_person_channel_change(
-                            camera_id, p_track_id, bbox, confidence,
-                            global_id, prev_camera, is_entry_exit_cam,
-                        )
-                    else:
-                        api_client.post_person_entry(
-                            camera_id, p_track_id, bbox, confidence,
-                            is_entry_exit_cam,
-                            global_id=global_id,
-                            is_return=(event_type == "person_return"),
-                        )
-                        _get_analytics(pad_index)["person_count"] += 1
-            else:
-                # Legacy: send vector to backend for server-side re-ID.
-                api_client.post_person_appearance(camera_id, p_track_id, vec.tolist())
-
-        elif state.global_id is not None and _reid_manager is not None:
-            # Subsequent embeddings — update the gallery to keep the vector fresh.
+        elif state.global_id is not None and frame_num % 90 == 0:
+            # ── Subsequent frames — refresh the gallery periodically ──────────
+            # Adds new angles/poses to the gallery so cross-camera matching stays
+            # accurate as lighting or position changes over time.
             _reid_manager.update_embedding(state.global_id, vec)
 
-    # ── Enqueue crop for the appearance worker ────────────────────────────────
-    if (frame_np is not None
-            and bbox["width"] >= CROP_MIN_WIDTH
-            and bbox["height"] >= CROP_MIN_HEIGHT):
-        needs_crop = (
-            frame_num == state.first_frame
-            or (not state.appearance_sent and frame_num % 15 == 0)
-            or (state.appearance_sent and state.global_id is not None and frame_num % 90 == 0)
-        )
-        if needs_crop:
-            crop = frame_np[
-                bbox["top"]:bbox["top"] + bbox["height"],
-                bbox["left"]:bbox["left"] + bbox["width"],
-            ]
-            if crop.size > 0:
-                _appearance_worker.enqueue(crop, p_track_id, pad_index, frame_num)
-
-    # ── Deadline fallback: emit entry if embedding never arrived ──────────────
-    if (_reid_manager is not None
-            and not state.entry_emitted
-            and frame_num >= state.entry_deadline):
+    # ── Deadline fallback: emit entry if SGIE never returned an embedding ─────
+    # Covers the edge case where the person's bbox never met the min-size threshold
+    # (32×32 px). person_entry goes out without global_id rather than never going out.
+    if not state.entry_emitted and frame_num >= state.entry_deadline:
         state.entry_emitted = True
         api_client.post_person_entry(
             camera_id, p_track_id,
@@ -1504,7 +1531,8 @@ def osd_sink_pad_buffer_probe(_pad, info):
             continue
 
         # ── Lazy frame read ───────────────────────────────────────────────────
-        # GPU->CPU copy only when face_recognizer or appearance_worker needs crops.
+        # GPU->CPU copy only when face_recognizer needs crops (for InsightFace embedding).
+        # OSNet embeddings come from the SGIE directly — no pixel copy needed for ReID.
         # In stream mode the tiled frame is read by Probe B from the tiler output, not here.
         frame_np = None
         _needs_pixel = False
@@ -1512,17 +1540,6 @@ def osd_sink_pad_buffer_probe(_pad, info):
         if frame_meta.num_obj_meta > 0:
             if _face_recognizer is not None:
                 _needs_pixel = True
-            if not _needs_pixel and _appearance_worker is not None:
-                n_persons_in_frame = sum(
-                    1 for om in _iter_pyds_list(frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast)
-                    if int(om.class_id) == PGIE_CLASS_PERSON
-                )
-                n_known = sum(1 for k in _active_tracks if k[0] == pad_index)
-                _needs_pixel = (
-                    n_persons_in_frame > n_known
-                    or any(not s.appearance_sent
-                           for k, s in _active_tracks.items() if k[0] == pad_index)
-                )
 
         # Empty scene: decode pixels only when a reference frame capture is due.
         # Without this check frame_np stays None and no reference frame is ever sent.
@@ -1610,7 +1627,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
             _handle_appearance_reid(
                 track_key, p_track_id, camera_id, bbox,
                 float(obj_meta.confidence), is_entry_exit_cam,
-                frame_num, frame_np, pad_index,
+                frame_num, pad_index, obj_meta,
             )
 
             # OSD label: short display number once ReID resolves, "..." while waiting.
