@@ -36,12 +36,13 @@ logger = logging.getLogger(__name__)
 
 # ── Tuneable constants ──────────────────────────────────────────────────────────
 # Cosine similarity threshold for cross-camera matching (dot product on L2-normalised vecs).
-# Tuning guide for OSNet-x0.25 on DVR sub-stream (960×544):
-#   0.65 → very strict, misses real matches (original value, pre-fix)
-#   0.60 → recommended: good recall with few false positives after (pad,track_id) fix
-#   0.55 → marginal; use only if 0.60 still misses cross-camera matches
-#   0.45 → too low: causes false positives (different people matching same global_id)
-SIMILARITY_THRESHOLD:      float = 0.60
+# Tuning guide for OSNet-x1.0 on DVR sub-stream:
+#   (values below were calibrated for x0.25 — x1.0 may need re-calibration)
+#   0.65 → very strict, misses real matches
+#   0.60 → too strict for x1.0 on sub-stream (misses same-person returns)
+#   0.50 → current: good balance for x1.0; reduce to 0.45 if still missing matches
+#   0.40 → too low: false positives (different people matching same global_id)
+SIMILARITY_THRESHOLD:      float = 0.50
 PRESENCE_WINDOW_S:         float = 300.0  # 5 min — within this, camera switch = channel_change
 REID_TTL_S:                float = 3600.0 # 1 hour — global_id expires if unseen for this long
 SAVE_INTERVAL_S:           float = 30.0   # persist to disk at most every N seconds
@@ -164,7 +165,8 @@ class ReIdManager:
                     last_seen_ts=now,
                     camera_id=camera_id,
                 )
-                logger.debug("ReID: new person global_id=%s sim_floor=%.3f", gid, best_sim)
+                logger.info("ReID: new_person gid=%s best_sim=%.3f (no match below threshold=%.2f)",
+                            gid, best_sim, SIMILARITY_THRESHOLD)
                 self._maybe_save()
                 return gid, EVENT_NEW_PERSON, None
             # TODO revisar si no poner esto en un else, porque acabamos de poner el tiempo que lo encontramos, no tiene sentido tiempo absent de una persona nueva
@@ -182,8 +184,8 @@ class ReIdManager:
                 event = EVENT_PERSON_RETURN
                 entry.visit_count += 1
 
-            logger.debug(
-                "ReID: %s global_id=%s sim=%.3f absent=%.0fs cam=%s→%s gallery=%d%s",
+            logger.info(
+                "ReID: %s gid=%s sim=%.3f absent=%.0fs cam=%s→%s gallery=%d%s",
                 event, best_gid, best_sim, time_absent, prev_camera, camera_id,
                 len(entry.gallery), " +angle" if added else "",
             )
