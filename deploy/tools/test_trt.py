@@ -7,7 +7,13 @@ logger = trt.Logger(trt.Logger.WARNING)
 builder = trt.Builder(logger)
 config = builder.create_builder_config()
 config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 28)
-print('FP32 mode')
+# Disable cuDNN (Cask) tactics — they fail on Jetson TRT 10.3 with this model.
+# Force cuBLAS + cuBLAS-LT only, which are reliable on Jetson unified memory.
+config.set_tactic_sources(
+    1 << int(trt.TacticSource.CUBLAS) |
+    1 << int(trt.TacticSource.CUBLAS_LT)
+)
+print('FP32 mode, cuBLAS tactics only')
 network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
 parser = trt.OnnxParser(network, logger)
 with open('/nx_tech/models/osnet/osnet_x1_0_market1501.onnx', 'rb') as f:
