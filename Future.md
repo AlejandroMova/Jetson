@@ -665,6 +665,29 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 
 ---
 
+## Descarga automática de OSNet desde GitHub Releases privado
+
+**Descripción:** `download_models.py --reid` actualmente falla con HTTP 404 porque la URL directa de GitHub (`releases/download/<tag>/<file>`) no funciona para repos privados aunque se pase token. La solución confirmada es usar la API de GitHub para obtener la URL real del asset y descargar desde ahí.
+
+**Flujo confirmado que funciona (verificado con curl):**
+1. `GET https://api.github.com/repos/AlejandroMova/NX-JETSON/releases/tags/models-v1` con `Authorization: token <token>` → obtiene `asset["url"]` = `https://api.github.com/repos/.../releases/assets/456165693`
+2. `GET <asset_url>` con `Authorization: token <token>` y `Accept: application/octet-stream` → GitHub redirige a S3 pre-signed URL → descarga el archivo (~8.4 MB en 1s)
+
+**El token** se extrae automáticamente del remote de git en `setup.sh`:
+```bash
+GITHUB_TOKEN=$(git -C "${WORK_DIR}" remote get-url origin | sed -n 's|https://\([^@]*\)@.*|\1|p')
+python3 "${WORK_DIR}/tools/download_models.py" --reid --github-token "$GITHUB_TOKEN"
+```
+
+**Reemplazaría:**
+- Archivo: `deploy/tools/download_models.py`
+- Función: `_download()` (actualmente usa `urllib.request.urlretrieve` directo con la URL de GitHub que da 404)
+- Cambio: agregar `import json`; nueva función `_find_github_asset_url(owner, repo, tag, filename, token)`; nueva función `_download_github_private(asset_api_url, dest, label, token)`; actualizar `download_osnet()` para usarlas
+
+**Consideraciones:** El token debe tener scope `repo` (lectura de releases privados). Si el repo se hace público en el futuro, se puede volver a la URL directa y eliminar la dependencia del token. Esfuerzo estimado: 30 min.
+
+---
+
 ## Fine-tuning de OSNet-x1.0 con datos propios del cliente
 
 **Descripción:** Fine-tunear el checkpoint OSNet-x1.0 (Market-1501) con crops reales extraídos de las cámaras del cliente. El modelo genérico fue entrenado en datasets de benchmarks de investigación; las cámaras fijas de un comercio tienen condiciones mucho más acotadas (iluminación constante, ángulos fijos, ropa cotidiana), lo que hace que un modelo fine-tuneado en el dominio específico supere al genérico incluso con pocos datos.
