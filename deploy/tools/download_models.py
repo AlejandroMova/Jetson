@@ -5,8 +5,8 @@ Downloads optional model files that are not tracked in git.
 
 Usage:
   python tools/download_models.py --fall-detection
-  python tools/download_models.py --reid
-  python tools/download_models.py --all
+  python tools/download_models.py --reid --github-token <token>
+  python tools/download_models.py --all --github-token <token>
 """
 import argparse
 import logging
@@ -21,43 +21,65 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODELS_DIR = _REPO_ROOT / "models"
 
 
-def _download(url: str, dest: Path, label: str):
-    """Descarga un archivo desde `url` a `dest`, mostrando progreso en consola.
+def _download(url: str, dest: Path, label: str, token: str = ""):
+    """Download a file from `url` to `dest`, showing progress.
 
-    Idempotente: si el archivo ya existe, lo omite sin error.
-    Si la descarga falla, elimina el archivo parcial y sale con código 1
-    para que setup.sh detecte el fallo y no continúe con un modelo corrupto.
+    Idempotent: skips if the file already exists.
+    Exits with code 1 on failure so setup.sh does not continue with a corrupt model.
+
+    If `token` is provided it is sent as a GitHub Bearer token — required for
+    assets hosted in private GitHub Releases. The token is the same one used to
+    clone the repo (extracted automatically from the git remote URL in setup.sh).
     """
-    dest.parent.mkdir(parents=True, exist_ok=True)  # crear directorios intermedios si no existen
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
-    # Si ya descargamos este modelo antes, no volver a descargar
     if dest.exists():
         logger.info("%s already exists — skipping.", dest.name)
         return
 
     logger.info("Downloading %s ...", label)
     try:
-        # urlretrieve llama a _progress en cada bloque recibido
-        urllib.request.urlretrieve(url, dest, reporthook=_progress)
-        print()  # nueva línea tras la barra de progreso inline
+        if token:
+            # Private GitHub Release: send auth header, then follow redirect to S3
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/octet-stream",
+                },
+            )
+            with urllib.request.urlopen(req) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                with open(dest, "wb") as f:
+                    while chunk := resp.read(65536):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = min(100, downloaded * 100 // total)
+                            print(f"\r  {pct}%", end="", flush=True)
+            print()
+        else:
+            # Public URL — use urlretrieve for simpler progress reporting
+            urllib.request.urlretrieve(url, dest, reporthook=_progress)
+            print()
+
         logger.info("Saved: %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
     except Exception as e:
         logger.error("Download failed: %s", e)
-        # Eliminar archivo parcial para evitar que el pipeline arranque con un modelo corrupto
         if dest.exists():
             dest.unlink()
         sys.exit(1)
 
 
 def _progress(block, block_size, total):
-    """Callback de progreso para urlretrieve — imprime porcentaje en la misma línea."""
+    """Progress callback for urlretrieve — prints percentage on the same line."""
     if total > 0:
-        # Calcular porcentaje sin superar 100% (el último bloque puede exceder ligeramente)
         pct = min(100, block * block_size * 100 // total)
         print(f"\r  {pct}%", end="", flush=True)
 
 
-def download_osnet(dest_dir: Path):
+def download_osnet(dest_dir: Path, token: str = ""):
     """
     OSNet-x1.0 (torchreid / KaiyangZhou), Apache 2.0.
     Input: NCHW float32 RGB ImageNet-normalized, 3×256×128.
@@ -67,6 +89,7 @@ def download_osnet(dest_dir: Path):
     At 2.2M params it remains lightweight and fits on GPU alongside PeopleNet.
 
     Downloaded from GitHub Releases — no torch or torchreid required on the Jetson.
+    Requires a GitHub token because the repo is private (passed via --github-token).
     To regenerate the ONNX file: deploy/tools/export_osnet_colab.ipynb
     """
     dest = dest_dir / "osnet" / "osnet_x1_0_market1501.onnx"
@@ -74,7 +97,7 @@ def download_osnet(dest_dir: Path):
         "https://github.com/AlejandroMova/NX-JETSON/releases/download/models-v1/"
         "osnet_x1_0_market1501.onnx"
     )
-    _download(url, dest, "OSNet-x1.0 ONNX (cross-camera re-ID)")
+    _download(url, dest, "OSNet-x1.0 ONNX (cross-camera re-ID)", token=token)
 
 
 def download_movenet(dest_dir: Path):
@@ -96,18 +119,21 @@ def download_movenet(dest_dir: Path):
 
 
 def main():
-    """CLI principal — parsea argumentos y llama a las funciones de descarga correspondientes.
+    """CLI entry point — parses args and calls the corresponding download functions.
 
-    Ejemplo de uso típico desde setup.sh:
-      python3 tools/download_models.py --all
+    Typical usage from setup.sh:
+      python3 tools/download_models.py --reid --github-token <token>
+      python3 tools/download_models.py --all  --github-token <token>
     """
     parser = argparse.ArgumentParser(description="Download NX optional model files")
     parser.add_argument("--reid", action="store_true",
-                        help="Export OSNet-x1.0 ONNX for cross-camera re-ID")
+                        help="Download OSNet-x1.0 ONNX for cross-camera re-ID")
     parser.add_argument("--fall-detection", action="store_true",
                         help="Download MoveNet ONNX for fall detection (Hogar only)")
     parser.add_argument("--all", action="store_true",
                         help="Download all optional models")
+    parser.add_argument("--github-token", default="",
+                        help="GitHub personal access token for private release assets")
     args = parser.parse_args()
 
     if not any([args.reid, args.fall_detection, args.all]):
@@ -115,7 +141,7 @@ def main():
         sys.exit(0)
 
     if args.reid or args.all:
-        download_osnet(_MODELS_DIR)
+        download_osnet(_MODELS_DIR, token=args.github_token)
 
     if args.fall_detection or args.all:
         download_movenet(_MODELS_DIR)

@@ -531,19 +531,24 @@ _download_models() {
   fi
 
   # ── OSNet-x1.0 (always active — cross-camera re-ID) ────────
-  # Runs inside the container where torch/torchreid are already installed
-  # (avoids multi-GB install on host and aarch64 wheel issues)
+  # Downloaded from GitHub Releases using the same token used to clone the repo.
+  # Runs on the host (no Docker needed — pure urllib, no torch/torchreid).
   OSNET_DEST="${WORK_DIR}/models/osnet/osnet_x1_0_market1501.onnx"
   if [[ -f "$OSNET_DEST" ]]; then
     ok "OSNet ya descargado — skip"
   else
     mkdir -p "${WORK_DIR}/models/osnet"
     chown "$REAL_USER" "${WORK_DIR}/models/osnet"
-    log "Exportando OSNet-x1.0 dentro del container (torchreid pretrained Market-1501)..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" run --rm deepstream \
-        python3 tools/download_models.py --reid \
-      && ok "OSNet exportado" \
-      || warn "Fallo al exportar OSNet. Corre manualmente: docker compose run --rm deepstream python3 tools/download_models.py --reid"
+    # Extract the GitHub token from the git remote URL (set at clone time)
+    GITHUB_TOKEN=$(git -C "${WORK_DIR}" remote get-url origin 2>/dev/null \
+      | sed -n 's|https://\([^@]*\)@.*|\1|p')
+    if [[ -z "$GITHUB_TOKEN" ]]; then
+      warn "No se encontró token en el remote de git. Clona el repo con: git clone https://<token>@github.com/..."
+    fi
+    log "Descargando OSNet-x1.0 desde GitHub Releases..."
+    python3 "${WORK_DIR}/tools/download_models.py" --reid --github-token "$GITHUB_TOKEN" \
+      && ok "OSNet descargado" \
+      || warn "Fallo al descargar OSNet. Corre manualmente: python3 tools/download_models.py --reid --github-token <token>"
   fi
 
 }

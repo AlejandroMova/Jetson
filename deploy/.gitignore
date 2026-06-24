@@ -16,6 +16,9 @@ models/insightface/
 # MoveNet ONNX (downloaded by tools/download_models.py)
 models/movenet/
 
+# OSNet ONNX (downloaded by tools/download_models.py — hosted in GitHub Releases)
+models/osnet/
+
 # Person crops dataset
 crops/
 
