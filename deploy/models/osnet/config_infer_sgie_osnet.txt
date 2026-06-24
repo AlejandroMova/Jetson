@@ -1,41 +1,41 @@
 [property]
 gpu-id=0
 
-; Rutas absolutas al ONNX y al engine TRT compilado.
-; El engine se genera automáticamente en el primer arranque (~2 min extra, igual que PeopleNet).
-; /nx_tech es el mount point del repo dentro del contenedor (docker-compose.yml).
+# Absolute paths to ONNX and compiled TRT engine.
+# The engine is auto-generated on first run (~2 min, same as PeopleNet).
+# /nx_tech is the repo mount point inside the container (docker-compose.yml).
 onnx-file=/nx_tech/models/osnet/osnet_x1_0_market1501.onnx
 model-engine-file=/nx_tech/models/osnet/osnet_x1_0_market1501.trt
 
-; net-scale-factor=1/255 — OSNet espera entrada float32 en [0,1], sin normalización ImageNet.
-; DeepStream escala los píxeles con este factor antes de mandarlos al modelo.
+# net-scale-factor=1/255 — OSNet expects float32 input in [0,1], no ImageNet normalization.
+# DeepStream scales pixel values by this factor before feeding the model.
 net-scale-factor=0.00392156862745098
 model-color-format=0
 
-; FP32 estable para primera puesta en marcha. Probar network-mode=2 (FP16) después
-; de verificar que los embeddings son coherentes — DeepStream maneja FP16 distinto a ONNX Runtime.
+# FP32 for stable first deployment. Try network-mode=2 (FP16) after verifying
+# embeddings are coherent — DeepStream handles FP16 differently than ONNX Runtime.
 network-mode=0
 
-; network-type=1 = other (no clasificador, no detector — solo extrae el tensor de salida).
-; output-tensor-meta=1 expone el tensor en NvDsInferTensorMeta para que el probe lo lea.
+# network-type=1 = other (not a classifier or detector — just extracts the output tensor).
+# output-tensor-meta=1 exposes the tensor via NvDsInferTensorMeta so the probe can read it.
 network-type=1
 output-blob-names=output
 output-tensor-meta=1
 force-implicit-batch-dim=0
 batch-size=8
 
-; process-mode=2 = SGIE (opera sobre los crops de objetos detectados por el PGIE).
-; operate-on-gie-id=1 = PeopleNet. operate-on-class-ids=0 = class 0 (person), no class 2 (face).
+# process-mode=2 = SGIE (runs on object crops from the PGIE).
+# operate-on-gie-id=1 = PeopleNet. operate-on-class-ids=0 = class 0 (person), not class 2 (face).
 process-mode=2
 operate-on-gie-id=1
 operate-on-class-ids=0
 
-; gie-unique-id=3 — 1=PeopleNet, 2=AgeGender, 3=OSNet (antes reservado para FaceDetectIR).
-; El probe lo usa para filtrar el tensor correcto en obj_user_meta_list.
+# gie-unique-id=3 — 1=PeopleNet, 2=AgeGender, 3=OSNet (previously reserved for FaceDetectIR).
+# The probe uses this to filter the correct tensor from obj_user_meta_list.
 gie-unique-id=3
 
-; interval=0 corre OSNet en cada frame (sin saltar frames).
-; Mínimo bbox para que DeepStream le pase el crop al SGIE.
+# interval=0 runs OSNet on every frame (no frame skipping).
+# Minimum bbox size for DeepStream to pass the crop to the SGIE.
 interval=0
 input-object-min-width=32
 input-object-min-height=32
