@@ -33,4 +33,4 @@ cluster-mode=2
 [class-attrs-all]
 topk=20
 nms-iou-threshold=0.20
-pre-cluster-threshold=0.3
+pre-cluster-threshold=0.35
