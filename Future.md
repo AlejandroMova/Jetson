@@ -789,14 +789,17 @@ Ya no se necesita. El SGIE reemplaza su función por completo.
 
 ---
 
-### Paso 6 — `setup.sh`: sin cambios adicionales
+### Paso 6 — `setup.sh` y descarga del ONNX
 
-El flujo de setup ya está completo:
-1. `download_models.py --reid` descarga `osnet_x1_0_market1501.onnx` a `models/osnet/`
-2. En el primer `docker compose up`, DeepStream lee `config_infer_sgie_osnet.txt`, encuentra el ONNX, y construye `osnet_x1_0_market1501.trt` automáticamente (~2 min)
-3. En arranques siguientes, carga el engine `.trt` directamente
+`setup.sh` ya extrae el token del remote de git y lo pasa a `download_models.py --reid --github-token`. El token se manda en el header de autorización — eso ya está implementado en `UpgradedOSNETGPU`.
 
-El primer arranque en un Jetson nuevo tardará ~2 min adicionales por la compilación del engine. Esto es aceptable (igual que PeopleNet y AgeGender la primera vez).
+**⚠️ Pendiente:** `download_models.py` usa la URL directa de GitHub Releases (`github.com/releases/download/...`) que devuelve **HTTP 404 en repos privados aunque el token sea válido**. Esa URL no funciona para repos privados — solo funciona la URL de la API de GitHub. Implementar el fix de la entrada **"Descarga automática de OSNet desde GitHub Releases privado"** de este mismo archivo antes de desplegar en un Jetson nuevo.
+
+Una vez aplicado ese fix, el flujo completo es automático:
+1. `setup.sh` extrae token → llama `download_models.py --reid --github-token $TOKEN`
+2. `download_models.py` descarga el ONNX via API de GitHub → `models/osnet/osnet_x1_0_market1501.onnx`
+3. Primer `docker compose up`: DeepStream construye el engine TRT (~2 min extra, igual que PeopleNet)
+4. Arranques siguientes: carga `osnet_x1_0_market1501.trt` directamente, sin recompilar
 
 ---
 
