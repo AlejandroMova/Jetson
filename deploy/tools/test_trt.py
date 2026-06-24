@@ -7,9 +7,7 @@ logger = trt.Logger(trt.Logger.WARNING)
 builder = trt.Builder(logger)
 config = builder.create_builder_config()
 config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 28)
-if builder.platform_has_fast_fp16:
-    config.set_flag(trt.BuilderFlag.FP16)
-    print('FP16 habilitado')
+print('FP32 mode')
 network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
 parser = trt.OnnxParser(network, logger)
 with open('/nx_tech/models/osnet/osnet_x1_0_market1501.onnx', 'rb') as f:
