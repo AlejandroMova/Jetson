@@ -66,41 +66,15 @@ def download_osnet(dest_dir: Path):
     OSNet-x1.0 achieves ~94% Rank-1 on Market-1501 vs ~82% for the x0.25 variant.
     At 2.2M params it remains lightweight and fits on GPU alongside PeopleNet.
 
-    Must be exported inside the Docker container where torch/torchreid are installed:
-      docker compose run --rm deepstream python3 tools/download_models.py --reid
+    Downloaded from GitHub Releases — no torch or torchreid required on the Jetson.
+    To regenerate the ONNX file: deploy/tools/export_osnet_colab.ipynb
     """
     dest = dest_dir / "osnet" / "osnet_x1_0_market1501.onnx"
-    if dest.exists():
-        logger.info("OSNet already exists — skipping.")
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        import torch
-        import torchreid  # noqa: F401
-    except ImportError as exc:
-        logger.error("Missing dependency: %s", exc)
-        logger.error("Run inside container: docker compose run --rm deepstream python3 tools/download_models.py --reid")
-        sys.exit(1)
-
-    logger.info("Exporting OSNet-x1.0 from torchreid pretrained weights (Market-1501)...")
-    try:
-        model = torchreid.models.build_model("osnet_x1_0", num_classes=1, pretrained=True)
-        model.eval()
-        dummy = torch.randn(1, 3, 256, 128)
-        torch.onnx.export(
-            model, dummy, str(dest),
-            opset_version=11,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
-        )
-        logger.info("Saved: %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
-    except Exception as exc:
-        logger.error("Export failed: %s", exc)
-        if dest.exists():
-            dest.unlink()
-        sys.exit(1)
+    url = (
+        "https://github.com/AlejandroMova/NX-JETSON/releases/download/models-v1/"
+        "osnet_x1_0_market1501.onnx"
+    )
+    _download(url, dest, "OSNet-x1.0 ONNX (cross-camera re-ID)")
 
 
 def download_movenet(dest_dir: Path):
