@@ -7,9 +7,13 @@ gpu-id=0
 onnx-file=/nx_tech/models/osnet/osnet_x1_0_market1501.onnx
 model-engine-file=/nx_tech/models/osnet/osnet_x1_0_market1501.trt
 
-# net-scale-factor=1/255 — OSNet expects float32 input in [0,1], no ImageNet normalization.
-# DeepStream scales pixel values by this factor before feeding the model.
-net-scale-factor=0.00392156862745098
+# ImageNet normalization: output_c = (pixel_c - mean_c*255) / (std_c*255)
+# DeepStream formula: output = (pixel - offset) * net_scale_factor
+# mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225] (per-channel std ~0.226 avg)
+# offsets = mean * 255 per channel (R, G, B)
+# net-scale-factor = 1 / (255 * avg_std) ≈ 0.01737
+net-scale-factor=0.01737
+offsets=123.675;116.28;103.53
 model-color-format=0
 
 # FP32 for stable first deployment. Try network-mode=2 (FP16) after verifying
