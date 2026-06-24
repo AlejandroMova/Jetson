@@ -665,6 +665,162 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 
 ---
 
+## CHANGE TO OSNET1 — OSNet como SGIE de DeepStream (GPU nativo, sin Python TRT)
+
+**Descripción:** Reemplazar el `AppearanceWorker` (Python thread con onnxruntime) por un SGIE de DeepStream que corre OSNet-x1.0 directamente en el pipeline TRT de GPU. DeepStream gestiona el contexto CUDA, la construcción del engine y el batching — igual que hace con PeopleNet y AgeGender. La embedding 512-dim se lee en el probe vía `NvDsInferTensorMeta`. El `ReIdManager` no cambia.
+
+**Por qué es mejor que el approach actual (Python TRT):**
+- Sin conflicto de contextos CUDA: DeepStream ya es dueño del GPU — el SGIE se integra al mismo contexto, sin kernel Cask errors.
+- Sin `onnxruntime-gpu`, sin `pycuda`, sin gestión manual de memoria CUDA.
+- Batching nativo: DeepStream agrupa crops de múltiples personas en un batch eficiente.
+- Los embeddings llegan en el mismo frame (síncronos), no diferidos — simplifica la lógica de `person_entry` deferido.
+
+**Validado contra:** https://github.com/ml6team/deepstream-python (repo de referencia con OSNet + DeepStream, DS 6.1, patrón idéntico)
+
+---
+
+### Paso 1 — Traer a `main` los cambios útiles de `UpgradedOSNETGPU`
+
+Hacer cherry-pick de estos commits (o mergear solo estos archivos):
+- `deploy/.gitignore` — excluye `models/osnet/` del repo
+- `deploy/tools/download_models.py` — soporte de token GitHub (`--github-token`)
+- `deploy/setup.sh` — sección de descarga de OSNet via `download_models.py`
+
+**NO traer a main:**
+- `deploy/tools/test_trt.py` — experimento de Python TRT, ya no necesario (eliminar del branch también)
+- Los cambios de `appearance_worker.py` (GPU providers) — el archivo se elimina en el paso 3
+
+---
+
+### Paso 2 — Crear `deploy/models/osnet/config_infer_sgie_osnet.txt`
+
+```ini
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+model-color-format=0
+onnx-file=/nx_tech/models/osnet/osnet_x1_0_market1501.onnx
+model-engine-file=/nx_tech/models/osnet/osnet_x1_0_market1501.trt
+force-implicit-batch-dim=0
+batch-size=8
+process-mode=2
+network-mode=0
+network-type=1
+output-blob-names=output
+output-tensor-meta=1
+operate-on-gie-id=1
+operate-on-class-ids=0
+gie-unique-id=3
+interval=0
+input-object-min-width=32
+input-object-min-height=32
+```
+
+Notas:
+- `network-mode=0` = FP32. Probar `network-mode=2` (FP16) después — DeepStream lo maneja distinto a Python TRT, puede funcionar.
+- `operate-on-class-ids=0` = personas en PeopleNet (no 2 como en el repo de referencia que usa YOLOv4).
+- `gie-unique-id=3` (1=PeopleNet, 2=AgeGender, 3=OSNet).
+- `output-blob-names=output` — nombre del tensor de salida del ONNX de OSNet.
+- `model-engine-file` se genera automáticamente en el primer arranque de DeepStream (~2 min adicionales la primera vez, igual que PeopleNet).
+
+---
+
+### Paso 3 — Modificar `deploy/pipelines/app.py`
+
+En `SGIE_CONFIGS`, agregar OSNet junto a AgeGender:
+
+```python
+SGIE_CONFIGS = {
+    "age_gender": str(_MODELS_DIR / "resnet_age_gender_FB2" / "config_infer.txt"),
+    "appearance":  str(_MODELS_DIR / "osnet" / "config_infer_sgie_osnet.txt"),
+}
+```
+
+El key `"appearance"` no es una capacidad en `VALID_CAPABILITIES` — se activa si el ONNX existe (igual que hoy lo hace `AppearanceWorker`). Agregar la lógica condicional igual al patrón ya existente.
+
+---
+
+### Paso 4 — Modificar `deploy/pipelines/probes.py`
+
+**Eliminar:**
+- Import de `AppearanceWorker`
+- Instanciación de `_appearance_worker` en `init_workers()`
+- Llamadas a `_appearance_worker.submit()` y `_appearance_worker.get_result()`
+- Lógica de embedding deferido (deadline 30 frames)
+
+**Agregar** en el probe, dentro del loop de objetos (donde se tiene `obj_meta`):
+
+```python
+import ctypes  # ya importado
+
+OSNET_GIE_ID = 3
+
+def _extract_osnet_embedding(obj_meta) -> np.ndarray | None:
+    """Lee el vector 512-dim del SGIE OSNet desde los metadatos del objeto."""
+    l_user = obj_meta.obj_user_meta_list
+    while l_user is not None:
+        try:
+            user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+        except StopIteration:
+            break
+        if user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
+            tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+            if tensor_meta.unique_id == OSNET_GIE_ID:
+                layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
+                ptr = ctypes.cast(pyds.get_ptr(layer.buffer),
+                                  ctypes.POINTER(ctypes.c_float))
+                emb = np.ctypeslib.as_array(ptr, shape=(512,)).copy()
+                norm = np.linalg.norm(emb)
+                return emb / norm if norm > 0 else emb
+        try:
+            l_user = l_user.next
+        except StopIteration:
+            break
+    return None
+```
+
+El embedding se pasa directamente a `_reid_manager.match_or_create()` en el mismo frame — sin cola, sin deferido.
+
+---
+
+### Paso 5 — Eliminar `deploy/pipelines/appearance_worker.py`
+
+Ya no se necesita. El SGIE reemplaza su función por completo.
+
+---
+
+### Paso 6 — `setup.sh`: sin cambios adicionales
+
+El flujo de setup ya está completo:
+1. `download_models.py --reid` descarga `osnet_x1_0_market1501.onnx` a `models/osnet/`
+2. En el primer `docker compose up`, DeepStream lee `config_infer_sgie_osnet.txt`, encuentra el ONNX, y construye `osnet_x1_0_market1501.trt` automáticamente (~2 min)
+3. En arranques siguientes, carga el engine `.trt` directamente
+
+El primer arranque en un Jetson nuevo tardará ~2 min adicionales por la compilación del engine. Esto es aceptable (igual que PeopleNet y AgeGender la primera vez).
+
+---
+
+### Paso 7 — Opcional: limpiar `Dockerfile.jetson`
+
+Remover la línea que instala el wheel de `onnxruntime-gpu` de nschloe (el que no funcionaba en GPU). `onnxruntime` puede quedar en `requirements.txt` para uso de InsightFace en CPU si lo necesita, pero el wheel de nschloe ya no tiene utilidad.
+
+---
+
+### Archivos modificados en total
+
+| Archivo | Acción |
+|---|---|
+| `deploy/models/osnet/config_infer_sgie_osnet.txt` | **Crear** |
+| `deploy/pipelines/app.py` | Agregar `"appearance"` en `SGIE_CONFIGS` |
+| `deploy/pipelines/probes.py` | Reemplazar AppearanceWorker por lectura de `NvDsInferTensorMeta` |
+| `deploy/pipelines/appearance_worker.py` | **Eliminar** |
+| `deploy/tools/test_trt.py` | **Eliminar** (era solo experimental) |
+| `deploy/Dockerfile.jetson` | Remover wheel onnxruntime-gpu nschloe (opcional) |
+
+**Sin cambios:** `setup.sh`, `download_models.py`, `reid_manager.py`, `docker-compose.yml`, `config_loader.py`
+
+---
+
 ## Descarga automática de OSNet desde GitHub Releases privado
 
 **Descripción:** `download_models.py --reid` actualmente falla con HTTP 404 porque la URL directa de GitHub (`releases/download/<tag>/<file>`) no funciona para repos privados aunque se pase token. La solución confirmada es usar la API de GitHub para obtener la URL real del asset y descargar desde ahí.
