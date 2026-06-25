@@ -1323,7 +1323,6 @@ def _expire_lost_tracks(pad_index: int, frame_num: int, visible_ids: Set[int]) -
                 global_id=state.global_id,
                 is_return=False,
             )
-            _get_analytics(pad_index)["person_count"] += 1
 
         api_client.post_person_exit(
             state.camera_id, track_id, dwell, state.is_entry_exit_cam,
@@ -1463,7 +1462,11 @@ def _handle_appearance_reid(
                         global_id=global_id,
                         is_return=(event_type == "person_return"),
                     )
-                    _get_analytics(pad_index)["person_count"] += 1
+                    # Only count genuinely new persons — event_type "new_person" means
+                    # match_or_create() created a fresh _Entry with a new global_id.
+                    # "person_return" is the same person revisiting; don't double-count.
+                    if event_type == "new_person":
+                        _get_analytics(pad_index)["person_count"] += 1
 
         elif state.global_id is not None and frame_num % 90 == 0:
             # ── Subsequent frames — refresh the gallery periodically ──────────
@@ -1484,7 +1487,6 @@ def _handle_appearance_reid(
             global_id=None,
             is_return=False,
         )
-        _get_analytics(pad_index)["person_count"] += 1
         logger.debug("ReID deadline reached track=%d cam=%s — entry emitted without global_id",
                      p_track_id, camera_id)
 

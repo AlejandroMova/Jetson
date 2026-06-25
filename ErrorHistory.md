@@ -6,6 +6,26 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-06-25 — `people_count` inflado: contaba por `track_id` en lugar de `global_id`
+
+**Contexto:** `deploy/pipelines/probes.py` — lógica de analytics en `_handle_appearance_reid` y `_expire_lost_tracks`
+
+**Síntoma:** El dashboard mostraba ~86 personas en tiempo real cuando había ~5 personas físicas. El overview acumulado del día llegaba a ~400.
+
+**Causa raíz:** `_get_analytics(pad_index)["person_count"]` se incrementaba en tres lugares basados en apariciones de `track_id`, sin deduplicar por `global_id`:
+1. Después de emitir `person_entry` vía ReID — contaba tanto `new_person` como `person_return` (misma persona que regresa)
+2. En el fallback de deadline (sin embedding OSNet) — sin global_id, no se podía saber si era persona nueva
+3. En `_expire_lost_tracks` al emitir entry diferida — mismo problema sin global_id
+
+Una sola persona física puede generar múltiples `track_id` (tracker la pierde y re-detecta, o cruza cámaras), inflando el contador entre 10–20x en escenas de baja afluencia.
+
+**Solución:** Tres cambios en `probes.py`:
+1. **Eliminado** el incremento en el fallback de deadline (línea ~1487 antes del fix) — personas sin embedding no se cuentan
+2. **Eliminado** el incremento en `_expire_lost_tracks` (línea ~1326 antes del fix) — tracks que expiran antes de ReID no se cuentan
+3. **Condicionado** el incremento en `_handle_appearance_reid` a `event_type == "new_person"` — solo se cuenta cuando `ReIdManager.match_or_create()` crea un `_Entry` nuevo (genuinamente nueva persona), no en `person_return`
+
+---
+
 ## 2026-06-08 — Reference frame nunca se envía durante escenas vacías
 
 **Contexto:** `deploy/pipelines/probes.py` — lógica de reference frame (líneas ~1694–1728)

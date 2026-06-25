@@ -103,6 +103,7 @@ Detecta y trackea personas en cada cámara. Emite eventos `person_entry` y `pers
 - **Modelo:** PeopleNet v2.3.4 (ResNet-34, INT8, NVIDIA NGC) — detecta 3 clases: person, bag, face
 - **Tracker:** NvDCF (correlación, recomendado ≤6 streams) o IOU (ligero, hasta 16 streams)
 - **Siempre activo** en todos los paquetes
+- **`person_count` en analytics snapshot:** se incrementa **solo cuando `match_or_create()` retorna `event_type == "new_person"`**, es decir, cuando `ReIdManager` crea un nuevo `_Entry` con un `global_id` fresco. Las visitas de retorno (`person_return`) y cambios de cámara (`channel_change`) no incrementan el contador — la misma persona física no se cuenta dos veces. Fallback sin ReID (`_reid_manager is None`): se cuenta por track, comportamiento legacy.
 
 ### Re-ID entre Cámaras (`appearance`) — ✅ Activo
 Identifica cuando la misma persona aparece en cámaras distintas usando embeddings de apariencia. El matching ocurre **localmente en el Jetson** gracias al `ReIdManager`. Emite tres variantes de evento según el contexto:
