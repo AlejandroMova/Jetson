@@ -1083,10 +1083,15 @@ _reid_manager = None        # ReIdManager — local cross-camera identity DB
 _ws_client = None           # WsPositionClient (position/heatmap WebSocket)
 _jetson_sync_client = None  # JetsonSyncClient (Socket.IO face roster sync)
 
-# Position buffer: pad_index → list of {track_id, x_norm, y_norm}
-_position_buffer: Dict[int, List[dict]] = {}
+# Position buffer: pad_index → {global_id → latest position entry}.
+# The inner dict is keyed by global_id (12-char hex from ReIdManager) so each person
+# contributes exactly one entry per snapshot regardless of how many frames they appear in.
+# The backend compares consecutive snapshot timestamps to calculate dwell per person.
+_position_buffer: Dict[int, Dict[str, dict]] = {}
 _position_last_sent: Dict[int, float] = {}
-POSITION_SEND_INTERVAL: float = 10.0
+# 1-second flush gives 1-second timestamp resolution for dwell tracking.
+# At a 5-second threshold, a person needs ~5 consecutive snapshots in the same cell.
+POSITION_SEND_INTERVAL: float = 1.0
 
 
 def init_workers(
@@ -1274,22 +1279,38 @@ def _get_analytics_last_sent(pad_index: int) -> float:
 
 
 def _accumulate_positions(
-    pad_index: int, camera_id: str, persons_meta: list,
-    frame_width: int, frame_height: int, frame_num: int,
+    pad_index: int, camera_id: str, persons_meta: list, frame_meta,
 ) -> None:
-    """Accumulate normalized centroids and flush a position snapshot every POSITION_SEND_INTERVAL s."""
-    buf = _position_buffer.setdefault(pad_index, [])
+    """Update the per-camera position buffer and flush to the backend every POSITION_SEND_INTERVAL s.
+
+    Only persons with a resolved global_id are included — tracks without a cross-camera
+    identity are skipped so the backend always receives a stable dwell-time key.
+
+    Each person contributes exactly one entry per snapshot (the latest position within
+    that second). The backend compares consecutive snapshot timestamps to calculate how
+    long each global_id stayed in a given heatmap cell.
+    """
+    fw = frame_meta.source_frame_width
+    fh = frame_meta.source_frame_height
+    buf = _position_buffer.setdefault(pad_index, {})
+
     for obj in persons_meta:
+        track_key = (pad_index, int(obj.object_id))
+        state = _active_tracks.get(track_key)
+        if state is None or state.global_id is None:
+            # Skip until ReID resolves a stable cross-camera identity.
+            continue
         r = obj.rect_params
-        x_norm = round((r.left + r.width / 2) / frame_width, 3)
-        y_norm = round((r.top + r.height / 2) / frame_height, 3)
-        buf.append({"track_id": int(obj.object_id), "x_norm": x_norm, "y_norm": y_norm})
+        x_norm = round((r.left + r.width / 2) / fw, 3)
+        y_norm = round((r.top + r.height / 2) / fh, 3)
+        # Overwrite any earlier entry for this person within the current second.
+        buf[state.global_id] = {"global_id": state.global_id, "x_norm": x_norm, "y_norm": y_norm}
 
     now = time.monotonic()
     last = _position_last_sent.get(pad_index, 0.0)
     if now - last >= POSITION_SEND_INTERVAL and buf:
-        _ws_client.send_positions(camera_id, buf)
-        _position_buffer[pad_index] = []
+        _ws_client.send_positions(camera_id, list(buf.values()))
+        _position_buffer[pad_index] = {}
         _position_last_sent[pad_index] = now
 
 
@@ -1732,9 +1753,8 @@ def osd_sink_pad_buffer_probe(_pad, info):
 
         _expire_lost_tracks(pad_index, frame_num, visible_ids)
 
-        if _ws_client is not None and visible_ids and frame_np is not None:
-            fh, fw = frame_np.shape[:2]
-            _accumulate_positions(pad_index, camera_id, persons_meta, fw, fh, frame_num)
+        if _ws_client is not None and visible_ids:
+            _accumulate_positions(pad_index, camera_id, persons_meta, frame_meta)
 
         # ── Periodic analytics snapshot ───────────────────────────────────────
         now = time.monotonic()
