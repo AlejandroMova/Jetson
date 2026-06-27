@@ -9,8 +9,9 @@ Each global_id stores a gallery of up to GALLERY_MAX_SIZE L2-normalised 512-dim
 embeddings covering distinct poses/angles.  Matching uses max-similarity over the
 gallery — if any gallery angle matches, the identity is recognised even if the
 current angle differs from the others.  New embeddings are added to the gallery
-only when they are sufficiently different from all existing gallery members
-(cosine similarity < GALLERY_DIVERSITY_THRESHOLD), preventing duplicates.
+only when max similarity vs. existing members falls in (GALLERY_DIVERSITY_THRESHOLD_MIN,
+GALLERY_DIVERSITY_THRESHOLD_MAX) — novel enough to add value, similar enough to
+belong to the same identity.
 
 Matching is vectorised: gallery_matrix @ query → shape (N×K,), then max per entry.
 O(N×K) but K≤5, negligible vs. OSNet inference.
@@ -47,8 +48,12 @@ PRESENCE_WINDOW_S:         float = 300.0  # 5 min — within this, camera switch
 REID_TTL_S:                float = 3600.0 # 1 hour — global_id expires if unseen for this long
 SAVE_INTERVAL_S:           float = 30.0   # persist to disk at most every N seconds
 GALLERY_MAX_SIZE:          int   = 10     # max embeddings per global_id
-# New embedding added to gallery only if sim < this vs. all existing members (novel angle).
-GALLERY_DIVERSITY_THRESHOLD: float = 0.85
+# Gallery addition window: embedding is added only if max_sim vs. existing falls in
+# (GALLERY_DIVERSITY_THRESHOLD_MIN, GALLERY_DIVERSITY_THRESHOLD_MAX).
+# Below MIN → too dissimilar (borderline/noisy match, protects gallery from contamination).
+# Above MAX → duplicate angle, skip.
+GALLERY_DIVERSITY_THRESHOLD_MAX: float = 0.85
+GALLERY_DIVERSITY_THRESHOLD_MIN: float = 0.71
 
 # ── Event type constants ─────────────────────────────────────────────────────────
 EVENT_NEW_PERSON     = "new_person"
@@ -78,16 +83,19 @@ def _gallery_add(gallery: List[np.ndarray], embedding: np.ndarray, max_size: int
     Returns True if the embedding was added.
 
     Addition rules:
-    - Gallery has fewer than max_size entries → always add.
-    - Gallery is full → add only if max similarity vs. all existing < GALLERY_DIVERSITY_THRESHOLD
-      (the new vector is sufficiently different = captures a new pose).
-    - If too similar to any existing member → skip (duplicate angle).
+    - Gallery has fewer than max_size entries → always add (first embedding always stored).
+    - Gallery is full → add only if max similarity vs. all existing falls in
+      (GALLERY_DIVERSITY_THRESHOLD_MIN, GALLERY_DIVERSITY_THRESHOLD_MAX):
+        - >= MAX (0.85): duplicate angle — skip.
+        - <= MIN (0.71): too dissimilar — likely noisy/borderline match, skip to
+          protect gallery integrity against false-positive contamination.
     """
     if gallery:
         gallery_mat = np.stack(gallery)          # (K, 512)
         sims = gallery_mat @ embedding           # (K,)
-        if float(np.max(sims)) >= GALLERY_DIVERSITY_THRESHOLD:
-            return False  # too similar to an existing angle, skip
+        max_sim = float(np.max(sims))
+        if max_sim >= GALLERY_DIVERSITY_THRESHOLD_MAX or max_sim < GALLERY_DIVERSITY_THRESHOLD_MIN:
+            return False  # outside valid diversity window — skip
     if len(gallery) < max_size:
         gallery.append(embedding.copy())
         return True
