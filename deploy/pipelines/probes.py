@@ -593,11 +593,11 @@ class NxApiClient:
             payload["global_id"] = global_id
         self.enqueue("POST", "/api/events", payload)
 
-    def post_person_classified(self, camera_id: str, track_id: int,
+    def post_person_classified(self, camera_id: str, global_id: str,
                                bbox: dict, demographics: dict) -> None:
         """Emit person_classified with age/gender result (after VOTES_REQUIRED votes)."""
         payload = self._base_event("person_classified", camera_id)
-        payload.update({"track_id": track_id, "bbox": bbox, "demographics": demographics})
+        payload.update({"global_id": global_id, "bbox": bbox, "demographics": demographics})
         self.enqueue("POST", "/api/events", payload)
 
     def post_person_appearance(self, camera_id: str, track_id: int,
@@ -1704,7 +1704,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                         f"track={p_track_id:<4} ",
                         f"{gd} | {ad}  conf={demo.get('confidence', 0.0):.0%}",
                     )
-                    api_client.post_person_classified(camera_id, p_track_id, bbox, demo)
+                    api_client.post_person_classified(camera_id, state.global_id, bbox, demo)
                     an = _get_analytics(pad_index)
                     au = result.analytics_update
                     if "age_gender_classes" in au:
