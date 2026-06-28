@@ -1587,10 +1587,21 @@ def osd_sink_pad_buffer_probe(_pad, info):
             if _face_recognizer is not None:
                 _needs_pixel = True
 
-        # Empty scene: decode pixels only when a reference frame capture is due.
-        # Without this check frame_np stays None and no reference frame is ever sent.
-        # Overhead: at most one GPU->CPU copy every 30s (unconfirmed) or 24h (confirmed).
-        if not _needs_pixel and frame_meta.num_obj_meta == 0:
+        # Pre-scan: detect if any person-class object is present before deciding
+        # whether to decode for a reference frame. Bags and faces (non-person
+        # PeopleNet classes) should not block the reference frame path — the send
+        # condition uses visible_ids == 0 (persons only), not num_obj_meta == 0.
+        _has_person_detection = frame_meta.num_obj_meta > 0 and any(
+            int(o.class_id) == PGIE_CLASS_PERSON
+            and o.unique_component_id == PGIE_UNIQUE_ID
+            and o.confidence >= OSD_CONFIDENCE_THRESHOLD
+            for o in _iter_pyds_list(frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast)
+        )
+
+        # Decode pixels for reference frame when no persons visible, even if bags
+        # or faces are detected. Overhead: at most one GPU→CPU copy every 30 s
+        # (initial retry) or 24 h (scene-change update).
+        if not _needs_pixel and not _has_person_detection:
             _rc_confirmed = _reference_frame_confirmed_np.get(camera_id)
             _rc_ts = _reference_frame_confirmed_ts.get(camera_id, 0.0)
             _rc_attempt = _reference_frame_last_attempt.get(pad_index, 0.0)
