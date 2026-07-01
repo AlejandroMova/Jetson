@@ -105,11 +105,14 @@ while true; do
 
     # Contar cuántos source-N únicos fallaron en esa ventana
     # El log de app.py emite: WARNING ... RTSP 'source-N' failed: ... — pipeline continues.
+    # NOTA: grep devuelve exit code 1 cuando no hay coincidencias (caso normal, sin fallos
+    # activos). Con pipefail eso propaga un código de error a todo el pipe aunque sort/wc -l
+    # terminen bien — el `|| true` evita que set -e mate el script en ese caso legítimo.
     n_failed=$(echo "$recent" \
         | grep "RTSP '.*' failed" \
         | grep -oE "source-[0-9]+" \
         | sort -u \
-        | wc -l)
+        | wc -l) || true
 
     if [[ "$n_failed" -ge "$N" ]]; then
         log "Todos los ${N} streams fallaron en los últimos ${FAILURE_WINDOW}s — iniciando redescubrimiento del DVR"

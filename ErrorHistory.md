@@ -6,6 +6,33 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-07-01 — `nx-dvr-watchdog` crashea al segundo de arrancar (set -e + pipefail + grep sin match)
+
+**Contexto:** `deploy/tools/dvr_watchdog.sh` — servicio systemd `nx-dvr-watchdog` en el host del Jetson.
+
+**Síntoma:** Todas las cámaras RTSP fallaron (DVR con IP dinámica, ver incidente 2026-05-13). Al intentar usar el watchdog para el auto-recovery, se descubrió que el servicio `nx-dvr-watchdog.service` ni siquiera existía (`setup.sh` nunca se re-corrió tras agregarse esta feature al repo — `update.sh` solo hace `git pull` + rebuild condicional, no reinstala servicios systemd). Al instalarlo manualmente, crasheaba ~1 segundo después de loguear "Iniciado", en bucle de reinicio (`Restart=always`, `RestartSec=30`), sin ningún mensaje de error visible en `journalctl`.
+
+**Error en consola:**
+```
+[nx-dvr-watchdog HH:MM:SS] Iniciado. Buscando container con patrón 'deepstream' | poll: 10s | ventana: 30s
+systemd[1]: nx-dvr-watchdog.service: Main process exited, code=exited, status=1/FAILURE
+systemd[1]: nx-dvr-watchdog.service: Failed with result 'exit-code'.
+```
+
+**Causa raíz:** El script usa `set -euo pipefail`. La línea que cuenta fallos RTSP recientes:
+```bash
+n_failed=$(echo "$recent" | grep "RTSP '.*' failed" | grep -oE "source-[0-9]+" | sort -u | wc -l)
+```
+no tenía ningún guard (`|| true`). `grep` retorna exit code 1 cuando no encuentra ninguna coincidencia — comportamiento normal, no un error — pero es el caso común: apenas pasan los 30s de `FAILURE_WINDOW` sin fallos activos, `grep` no encuentra nada, y con `pipefail` ese código de error se propaga a través de `sort -u`/`wc -l` (que sí terminan bien) hasta el pipeline completo. Como la asignación no estaba protegida, `set -e` mataba el proceso inmediatamente. Esto no era un caso raro: pasaba siempre que el watchdog corría sin fallos activos en ese instante exacto, es decir, la mayor parte del tiempo en operación normal — el watchdog nunca podía sobrevivir en producción tal como estaba escrito.
+
+**Solución:** Agregar `|| true` al final de la asignación para que un "sin coincidencias" no se trate como error fatal:
+```bash
+n_failed=$(echo "$recent" | grep "RTSP '.*' failed" | grep -oE "source-[0-9]+" | sort -u | wc -l) || true
+```
+Además, tras cualquier cambio a `tools/dvr_watchdog.sh`, recordar que `update.sh` no reinstala el servicio systemd — hay que copiar manualmente el script actualizado a `/usr/local/bin/nx_dvr_watchdog.sh` (con `@@WORK_DIR@@` sustituido) y correr `systemctl restart nx-dvr-watchdog`, o extender `update.sh`/`setup.sh` para que lo haga automáticamente (pendiente, ver `Future.md`).
+
+---
+
 ## 2026-06-25 — `people_count` inflado: contaba por `track_id` en lugar de `global_id`
 
 **Contexto:** `deploy/pipelines/probes.py` — lógica de analytics en `_handle_appearance_reid` y `_expire_lost_tracks`
