@@ -32,7 +32,15 @@ CHECK_TIMEOUT=3         # timeout (s) por intento de conexión TCP al puerto RTS
 FAILURE_THRESHOLD=3     # chequeos consecutivos fallidos antes de asumir cambio de IP
 COOLDOWN=300            # segundos de espera tras un intento de redescubrimiento
 
-log()  { echo "[nx-dvr-watchdog $(date '+%H:%M:%S')] $*"; }
+
+# IMPORTANTE: escribir a stderr (>&2), nunca a stdout. find_new_dvr_ip() y otras
+# funciones devuelven su resultado por stdout vía $(...) — si log/warn escribieran
+# a stdout, un mensaje de log llamado dentro de esas funciones se colaría como si
+# fuera el valor de retorno (pasó en producción: un warning terminó escrito en
+# /etc/nx_dvr_ip en vez de una IP real — ver ErrorHistory.md 2026-07-01).
+# systemd captura stdout y stderr por igual (StandardOutput=journal,
+# StandardError=journal), así que esto no afecta la visibilidad en journalctl.
+log()  { echo "[nx-dvr-watchdog $(date '+%H:%M:%S')] $*" >&2; }
 warn() { log "WARN: $*"; }
 
 # Resolves the actual running container name that matches CONTAINER_PATTERN.
