@@ -646,9 +646,9 @@ fi
 # 6d. DVR Watchdog — auto-recuperación de IP cuando cambia por DHCP
 # ════════════════════════════════════════════════════════════
 # Instala dvr_watchdog.sh como servicio systemd en el host.
-# El watchdog monitorea los logs del container deepstream; cuando detecta
-# que TODOS los streams RTSP fallaron, corre nmap para encontrar la nueva
-# IP del DVR, actualiza /etc/nx_dvr_ip y reinicia el container.
+# El watchdog verifica directamente si la IP del DVR configurada responde en su
+# puerto RTSP; tras varios chequeos fallidos seguidos corre nmap para encontrar
+# la nueva IP del DVR, actualiza /etc/nx_dvr_ip y reinicia el container.
 WATCHDOG_SRC="${WORK_DIR}/tools/dvr_watchdog.sh"
 WATCHDOG_DST="/usr/local/bin/nx_dvr_watchdog.sh"
 

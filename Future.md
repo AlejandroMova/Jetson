@@ -6,6 +6,23 @@ Ver regla 11 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## `update.sh` debe reinstalar servicios systemd de host (ej. `nx-dvr-watchdog`) automáticamente
+
+**Descripción:** Servicios de host como `nx-dvr-watchdog` solo se instalan en la sección 6d de `setup.sh`, que corre una única vez durante la instalación inicial. `update.sh` únicamente hace `git pull` + rebuild condicional del container — nunca reinstala ni actualiza los servicios systemd del host. Si se agrega una feature de este tipo después de que un Jetson ya fue instalado en campo, o si se corrige un bug en un script como `dvr_watchdog.sh` (ver `ErrorHistory.md` 2026-07-01), los Jetsons ya desplegados se quedan con el servicio desactualizado o sin instalar, sin que nadie lo note hasta que falla.
+
+**Por qué sería mejor:** Hoy se descubrió que un Jetson en campo nunca tuvo el watchdog de auto-recuperación de IP del DVR instalado — justo cuando se necesitaba (DVR con IP dinámica, 11 cámaras caídas). Un `update.sh` normal en ese Jetson no lo habría solucionado, porque no toca servicios de host. El fix quedó commiteado en el repo (para Jetsons nuevos vía `setup.sh`), pero los Jetsons ya desplegados requieren reinstalación manual.
+
+**Reemplazaría:**
+- Archivo: `deploy/tools/update.sh`
+- Sección: lógica de actualización (git pull + rebuild condicional)
+- Descripción de lo que se agrega: detectar si `tools/dvr_watchdog.sh` cambió respecto al `/usr/local/bin/nx_dvr_watchdog.sh` instalado (diff o hash) y, de ser así, re-copiar con sustitución de `@@WORK_DIR@@` y `systemctl restart nx-dvr-watchdog`. Idealmente generalizar a cualquier script de `tools/` que se instale como servicio de host.
+
+**Tech stack propuesto:** Bash puro (mismo patrón que la sección 6d de `setup.sh`), sin dependencias nuevas.
+
+**Consideraciones:** Requiere `sudo` dentro de `update.sh` (ya lo requiere para otras cosas). Esfuerzo estimado: 30 min.
+
+---
+
 ## SSIM para detección de cambio visual en reference frames
 
 **Descripción:** Reemplazar la métrica actual de diferencia media normalizada en `_scene_changed()` por SSIM (Structural Similarity Index) de scikit-image o OpenCV. SSIM es más robusto ante ruido de sensor y pequeñas variaciones locales que no reflejan un cambio estructural real de la escena.

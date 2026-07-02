@@ -646,8 +646,9 @@ CLI para enrolamiento de rostros en la DB local. Acepta imágenes individuales, 
 **`test_rtsp.py`** (~2 KB)
 Test rápido de conectividad RTSP. Útil para verificar credenciales DVR antes de despliegue completo.
 
-**`dvr_watchdog.sh`** (~80 líneas)
-Script daemon instalado por `setup.sh` como servicio systemd `nx-dvr-watchdog` en el host del Jetson (fuera de Docker). Cada 10 s revisa `docker logs --since 30s deepstream` buscando el patrón `RTSP 'source-N' failed`. Cuando todos los streams configurados fallan dentro de esa ventana de 30 s, ejecuta `nmap -p 554 <subred>/24 --open -T4` para encontrar el DVR en su nueva IP. Si la encuentra: escribe la nueva IP en `/etc/nx_dvr_ip` y corre `docker restart deepstream`. Si no encuentra nada: espera 300 s (COOLDOWN) y reintenta. Al instalar, `setup.sh` sustituye el placeholder `@@WORK_DIR@@` con la ruta real del repo. Logs: `journalctl -u nx-dvr-watchdog -f`.
+**`dvr_watchdog.sh`** (~140 líneas)
+Script daemon instalado por `setup.sh` como servicio systemd `nx-dvr-watchdog` en el host del Jetson (fuera de Docker). Cada 10 s (`POLL_INTERVAL`) verifica conectividad TCP directa a la IP configurada en `/etc/nx_dvr_ip` sobre el puerto RTSP del cliente (`get_dvr_port()` lee `dvr_port` de `clients/<cliente>/config.yaml`, default 554 — mismo default que `config_loader.py`), usando `/dev/tcp` de bash (sin dependencias nuevas). Tras `FAILURE_THRESHOLD=3` chequeos consecutivos fallidos (debounce contra blips de red), ejecuta `nmap -p <puerto> <subred>/24 --open -T4` para encontrar el DVR en su nueva IP. Si la encuentra: escribe la nueva IP en `/etc/nx_dvr_ip` y corre `docker restart` sobre el container detectado (`get_container()`, tolera el prefijo de proyecto de Docker Compose). Si no encuentra nada: espera 300 s (`COOLDOWN`) y reintenta. Al instalar, `setup.sh` sustituye el placeholder `@@WORK_DIR@@` con la ruta real del repo. Logs: `journalctl -u nx-dvr-watchdog -f`.
+- **Diseño anterior (abandonado):** parseaba `docker logs` buscando `RTSP 'source-N' failed` y comparaba el conteo contra `len(channels)` de `config.yaml`. Se abandonó porque ese conteo no coincidía con los streams reales cuando el cliente tenía `external_channels` configurados (`app.py` los excluye de `active_channels`) — el watchdog nunca disparaba aunque todas las cámaras reales fallaran. Ver `ErrorHistory.md` 2026-07-01.
 
 ---
 

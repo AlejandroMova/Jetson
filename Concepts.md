@@ -433,13 +433,13 @@ del lease. Cuando eso pasa, todos los streams RTSP fallan y el pipeline queda co
 ```
 Host Jetson (fuera de Docker)
   └── systemd: nx-dvr-watchdog
-        │  cada 10 s: docker logs --since 30s deepstream
-        │  cuenta cuántos "source-N" fallaron
+        │  cada 10 s: chequeo TCP directo a <IP configurada>:<puerto RTSP>
+        │  (bash /dev/tcp, sin dependencias nuevas — no lee logs del pipeline)
         │
-        ├─ Si n_failed < N_channels → seguir monitoreando
+        ├─ Si responde → resetear contador de fallos, seguir monitoreando
         │
-        └─ Si n_failed >= N_channels (todos fallaron):
-              nmap -p 554 <subred/24> --open -T4
+        └─ Si no responde 3 veces seguidas (debounce contra blips de red):
+              nmap -p <puerto> <subred/24> --open -T4
               │
               ├─ nueva IP encontrada → escribe /etc/nx_dvr_ip → docker restart deepstream
               │                        pipeline se reconecta automáticamente
@@ -449,6 +449,15 @@ Host Jetson (fuera de Docker)
 
 El servicio corre en el **host** (no dentro de Docker), por lo que puede escribir
 `/etc/nx_dvr_ip` directamente y hacer `docker restart` sin restricciones de bind mount.
+
+**Por qué chequeo directo y no logs del pipeline:** la primera versión parseaba
+`docker logs` buscando líneas `RTSP 'source-N' failed` y comparaba el conteo contra
+los canales de `config.yaml`. Ese conteo no coincidía con los streams reales cuando el
+cliente tenía `external_channels` configurados — el watchdog nunca disparaba aunque
+todas las cámaras reales fallaran (ver `ErrorHistory.md` 2026-07-01). El chequeo TCP
+directo a la IP configurada no depende de cuántas cámaras haya, ni del formato de logs
+del pipeline, ni de que el container esté corriendo — verifica exactamente lo que
+importa: si el DVR sigue respondiendo donde se supone que está.
 
 **Instalación:** `setup.sh` copia `tools/dvr_watchdog.sh` a `/usr/local/bin/nx_dvr_watchdog.sh`
 (sustituyendo `@@WORK_DIR@@` con la ruta real del repo) y crea el servicio systemd.
@@ -472,5 +481,5 @@ El servicio corre en el **host** (no dentro de Docker), por lo que puede escribi
 ¿Cómo se identifica la misma persona entre cámaras? → ReIdManager + OSNet embeddings
 ¿Cómo se ve visualmente?       → QA mode: MjpegServer + Streamlit
 ¿Cómo se configura un cliente? → setup.sh (un solo comando)
-¿Qué pasa si el DVR cambia de IP? → nx-dvr-watchdog detecta, hace nmap, reinicia pipeline
+¿Qué pasa si el DVR cambia de IP? → nx-dvr-watchdog chequea TCP directo, hace nmap, reinicia pipeline
 ```

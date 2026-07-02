@@ -6,6 +6,18 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-07-01 — `nx-dvr-watchdog` nunca dispara el redescubrimiento: conteo de canales mal comparado
+
+**Contexto:** `deploy/tools/dvr_watchdog.sh` — mismo incidente del DVR con IP dinámica que las dos entradas siguientes (todas del mismo día). Tras arreglar el crash de `set -e`/`pipefail`, el servicio quedó `active (running)` de forma estable pero `journalctl -u nx-dvr-watchdog` no mostraba **ninguna** línea nueva ni siquiera con las 11 cámaras del cliente "Mova" fallando de forma continua.
+
+**Síntoma:** El watchdog corre, no crashea, pero nunca detecta el fallo total de cámaras ni dispara `nmap`. Sin warnings, sin logs — silencio total, indefinidamente.
+
+**Causa raíz:** `get_n_channels()` contaba `len(cfg.get("channels", []))` directo del `config.yaml` del cliente — para "Mova" daba **16**. Pero `app.py` excluye los canales marcados como `external_channels` de `active_channels` cuando `count_external: false` ([config_loader.py:132-133](deploy/pipelines/config_loader.py#L132-L133)) — de esos 16 canales, 5 son externos y no generan una fuente RTSP real, así que el pipeline solo crea **11** streams (`source-0` a `source-10`). La condición `[[ "$n_failed" -ge "$N" ]]` comparaba el máximo real posible (`n_failed=11`) contra el total mal contado (`N=16`) — `11 -ge 16` nunca es verdadero, sin importar cuántas cámaras reales fallen. El script nunca entraba a ninguna rama que loguee algo, de ahí el silencio total.
+
+**Solución:** Rediseño completo del mecanismo de detección — en vez de parsear `docker logs` y contar canales, `dvr_watchdog.sh` ahora verifica conectividad TCP directa a `<IP configurada>:<puerto RTSP>` cada 10 s (usando `/dev/tcp` de bash, sin dependencias nuevas). Tras 3 chequeos consecutivos fallidos (debounce contra blips de red) dispara el mismo flujo de `nmap` + actualización de `/etc/nx_dvr_ip` + `docker restart`. Esto elimina por completo la necesidad de contar canales o depender del formato de logs del pipeline — ver sección "DVR IP auto-recovery" en `Concepts.md` para el diagrama actualizado.
+
+---
+
 ## 2026-07-01 — `nx-dvr-watchdog` crashea al segundo de arrancar (set -e + pipefail + grep sin match)
 
 **Contexto:** `deploy/tools/dvr_watchdog.sh` — servicio systemd `nx-dvr-watchdog` en el host del Jetson.
