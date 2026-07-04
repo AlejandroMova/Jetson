@@ -664,9 +664,9 @@ Script daemon instalado por `setup.sh` como servicio systemd `nx-dvr-watchdog` e
 - `custom_softmax_parser.so`: Plugin C++ compilado por `docker-entrypoint.sh` para parsear salida softmax del clasificador.
 
 **`osnet/`**
-- `config_infer_sgie_osnet.txt`: Config para SGIE OSNet appearance. `gie-unique-id=3`, FP32, `process-mode=2`, opera sobre `class-ids=0` (personas) del PGIE. `output-tensor-meta=1` expone el tensor para lectura en el probe. El engine `.trt` se genera automáticamente en el primer arranque.
+- `config_infer_sgie_osnet.txt`: Config para SGIE OSNet appearance. `gie-unique-id=3`, FP32, `process-mode=2`, opera sobre `class-ids=0` (personas) del PGIE. `output-tensor-meta=1` expone el tensor para lectura en el probe. `model-engine-file` debe coincidir exactamente con el nombre que DeepStream genera al compilar (`<onnx>_b<batch-size>_gpu<gpu-id>_<network-mode>.engine`) — si no coincide, el engine nunca se cachea y se recompila (~2 min) en cada restart del container, no solo la primera vez. Ver `ErrorHistory.md` 2026-07-04.
 - `osnet_x1_0_market1501.onnx`: Modelo descargado por `setup.sh` vía `download_models.py --reid`. No está en git.
-- `osnet_x1_0_market1501.trt`: Engine TRT compilado por DeepStream al arrancar por primera vez. No está en git.
+- `osnet_x1_0_market1501.onnx_b8_gpu0_fp32.engine`: Engine TRT compilado por DeepStream (batch-size=8, gpu-id=0, FP32). Se genera en el primer arranque y se reutiliza en los siguientes mientras `batch-size`, `gpu-id` y `network-mode` no cambien. No está en git.
 
 **`facedetect_ir/`** — ⚠️ No usado actualmente. El SGIE FaceDetectIR fue eliminado; la detección de rostros usa PeopleNet class_id=2 directamente. El directorio y su `config_infer.txt` se conservan como referencia pero no se cargan en `app.py`.
 

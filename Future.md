@@ -539,6 +539,38 @@ Como alternativa más simple para el experimento inicial: usar Python worker (ON
 
 ---
 
+## ReID cross-Jetson vía Redis local compartido en el mismo sitio (en vez de depender solo del backend)
+
+**Descripción:** Hoy el único mecanismo para reconciliar la identidad de una persona vista por dos Jetsons físicos distintos es el backend: `PersonTracker.find_match()` compara el `appearance_vector` crudo que llega en `person_appearance` contra `recent_exits` (`REID_THRESHOLD=0.65`), con alcance "mismo `tenant_id`" — sin ningún concepto de "sitio físico". La idea es que, cuando un mismo sitio tiene **más de un Jetson** (necesario cuando hay más cámaras de las que un solo Jetson soporta — ver Notas de Rendimiento: máx. 6 streams main / 16 sub — o múltiples DVRs no unificados), esos Jetsons compartan un **Redis local en su propia LAN** donde escriban/lean directamente embeddings y `global_id` resueltos, igual que hoy hace `ReIdManager` con `deploy/reid_db.json`, pero compartido entre procesos/dispositivos en vez de un archivo local a un solo proceso.
+
+**Por qué sería mejor:**
+
+1. **Alcance correctamente delimitado a "mismo sitio físico".** Verificado en código: el modelo `Jetson` en el backend (`NX-Platform/Backend/app/models.py:72-92`) solo tiene un campo `location: str | None` de texto libre — no existe ninguna agrupación estructurada de "estos Jetsons son del mismo sitio". Esto significa que si un tenant tiene dos tiendas separadas, cada una con su propio Jetson, el `find_match()` actual del backend podría (incorrectamente) fusionar la visita de la misma persona en la Tienda A por la mañana y la Tienda B por la tarde en un solo `global_person_id`/sesión — algo que probablemente no tiene sentido de negocio (ver Consideraciones). Un Redis compartido solo alcanzable por LAN local resuelve esto gratis: es físicamente imposible que un Jetson de otro sitio (otra red) le pegue al Redis de este sitio, así que el alcance de "misma persona" queda naturalmente limitado a "mismo sitio físico".
+
+2. **Latencia y resiliencia offline.** Resolver el ReID cross-cámara localmente evita la ida y vuelta a la nube, y sigue funcionando si el sitio pierde internet — consistente con la filosofía del proyecto ("todo el procesamiento de video ocurre on-device... funcionamiento sin dependencia de internet para la inferencia", ver introducción de este CLAUDE.md).
+
+3. **Simplifica el backend.** Si el ReID cross-cámara del caso multi-Jetson-mismo-sitio ya llega resuelto (mismo `global_id`) desde el Jetson, el comparador de embeddings del backend (`PersonTracker.find_match`/`recent_exits`, `NX-Platform/Backend/app/services/person_tracker.py:131-156`) deja de ser necesario para ese caso — quedaría solo como fallback para el caso genuinamente cross-sitio, si es que ese caso llega a tener sentido de negocio.
+
+**Reemplazaría / tocaría:**
+- Archivo: `deploy/pipelines/reid_manager.py` — hoy `ReIdManager` persiste su galería en `deploy/reid_db.json`, un archivo local al proceso/dispositivo. Habría que abstraer el storage detrás de una interfaz (archivo local vs Redis compartido), activable solo cuando el sitio tiene >1 Jetson.
+- Archivo: `deploy/pipelines/config_loader.py` — no existe hoy ningún concepto de "sitio" que agrupe Jetsons; habría que agregar algo como `site_id` en `config.yaml` para que los Jetsons del mismo sitio sepan que deben compartir Redis.
+- Archivo: `deploy/setup.sh` — el flujo de instalación asume un dispositivo autónomo; instalar un segundo Jetson en el mismo sitio necesitaría un flag nuevo ("¿es el primer Jetson del sitio, o se une a uno existente?") para configurar el host del Redis compartido.
+- Archivo: `NX-Platform/Backend/app/services/person_tracker.py` — `find_match()`/`recent_exits` podrían simplificarse o re-scopearse una vez que el caso same-site quede resuelto localmente en el Jetson.
+
+**Preguntas abiertas para la próxima sesión (sin resolver todavía):**
+1. **¿Quién hostea el Redis compartido?** — ¿uno de los Jetsons del sitio actúa como "coordinador" y corre el Redis, o se agrega una cajita/contenedor dedicado en la LAN?
+2. **¿Qué pasa si el nodo que hostea el Redis se cae o se reinicia?** — ¿los demás Jetsons degradan a su galería local (`reid_db.json`) mientras tanto, o pierden ReID cross-cámara temporalmente? Hay que decidir la política de fallback explícitamente, no dejarlo implícito.
+3. **¿Cómo migra `ReIdManager` de gallery local a gallery compartida?** — hoy persiste en `deploy/reid_db.json` por proceso; habría que hacer condicional la lectura/escritura a Redis cuando el modo "sitio multi-Jetson" esté activo, sin romper ni complicar el modo single-Jetson (que debe seguir funcionando igual, sin Redis, para el caso común).
+4. **¿Cómo se descubren los Jetsons entre sí en la LAN?** — ¿mDNS, IP fija documentada en el `config.yaml` del sitio, o reusar Tailscale (ya presente en el stack para VPN mesh de acceso remoto)?
+
+**Consideraciones:**
+- Este cambio es **independiente** de los bugs [[Campo `global_id` del Jetson se descarta en todos los eventos de persona]] y [[Campo `entry_type` de `person_entry` se descarta silenciosamente en el backend]] — esos son bugs del caso same-Jetson (un solo dispositivo) y deben arreglarse primero, por separado. Esta mejora es específicamente para el caso multi-Jetson-mismo-sitio.
+- Vale la pena cuestionar si el matching cross-sitio (tiendas distintas del mismo tenant) tiene sentido de negocio en absoluto — fusionar la visita de una persona a la Tienda A con su visita a la Tienda B como "la misma sesión" probablemente NO es el comportamiento deseado para dwell-time/conteo de visitas por tienda. Si nunca se quiere ese comportamiento, el backend debería dejar de intentarlo (hoy lo hace sin querer, por falta de scoping), y el Redis local sería la única forma de ReID cross-cámara que tendría sentido real en el producto.
+- Multi-Jetson-por-sitio no es el caso común hoy — un solo Jetson soporta hasta 16 sub-streams o 6 main streams desde un DVR. Sería relevante solo para sitios grandes (fábricas, centros comerciales) con más cámaras de las que un Jetson soporta, o con múltiples DVRs no unificados.
+- Esfuerzo estimado: mayor que un fix puntual — toca `setup.sh`, `config_loader.py`, `reid_manager.py`, y potencialmente el backend. Requiere diseño explícito (resolver las 4 preguntas de arriba) antes de implementar — no es un cambio de una sola sesión.
+
+---
+
 ## [Bug] `EmployeeIdentifiedEvent` es código muerto — nunca lo genera el Jetson
 
 **Descripción:** El backend define `EmployeeIdentifiedEvent` con `type: "employee_identified"` y `employee_id: UUID` (FK a `employees`) en `schemas.py:167–175`. Este tipo está incluido en el `JetsonEvent` union y tiene lógica especial en `events.py:105`. El Jetson nunca genera este evento — fue probablemente el tipo original de reconocimiento facial antes de ser renombrado a `employee_seen`. El código muerto confunde porque `attendance.py` lo busca directamente (ver Bug de asistencia), y cualquier desarrollador que lea el schema asume que el Jetson lo envía.

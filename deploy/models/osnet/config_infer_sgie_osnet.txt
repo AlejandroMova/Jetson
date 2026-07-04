@@ -4,8 +4,11 @@ gpu-id=0
 # Absolute paths to ONNX and compiled TRT engine.
 # The engine is auto-generated on first run (~2 min, same as PeopleNet).
 # /nx_tech is the repo mount point inside the container (docker-compose.yml).
+# model-engine-file must match DeepStream's auto-generated name exactly
+# (<onnx>_b<batch-size>_gpu<gpu-id>_<network-mode>.engine) or it rebuilds
+# from scratch on every restart instead of loading the cached engine.
 onnx-file=/nx_tech/models/osnet/osnet_x1_0_market1501.onnx
-model-engine-file=/nx_tech/models/osnet/osnet_x1_0_market1501.trt
+model-engine-file=/nx_tech/models/osnet/osnet_x1_0_market1501.onnx_b8_gpu0_fp32.engine
 
 # ImageNet normalization: output_c = (pixel_c - mean_c*255) / (std_c*255)
 # DeepStream formula: output = (pixel - offset) * net_scale_factor

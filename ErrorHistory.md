@@ -6,6 +6,20 @@ Ver regla 10 de CLAUDE.md para el formato de entradas y el protocolo completo.
 
 ---
 
+## 2026-07-04 — WS de posiciones tarda ~2 min en conectar: engine TRT de OSNet se recompila en cada arranque
+
+**Contexto:** `deploy/models/osnet/config_infer_sgie_osnet.txt` — SGIE de appearance re-ID (gie-id=3). Reportado como "el WS tarda mucho en conectarse" al correr `stream.sh`, con la duda de si era un problema del WebSocket o algo más general.
+
+**Síntoma:** Entre "Starting pipeline…" y el primer log de `ws_client: WS connected` pasan ~2 min 18 s en cada arranque del container (`stream.sh` o `docker compose up`), no solo la primera vez. `WsPositionClient.start()` se llama al final de la construcción del pipeline en `app.py`, así que todo lo que retrase el arranque del pipeline retrasa igual el WS — el WS en sí conecta en ~1.3 s una vez que se llama.
+
+**Causa raíz:** `model-engine-file` apuntaba a `osnet_x1_0_market1501.trt`, pero DeepStream guarda el engine compilado con el nombre automático `<onnx>_b<batch-size>_gpu<gpu-id>_<network-mode>.engine` (visto en el log: `serialize cuda engine to file: osnet_x1_0_market1501.onnx_b8_gpu0_fp32.engine successfully`). Como el nombre buscado nunca coincide con el nombre real, el engine **nunca queda cacheado** — se recompila desde el ONNX en cada restart del container, aunque `./models` esté bind-mounteado y persista en disco. Los otros dos modelos (PeopleNet, AgeGender) sí tienen `model-engine-file` igual al nombre automático real, por eso esos deserializan al instante en cada restart y no sufren este problema.
+
+**Solución:** Cambiar `model-engine-file` en `config_infer_sgie_osnet.txt` para que coincida exactamente con el nombre que DeepStream genera: `osnet_x1_0_market1501.onnx_b8_gpu0_fp32.engine` (batch-size=8, gpu-id=0, network-mode=0 → fp32). Con esto el engine compilado se reutiliza entre restarts y el arranque del pipeline (y por lo tanto el WS) deja de esperar la recompilación de ~2 min.
+
+**Nota aparte (no relacionada):** el log de Railway mostraba `https://vigilant-eagerness-production.up.railway.app is not an accepted origin` en el servidor Socket.IO del dashboard (`app/socket/events.py`, backend). Es un servidor distinto al `/ws/positions` que usa el Jetson (WebSocket plano, sin chequeo de Origin) — confirmado en el log: `"WebSocket /ws/positions" [accepted]` se acepta sin problema. El origin rechazado es el dominio del propio backend en Railway, no el frontend — sugiere un healthcheck/monitor externo pegándole a `/socket.io/`, no el dashboard real. Pendiente de investigar si se quiere eliminar el ruido en logs, pero no afecta al Jetson.
+
+---
+
 ## 2026-07-01 — `nx-dvr-watchdog` nunca dispara el redescubrimiento: conteo de canales mal comparado
 
 **Contexto:** `deploy/tools/dvr_watchdog.sh` — mismo incidente del DVR con IP dinámica que las dos entradas siguientes (todas del mismo día). Tras arreglar el crash de `set -e`/`pipefail`, el servicio quedó `active (running)` de forma estable pero `journalctl -u nx-dvr-watchdog` no mostraba **ninguna** línea nueva ni siquiera con las 11 cámaras del cliente "Mova" fallando de forma continua.
