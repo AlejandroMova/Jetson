@@ -216,82 +216,38 @@ Store on `ActivePerson.demographics`. Propagate to `PersonSession.demographics`.
 
 Two model pairs run independently:
 - **ArcFace** (InsightFace buffalo_l): identifies WHO a person is against `known_faces.json`
-- **OSNet** (appearance_worker): identifies WHICH body this is cross-camera (§4.1)
+- **OSNet** (SGIE appearance): identifies WHICH body this is cross-camera (§4.1) — resolves the
+  `global_id` that ArcFace identity now rides along on
 
 **Employee ID contract (important):**
-`employee_id` in all face recognition events is now the **backend-assigned UUID** from `employees.id`
-(not the employee's name). The Jetson receives this UUID via `GET /api/employees/embeddings` and
-echoes it in events. The backend can join directly on `Employee.id` without a name-based lookup.
+`employee_id` is the **backend-assigned UUID** from `employees.id` (not the employee's name). The
+Jetson receives this UUID via `GET /api/employees/embeddings` and tags the `global_id` with it once
+ArcFace locks identity. The backend can join directly on `Employee.id` without a name-based lookup.
 
 **Roster sync flow:**
 1. Admin activates employee on platform → backend generates ArcFace embedding → emits `face_update`
    Socket.IO event on namespace `/jetson` (room `jt_{tenant_id}`)
 2. Jetson's `JetsonSyncClient` receives `face_update` → calls `GET /api/employees/embeddings`
 3. Jetson updates `known_faces.json` with UUID-keyed entries
-4. On next recognition, events carry the UUID in `employee_id`
+4. On next recognition, the resolved `global_id` gets tagged with the UUID
 
-Event names differ by sector:
+**Employee identity no longer travels as discrete events (comercio/industrial).** `employee_seen` /
+`employee_presence` / `employee_exit` were removed — recognized employees now ride along in
+`positions_snapshot` (§5) via its `employee_id` / `face_confirmed` fields instead, exactly like any
+other tracked person, and the backend derives attendance (`EmployeeZoneInterval`,
+`EmployeePositionLog`) from that stream. See `deploy/pipelines/face_recognizer.py` and
+`_FaceRecognitionHandler` in `deploy/pipelines/probes.py`.
 
-| Sector | Recognized | Heartbeat | Exit | Unknown |
-|--------|-----------|-----------|------|---------|
-| `comercio` | `employee_seen` | `employee_presence` | `employee_exit` | (no event) |
-| `industrial` | `employee_seen` | `employee_presence` | `employee_exit` | (no event) |
-| `hogar` | `known_person_seen` | (none) | `known_person_exit` | `unknown_person_alert` |
-
-#### `employee_seen` / `known_person_seen`
-
-Fired on first face identification for this track in this camera session.
-
-```json
-{
-  "type": "employee_seen",
-  "track_id": 15,
-  "employee_id": "3f2a1b4c-0000-0000-0000-000000000001",
-  "similarity": 0.87,
-  "bbox": { "left": 210, "top": 100, "width": 55, "height": 165 }
-}
-```
-
-```json
-{
-  "type": "known_person_seen",
-  "track_id": 3,
-  "name": "Maria",
-  "similarity": 0.91,
-  "bbox": { "left": 140, "top": 120, "width": 50, "height": 160 }
-}
-```
-
-`similarity` = ArcFace cosine similarity (0–1). Jetson already applied its threshold (≥ 0.50) — events below that are never sent.
-
-`employee_id` is a UUID string matching `employees.id` in the backend DB. No name lookup needed.
-
-Open an `EmployeeZoneInterval`. For hogar `known_person_seen`, trigger "Maria arrived home" push notification.
-
-#### `employee_presence`
-
-Heartbeat every 30s while the employee is visible. No equivalent for hogar.
-
-```json
-{
-  "type": "employee_presence",
-  "track_id": 15,
-  "employee_id": "3f2a1b4c-0000-0000-0000-000000000001"
-}
-```
-
-Update `EmployeeZoneInterval.last_heartbeat`. If missed for > 90s, assume the Jetson crashed — estimate `exit ≈ last_heartbeat + 30s`.
-
-#### `employee_exit` / `known_person_exit`
-
-```json
-{ "type": "employee_exit",    "employee_id": "3f2a1b4c-...", "track_id": 15, "dwell_seconds": 870.0 }
-{ "type": "known_person_exit","name": "Maria",               "track_id": 3,  "dwell_seconds": 300.0 }
-```
-
-Close the `EmployeeZoneInterval`.
+Only the hogar sector still uses a discrete event, because `unknown_person_alert` is an intrusion
+alert, not attendance:
 
 #### `unknown_person_alert` (hogar only)
+
+**Known limitation:** `_FaceRecognitionHandler.process_face` (in `probes.py`) doesn't process any
+face — recognized or unknown — until ReID has resolved a `global_id` for that track (see §4.1). On
+a Jetson without the OSNet model installed, `global_id` never resolves, so `unknown_person_alert`
+never fires either. This is an accepted, deferred limitation — hogar isn't a priority for the
+positions-based redesign yet. See `CLAUDE.md`'s "Reconocimiento Facial" section.
 
 ```json
 {
@@ -349,7 +305,7 @@ Implementation checklist:
 - Receive JSON text frames; parse as `positions_snapshot`
 - No need to send back anything — unidirectional
 
-Message format (sent every 10s per camera):
+Message format (sent every 1s per camera, `POSITION_SEND_INTERVAL` in `probes.py`):
 
 ```json
 {
@@ -359,11 +315,26 @@ Message format (sent every 10s per camera):
   "camera_id": "jetson-mova-001-ch01",
   "timestamp": "2025-05-01T14:32:15Z",
   "positions": [
-    { "track_id": 42, "x_norm": 0.45, "y_norm": 0.62 },
-    { "track_id": 43, "x_norm": 0.21, "y_norm": 0.34 }
+    { "global_id": "a3f92c1b8d04", "x_norm": 0.45, "y_norm": 0.62,
+      "employee_id": null, "face_confirmed": false },
+    { "global_id": "7be104fa22c9", "x_norm": 0.21, "y_norm": 0.34,
+      "employee_id": "3f2a1b4c-0000-0000-0000-000000000001", "face_confirmed": true }
   ]
 }
 ```
+
+Entries are keyed by `global_id` (cross-camera ReID identity from `ReIdManager`), not `track_id` —
+`track_id` resets on every camera change and never appears in this payload.
+
+`employee_id` is set once ArcFace tags a `global_id` as a known employee (see §4.3) — it stays set
+for the `global_id`'s lifetime (permanent, ~1h TTL), regardless of whether the face is visible again.
+`face_confirmed` is `true` only in the buffering cycle(s) where a face crop was actually processed
+for that `global_id` this second — it is NOT a rolling "last confirmed" timestamp, it resets to
+`false` every cycle and only flips back to `true` when a fresh face check happens. The backend only
+persists an employee's zone interval as attendance if it was confirmed at least once during its
+life (protects against ReID/OSNet handing an employee's `global_id` to a different physical person
+who never shows their face — see `app/socket/positions.py::_close_employee_interval` on the
+backend).
 
 `x_norm`, `y_norm` ∈ [0, 1] relative to the camera's frame size. Map to pixels with:
 ```python
@@ -473,18 +444,22 @@ Dedup rule: ignore re-entry within 5 minutes of last session close for the same 
 
 ### `EmployeeZoneInterval`
 
-One continuous presence interval for a known person in one camera zone.
+One continuous presence interval for an employee in one camera zone, derived from
+`positions_snapshot` (§5) rather than discrete events — see
+`app/socket/positions.py::_record_employee_positions`/`_close_employee_interval` on the backend.
+Only ever persisted if the interval had at least one `face_confirmed: true` position during its
+life; otherwise discarded when the zone closes.
 
 ```python
 @dataclass
 class EmployeeZoneInterval:
-    employee_id:      str
+    employee_id:      UUID          # FK employees.id
     camera_id:        str
-    track_id:         int
+    track_id:         int | None    # positions_snapshot has no track_id — always None now
     entry_time:       datetime
     exit_time:        datetime | None
     duration_seconds: float | None
-    last_heartbeat:   datetime   # updated by employee_presence every 30s
+    last_heartbeat:   datetime      # updated on every position for this employee
 ```
 
 ---
@@ -712,7 +687,7 @@ def camera_transition_matrix(sessions: list[PersonSession]) -> dict[tuple, int]:
 
 **What it shows:** Which areas each employee was in, and for how long.
 
-**Data source:** `EmployeeZoneInterval` records (from `employee_seen`, `employee_presence`, `employee_exit`).
+**Data source:** `EmployeeZoneInterval` records, derived from `positions_snapshot` (§5).
 
 ```python
 def employee_timeline(intervals: list[EmployeeZoneInterval], 
@@ -821,7 +796,7 @@ def find_match(vector, jetson_id, camera_id, recent_exits):
 
 | Model | Field | Range | Threshold | Meaning |
 |-------|-------|-------|-----------|---------|
-| ArcFace (InsightFace) | `similarity` in `employee_seen` | 0–1 | Jetson applies ≥ 0.50 before sending | Face identity |
+| ArcFace (InsightFace) | internal to `face_recognizer.py` (`FACE_SIMILARITY_THRESHOLD`) — never transmitted | 0–1 | Jetson applies ≥ 0.50 before tagging a `global_id` | Face identity |
 | OSNet | `appearance_vector` dot product | 0–1 | Backend applies ≥ 0.65 in `find_match` | Body/clothing re-ID |
 
 Never mix these scores. A person can have high OSNet similarity (same clothing) but low ArcFace (different face angle), and vice versa.
@@ -835,7 +810,7 @@ Never mix these scores. A person can have high OSNet similarity (same clothing) 
 | `critical` | (reserved for future: fall detection, fire/smoke) | Push notification immediately |
 | `high` | (reserved for future: EPP violation) | Push notification ≤ 30s |
 | `medium` | `unknown_person_alert` | Push with face photo |
-| `info` | `person_entry`, `person_classified`, `employee_seen`, `analytics_snapshot` | Dashboard display only |
+| `info` | `person_entry`, `person_classified`, `analytics_snapshot` | Dashboard display only |
 
 ---
 
@@ -870,12 +845,11 @@ The Jetson reconnects automatically (exponential backoff 1s → 30s). Position s
 
 The Jetson queues up to 512 events. If the backend is down for several minutes, oldest events are silently discarded. Do not assume events always arrive in contiguous order.
 
-### `employee_exit` never arrives
+### Employee zone never closes cleanly
 
-If the Jetson crashes mid-session, `employee_exit` may never be sent. Use the heartbeat-based estimation:
-
-```python
-estimated_exit = interval.last_heartbeat + timedelta(seconds=30)
-```
-
-Apply this in a scheduled cleanup job (e.g., every 5 minutes) to close stale `EmployeeZoneInterval` records.
+Since employee zones close on a camera change in `positions_snapshot` rather than a discrete exit
+event, an employee who leaves the building (or a blind spot with no camera) never triggers a
+reactive close — nothing tells the backend they're gone. `app/tasks/scheduler.py`'s
+`_close_stale_employee_intervals_job` handles this: every ~75s it checks each open
+`emp_zone_state` in Redis, and if `last_heartbeat` is older than `EMPLOYEE_GONE_THRESHOLD_S`
+(15 min), closes the interval using the last known heartbeat as `exit_time`.

@@ -126,7 +126,7 @@ class ReIdManager:
 
     Usage:
         mgr = ReIdManager("/opt/nx/reid_db.json")
-        global_id, event_type, prev_camera = mgr.match_or_create(embedding, camera_id)
+        global_id, event_type, prev_camera, expired_ids = mgr.match_or_create(embedding, camera_id)
         mgr.flush()   # call on shutdown
     """
 
@@ -152,28 +152,32 @@ class ReIdManager:
         camera_id: str,
         threshold: Optional[float] = None,
         create: bool = True,
-    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
         """
-        Match embedding against the DB and return (global_id, event_type, prev_camera_id).
+        Match embedding against the DB and return
+        (global_id, event_type, prev_camera_id, expired_ids).
 
         threshold overrides SIMILARITY_THRESHOLD for this call — probes.py computes the
         right value based on the detection's aspect ratio before calling this method.
-        If create=False and no match is found, returns (None, None, None) instead of
-        seeding a new identity; used for partial-body detections that should not create
-        new identities but can still match existing ones.
+        If create=False and no match is found, returns (None, None, None, expired_ids)
+        instead of seeding a new identity; used for partial-body detections that should
+        not create new identities but can still match existing ones.
         event_type is one of EVENT_NEW_PERSON, EVENT_PERSON_RETURN, EVENT_CHANNEL_CHANGE.
         prev_camera_id is None for new persons.
+        expired_ids lists any global_ids just dropped by _expire_stale() this call —
+        the caller (probes.py) uses it to purge FaceRecognizer's own vote/lock state
+        for the same ids, since nothing else would ever tell it to forget them.
         Thread-safe.
         """
         with self._lock:
-            self._expire_stale()
+            expired_ids = self._expire_stale()
             now = time.time()
 
             best_gid, best_sim = self._find_best_match(embedding, threshold=threshold)
 
             if best_gid is None:
                 if not create:
-                    return None, None, None
+                    return None, None, None, expired_ids
                 gid = uuid.uuid4().hex[:12]
                 self._db[gid] = _Entry(
                     global_id=gid,
@@ -185,7 +189,7 @@ class ReIdManager:
                 logger.info("ReID: new_person gid=%s best_sim=%.3f (no match below threshold=%.2f)",
                             gid, best_sim, threshold if threshold is not None else SIMILARITY_THRESHOLD)
                 self._maybe_save()
-                return gid, EVENT_NEW_PERSON, None
+                return gid, EVENT_NEW_PERSON, None, expired_ids
             # TODO revisar si no poner esto en un else, porque acabamos de poner el tiempo que lo encontramos, no tiene sentido tiempo absent de una persona nueva
             entry = self._db[best_gid]
             time_absent = now - entry.last_seen_ts
@@ -207,7 +211,7 @@ class ReIdManager:
                 len(entry.gallery), " +angle" if added else "",
             )
             self._maybe_save()
-            return best_gid, event, prev_camera
+            return best_gid, event, prev_camera, expired_ids
 
     def update_embedding(self, global_id: str, embedding: np.ndarray) -> None:
         """Add embedding to the gallery of a known global_id without matching.
@@ -271,8 +275,14 @@ class ReIdManager:
 
         return (ids[best_idx], best_sim) if best_sim >= effective_threshold else (None, best_sim)
 
-    def _expire_stale(self) -> None:
-        """Elimina entradas que no han sido vistas en REID_TTL_S segundos. Llamar dentro del lock."""
+    def _expire_stale(self) -> List[str]:
+        """Elimina entradas que no han sido vistas en REID_TTL_S segundos. Llamar dentro del lock.
+
+        Retorna la lista de global_ids recién expirados, para que match_or_create()
+        se la pase al llamador (probes.py) — es la única forma de avisarle a
+        FaceRecognizer que también olvide su estado de votos/candado para esos ids,
+        ya que ReIdManager y FaceRecognizer son diccionarios independientes.
+        """
         now = time.time()
         stale = [gid for gid, e in self._db.items()
                  if now - e.last_seen_ts > REID_TTL_S]
@@ -280,6 +290,7 @@ class ReIdManager:
             del self._db[gid]
         if stale:
             logger.debug("ReID: expired %d stale entries", len(stale))
+        return stale
 
     def _maybe_save(self) -> None:
         if time.time() - self._last_save_ts >= SAVE_INTERVAL_S:

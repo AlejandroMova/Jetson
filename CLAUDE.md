@@ -114,11 +114,12 @@ Identifica cuando la misma persona aparece en cámaras distintas usando embeddin
 La emisión de `person_entry` se **difiere** hasta que el embedding esté listo (deadline 30 frames / ~1 s a 30fps como fallback de seguridad). Con el SGIE el embedding llega en el mismo frame — el fallback solo aplica si el bbox nunca supera el mínimo de 32×32 px del SGIE.
 
 - **Embedding:** OSNet-x1.0 — vectores 512-dim L2-normalizados, extraídos **directamente del SGIE DeepStream** (gie-id=3) vía `NvDsInferTensorMeta` en el probe. Sin `AppearanceWorker`, sin Python thread, sin cola. DeepStream gestiona el crop y el engine TRT.
-- **Matching:** max-similitud coseno ≥ 0.55 sobre **galería de hasta 5 embeddings** por persona. `ReIdManager` — O(N×K) con K≤5, vectorizable con numpy. Nuevos ángulos se añaden a la galería solo si son suficientemente distintos a los existentes (sim < 0.85); cuando la galería está llena se reemplaza el miembro menos informativo.
+- **Matching:** max-similitud coseno ≥ 0.68 (`SIMILARITY_THRESHOLD`) sobre **galería de hasta 10 embeddings** por persona (`GALLERY_MAX_SIZE`, configurable por cliente vía `reid_gallery_size`). `ReIdManager` — O(N×K), vectorizable con numpy. Nuevos ángulos se añaden a la galería solo si son suficientemente distintos a los existentes (sim < 0.85); cuando la galería está llena se reemplaza el miembro menos informativo.
 - **Same-camera re-detection:** si `channel_change` ocurre con `prev_camera == camera_id` (tracker pierde y re-detecta en la misma cámara), se demota a `person_return` para no emitir un evento de cambio de cámara espurio.
 - **Persistencia:** `deploy/reid_db.json` — sobrevive reinicios; TTL 1 hora sin actividad
 - **Ventana de presencia:** 5 min (configurable en `reid_manager.py` como `PRESENCE_WINDOW_S`)
 - Se activa automáticamente si el ONNX existe en `models/osnet/` (el engine TRT se compila en el primer arranque, ~2 min extra)
+- **Limpieza cruzada con reconocimiento facial:** `match_or_create()` retorna una 4ª posición, `expired_ids` — los `global_id`s que `_expire_stale()` acaba de olvidar (TTL 1h). `probes.py::_handle_appearance_reid()` usa esa lista para llamar `FaceRecognizer.forget(gid)` y limpiar `_employee_by_global_id` — sin esto, el estado de votos/candado de caras y el tag de empleado por `global_id` crecerían indefinidamente, ya que `ReIdManager` y `FaceRecognizer` son diccionarios independientes que nada más sincroniza.
 
 ### Edad y Género (`age_gender`) — ✅ Activo
 Clasifica a cada persona detectada en una de 6 categorías: female_young, female_adult, female_senior, male_young, male_adult, male_senior. Requiere al menos 10 muestras del SGIE antes de confirmar la clasificación (sistema de votación para reducir falsos positivos).
@@ -127,14 +128,16 @@ Clasifica a cada persona detectada en una de 6 categorías: female_young, female
 - **Parser custom:** `custom_softmax_parser.so` compilado en el entrypoint del contenedor
 
 ### Reconocimiento Facial (`face_recognition`) — ✅ Activo
-Identifica personas conocidas (empleados, residentes) a partir de una base de datos de embeddings faciales. Usa PeopleNet class 2 (face) para detectar rostros, luego un worker Python extrae el embedding y lo compara con la DB. Requiere 3 coincidencias antes de bloquear la identidad por persona. No hay SGIE dedicado para caras — el SGIE FaceDetectIR fue eliminado.
+Identifica personas conocidas (empleados, residentes) a partir de una base de datos de embeddings faciales. Usa PeopleNet class 2 (face) para detectar rostros, luego un worker Python extrae el embedding y lo compara con la DB. No hay SGIE dedicado para caras — el SGIE FaceDetectIR fue eliminado.
 - **Detección:** PeopleNet class_id=2 (face) — mismo PGIE que detecta personas, sin SGIE adicional
 - **Embedding:** InsightFace buffalo_l — ArcFace 512-dim, threshold similitud coseno ≥ 0.50
-- **Worker:** `FaceRecognizer` (Python thread) — ahora usa UUID de backend como clave de identidad
+- **Worker:** `FaceRecognizer` (Python thread) — indexado por `global_id` de ReID, no por `track_id`. `track_id` se reinicia en cada cámara nueva, lo que obligaba a re-votar desde cero cada vez que el empleado cambiaba de cámara; con `global_id` la identidad ya bloqueada viaja automáticamente vía la continuidad de apariencia de `ReIdManager`. `probes.py::_FaceRecognitionHandler.process_face()` no alimenta al worker hasta que `_active_tracks[(pad_index, track_id)].global_id` esté resuelto — la espera es de pocos frames, insignificante frente al ciclo de votación.
+- **Ventana de votos (`FACE_VOTES_REQUIRED=3`):** `deque(maxlen=3)` por `global_id`, se sigue alimentando aunque ya haya un candado — si la mayoría de la ventana cambia, se corrige el tag (`Face re-tagged` en logs). Salvaguarda contra que `ReIdManager`/OSNet le pase el `global_id` de un empleado a otra persona por error (ej. uniformes parecidos entre empleados) — la cara sigue siendo la única fuente de verdad para la identidad, ReID nunca la asigna por sí solo.
 - **DB:** `known_faces.json` — formato nuevo: `{"<uuid>": {"name": "...", "embeddings": [[...]]}}`. Formato legacy (nombre-clave) sigue siendo compatible en lectura.
 - **Registro automático:** `JetsonSyncClient` recibe `face_update` de backend via Socket.IO `/jetson` namespace, llama `sync_from_backend()` que hace GET `/api/employees/embeddings` y actualiza la DB en caliente sin reiniciar el pipeline
-- **Semántica por sector:** comercio/industrial → `employee_seen/presence/exit`; hogar → `known_person_seen/unknown_person_alert`
-- **`employee_id` en eventos:** UUID string del backend (`employees.id`) — no el nombre del empleado
+- **Ya no hay eventos discretos para comercio/industrial** (`employee_seen`/`employee_presence`/`employee_exit` eliminados). La identidad de empleado viaja dentro de `positions_snapshot` — `_accumulate_positions()` agrega `employee_id` (de `_employee_by_global_id`) y `face_confirmed` (booleano por ciclo de ~1s, `True` solo si se procesó una cara para ese `global_id` en ese ciclo) a cada posición. `_employee_by_global_id` dura mientras el `global_id` viva, pero **no es incondicional**: se limpia si `ReIdManager` expira el `global_id`, o si la ventana deslizante de votos (o un reload por revocación) hace que `FaceRecognizer` decida que ya no es ese empleado (ver `process_face`, rama `else`). El backend (`app/socket/positions.py`) solo persiste la asistencia de una estadía en cámara si tuvo al menos una confirmación de cara durante su vida.
+- **Hogar** conserva `unknown_person_alert` como evento discreto (es alerta de intrusión, no asistencia) — pero comparte el mismo gate de `global_id` que el reconocimiento de empleados: en un Jetson sin OSNet instalado, tampoco dispara. Limitación aceptada y diferida — hogar no es prioridad de este rediseño.
+- **`employee_id`:** UUID string del backend (`employees.id`) — no el nombre del empleado. Tageado sobre el `global_id`, nunca transmitido en eventos sueltos.
 
 ### Detección de EPP, Fuego/Humo, Placas — 🔄 Pendiente (no en MVP)
 Removidas del MVP por falta de modelos entrenados. Ver `Future.md` para el plan de reintegración.
@@ -562,7 +565,7 @@ El motor central de analytics. Probe único (`osd_sink_pad_buffer_probe`) en `ca
 - `NxApiClient`: cola async → thread worker → HTTP POST al backend (fire-and-forget, no bloquea). Soporta callbacks de éxito por endpoint (`register_success_callback`) invocados desde el worker thread cuando el backend confirma 2xx.
 - `_AgeGenderHandler`: acumula 10 votes del SGIE (gie-id=2) antes de confirmar clasificación; emite `person_classified`
 - `_extract_osnet_embedding(obj_meta)`: lee el tensor 512-dim del SGIE OSNet (gie-id=3) desde `NvDsInferTensorMeta` — síncrono, sin thread. `_handle_appearance_reid()` lo llama por cada persona visible y lo pasa a `ReIdManager`.
-- `_FaceRecognitionHandler`: cruza detecciones de cara de PeopleNet (class_id=2) con el `FaceRecognizer`; emite `employee_seen/presence/exit` o `unknown_person_alert`
+- `_FaceRecognitionHandler`: cruza detecciones de cara de PeopleNet (class_id=2) con el `FaceRecognizer`, indexado por `global_id` (no `track_id`) una vez que ReID lo resuelve. Ya no emite eventos discretos para comercio/industrial — tagea `_employee_by_global_id`/`_face_confirmed_this_cycle`, consumidos por `_accumulate_positions` para que la identidad viaje en `positions_snapshot`. Solo `unknown_person_alert` (hogar) sigue siendo un evento discreto.
 - `osd_sink_pad_buffer_probe`: probe único. Lazy frame read: GPU→CPU solo cuando workers necesitan pixels, `NX_STREAM_ENABLED=true`, o la escena está vacía y toca capturar reference frame (a lo sumo cada 30 s). Al final del loop de cámara, si stream mode activo: dibuja bboxes+labels con OpenCV y empuja a `camera_frame_queues[camera_id]`.
 - **Reference frame — retry + cambio visual + filtro de brillo**: se evalúa cuando no hay personas visibles (`visible_ids` vacío) y el frame tiene suficiente iluminación (`_frame_is_bright_enough()`, media ≥ `REFERENCE_FRAME_MIN_BRIGHTNESS=30.0`/255 — rechaza frames nocturnos). El primer frame válido se envía y se reintenta cada `REFERENCE_FRAME_RETRY_SECS=30s` hasta confirmar 2xx. Una vez confirmado, solo se reenvía si han pasado `REFERENCE_FRAME_MIN_INTERVAL_SECS=86400s` (24 h) Y `_scene_changed()` detecta ≥ `REFERENCE_FRAME_CHANGE_THRESHOLD=0.15` (15 %) de diferencia normalizada por iluminación. **Importante:** el lazy frame read solo decodifica el frame cuando las condiciones de tiempo se cumplen (≥30 s sin confirmar, ó ≥24 h desde último confirmado) — no en cada frame vacío. Objetos no-persona detectados por PeopleNet (bolsos, caras sin cuerpo, `PGIE_CLASS_BAG`/`PGIE_CLASS_FACE`) no bloquean el reference frame. El backend guarda historial completo (INSERT, no UPSERT) para que las consultas históricas de heatmap usen el fondo correcto para cualquier período.
 - **`_frame_is_bright_enough(frame_np)`**: redimensiona a 64×36, toma la media del canal gris; retorna `False` si media < `REFERENCE_FRAME_MIN_BRIGHTNESS` (30.0).
@@ -587,8 +590,10 @@ Handler genérico de mensajes del bus GStreamer (EOS, WARNING, ERROR). Estándar
 **`common/FPS.py`**
 Medidor de FPS con ventana de 5 segundos. Clase `GETFPS` con `get_fps()` y `print_data()`.
 
-**`face_recognizer.py`** (~270 líneas)
-Worker thread para reconocimiento facial. Carga `known_faces.json` (dos formatos: legacy nombre-clave, nuevo UUID-clave `{"uuid": {"name": "...", "embeddings": [...]}}`) en `_load_db()`. Para cada crop de rostro: extrae embedding 512-dim con InsightFace buffalo_l, calcula similitud coseno contra la DB, acumula 3 votos antes de bloquear identidad. Threshold: ≥ 0.50.
+**`face_recognizer.py`** (~330 líneas)
+Worker thread para reconocimiento facial. Carga `known_faces.json` (dos formatos: legacy nombre-clave, nuevo UUID-clave `{"uuid": {"name": "...", "embeddings": [...]}}`) en `_load_db()`. Para cada crop de rostro: extrae embedding 512-dim con InsightFace buffalo_l, calcula similitud coseno contra la DB. Threshold: ≥ 0.50. `_locked`/`_votes` están indexados por `global_id` (no `track_id`) — `_votes` es un `deque(maxlen=FACE_VOTES_REQUIRED=3)` por `global_id` que se sigue alimentando aunque ya haya un candado, para poder corregirlo si la mayoría cambia (protección contra que ReID/OSNet confunda a dos empleados con uniformes parecidos).
+- `enqueue(face_crop, identity_key, frame_num, camera_id)` / `get_result(identity_key)`: `identity_key` es el `global_id`, no el `track_id` — renombrado en esta migración.
+- `forget(global_id)`: limpia `_locked`/`_votes` para un `global_id` que `ReIdManager` ya expiró — llamado desde `probes.py::_handle_appearance_reid()` con los `expired_ids` que retorna `match_or_create()`. Sin esto, ambos dicts crecerían indefinidamente.
 - `sync_from_backend(action, employee_id)`: llama GET `/api/employees/embeddings`, reescribe JSON a disco y llama `reload()` — bloqueante, ejecutar en hilo separado
 - `reload(raw_db)`: reemplaza `_db` y `_uuid_to_name` en memoria; resetea `_locked` y `_votes` para evitar votos stale
 - `get_display_name(uuid_str)`: retorna nombre legible para OSD (de `_uuid_to_name`)
@@ -598,15 +603,15 @@ Worker thread para reconocimiento facial. Carga `known_faces.json` (dos formatos
 Worker Socket.IO que mantiene conexión persistente al namespace `/jetson` del backend. Autentica con `X-API-Key` en el dict `auth` de Socket.IO. En `face_update` recibido: despacha `sync_callback(action, employee_id)` en hilo separado (sin bloquear el event loop). También dispara un sync en `on_connect` para sincronizar si el Jetson estuvo offline. Reconexión automática gestionada por python-socketio.
 
 
-**`reid_manager.py`** (~235 líneas)
-Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con **galería de embeddings**, timestamps y cámara actual. Cada `global_id` almacena hasta `GALLERY_MAX_SIZE=5` vectores que representan distintos ángulos/poses. El matching usa `max(query @ emb_i for emb_i in gallery)`. API pública:
-- `match_or_create(embedding, camera_id)` — retorna `(global_id, event_type, prev_camera_id)`
+**`reid_manager.py`** (~245 líneas)
+Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_id → _Entry`) con **galería de embeddings**, timestamps y cámara actual. Cada `global_id` almacena hasta `GALLERY_MAX_SIZE=10` vectores que representan distintos ángulos/poses. El matching usa `max(query @ emb_i for emb_i in gallery)`. API pública:
+- `match_or_create(embedding, camera_id)` — retorna `(global_id, event_type, prev_camera_id, expired_ids)`. `expired_ids` son los `global_id`s que `_expire_stale()` acaba de olvidar en esta llamada — el caller (`probes.py`) los usa para limpiar `FaceRecognizer.forget()` y `_employee_by_global_id`.
 - `update_embedding(global_id, embedding)` — añade a la galería con diversity check (sim < 0.85)
 - `flush()` — persiste a disco al apagar el pipeline
-Persiste la DB en `deploy/reid_db.json` cada 30 s. Constantes: `SIMILARITY_THRESHOLD=0.55`, `GALLERY_MAX_SIZE=10`, `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
+Persiste la DB en `deploy/reid_db.json` cada 30 s. Constantes: `SIMILARITY_THRESHOLD=0.68`, `GALLERY_MAX_SIZE=10`, `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
 
-**`ws_client.py`** (~136 líneas)
-WebSocket persistente hacia el backend. Envía snapshots de posiciones normalizadas (x, y, track_id) cada 10 segundos por cámara — usados por el backend para generar heatmaps. Reconexión automática con backoff exponencial (1s → 30s). Silencioso si no hay conexión.
+**`ws_client.py`** (~150 líneas)
+WebSocket persistente hacia el backend. Envía snapshots de posiciones normalizadas (`global_id`, `x_norm`, `y_norm`, `employee_id`, `face_confirmed`) cada 1 segundo (`POSITION_SEND_INTERVAL` en `probes.py`) por cámara — usados por el backend para generar heatmaps y, si `employee_id` no es nulo, asistencia de empleados. Reconexión automática con backoff exponencial (1s → 30s). Silencioso si no hay conexión.
 
 ---
 

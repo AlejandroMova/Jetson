@@ -4,9 +4,21 @@ Async worker: receives face crops from PeopleNet class_id=2 (face) detections, e
 ArcFace embeddings via InsightFace buffalo_l, and matches against known_faces.json.
 
 Architecture: same non-blocking queue pattern as NxApiClient / AppearanceWorker.
-  probe → enqueue(face_crop, track_id, frame_num, camera_id)   ← O(1)
+  probe → enqueue(face_crop, global_id, frame_num, camera_id)   ← O(1)
   worker thread → InsightFace align+embed → cosine similarity → vote cache
-  probe (next frame) → get_result(track_id) → (uuid_str, confidence) | None
+  probe (next frame) → get_result(global_id) → (uuid_str, confidence) | None
+
+Identity is keyed by the cross-camera global_id from ReIdManager, not by the
+local per-camera track_id — a track_id resets every time the person changes
+camera, which used to mean re-running the full 3-vote identification from
+scratch in every camera. Keying by global_id lets an already-locked identity
+ride along across cameras via ReID's own appearance-gallery continuity
+(probes.py only starts feeding crops once a track's global_id is resolved —
+see _FaceRecognitionHandler.process_face). Votes never stop accumulating
+even after a lock: uniforms can make different employees look alike to
+OSNet's appearance embedding, so if a later face crop strongly disagrees with
+the current lock, the tag gets corrected (see _process) instead of trusting
+a one-time match forever.
 
 JSON format (new, UUID-keyed):
   {
@@ -27,16 +39,16 @@ import json
 import logging
 import queue
 import threading
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 FACE_SIMILARITY_THRESHOLD: float = 0.50  # cosine sim minimum for a positive match
-FACE_VOTES_REQUIRED: int         = 3     # votes before locking identity per track
+FACE_VOTES_REQUIRED: int         = 3     # votes in the sliding window before (re)locking identity
 
 
 class FaceRecognizer:
@@ -52,8 +64,10 @@ class FaceRecognizer:
                  api_base_url: str = "", api_key: str = "", queue_size: int = 64):
         """Configura el worker. InsightFace se carga en start() para evitar conflictos CUDA con TRT.
 
-        _locked almacena el resultado final por track_id (uuid, conf) una vez que acumula FACE_VOTES_REQUIRED votos.
-        _votes acumula las predicciones frame a frame antes de bloquear la identidad.
+        _locked almacena el resultado actual por global_id (uuid, conf). _votes es una ventana
+        deslizante (deque, maxlen=FACE_VOTES_REQUIRED) de las últimas predicciones por global_id —
+        se sigue alimentando incluso después de bloquear, así que un cambio sostenido de mayoría
+        corrige el candado en vez de quedar congelado en el primer match.
         La DB se carga en __init__ porque no usa GPU — es solo lectura de JSON + conversión a ndarray.
 
         Args:
@@ -68,8 +82,8 @@ class FaceRecognizer:
         self._api_base_url = api_base_url.rstrip("/")
         self._api_key = api_key
         self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
-        self._locked: Dict[int, Tuple[str, float]] = {}   # track_id → (uuid/name, conf)
-        self._votes: Dict[int, List[str]] = {}             # track_id → lista de predicciones
+        self._locked: Dict[str, Tuple[str, float]] = {}   # global_id → (uuid/name, conf)
+        self._votes: Dict[str, Deque[str]] = {}            # global_id → ventana de predicciones
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -107,18 +121,28 @@ class FaceRecognizer:
             self._thread.join(timeout=5)
         logger.info("FaceRecognizer stopped.")
 
-    def enqueue(self, face_crop_bgr: np.ndarray, track_id: int,
+    def enqueue(self, face_crop_bgr: np.ndarray, identity_key: str,
                 frame_num: int, camera_id: str = ""):
-        """Encola un crop de rostro para reconocimiento. No bloqueante — descarta si la cola está llena."""
+        """Encola un crop de rostro para reconocimiento, indexado por global_id (identity_key).
+        No bloqueante — descarta si la cola está llena."""
         try:
-            self._queue.put_nowait((face_crop_bgr.copy(), track_id, frame_num, camera_id))
+            self._queue.put_nowait((face_crop_bgr.copy(), identity_key, frame_num, camera_id))
         except queue.Full:
             pass  # descarte silencioso — el probe reintentará en el próximo frame
 
-    def get_result(self, track_id: int) -> Optional[Tuple[str, float]]:
-        """Retorna (uuid_or_name, confidence) si la identidad fue bloqueada, o None si aún votando."""
+    def get_result(self, identity_key: str) -> Optional[Tuple[str, float]]:
+        """Retorna (uuid_or_name, confidence) si la identidad ya tiene un candado
+        vigente para este global_id, o None si aún no hay suficientes votos."""
         with self._lock:
-            return self._locked.get(track_id)
+            return self._locked.get(identity_key)
+
+    def forget(self, global_id: str) -> None:
+        """Limpia el estado de votos/candado de un global_id que ReIdManager ya
+        expiró (ver reid_manager.py::_expire_stale). Sin esto, _locked/_votes
+        crecerían para siempre — nada más los limpia por global_id."""
+        with self._lock:
+            self._locked.pop(global_id, None)
+            self._votes.pop(global_id, None)
 
     def get_display_name(self, uuid_str: str) -> str:
         """Retorna el nombre legible del empleado para mostrar en OSD y stream logs.
@@ -213,11 +237,11 @@ class FaceRecognizer:
             if item is None:
                 break  # sentinel sent by stop()
             # NOTE: _camera_id reserved for future per-camera routing — not yet wired to _process.
-            face_crop, track_id, frame_num, _camera_id = item
+            face_crop, identity_key, frame_num, _camera_id = item
             try:
-                self._process(face_crop, track_id)
+                self._process(face_crop, identity_key)
             except Exception as e:
-                logger.warning("FaceRecognizer error track=%d: %s", track_id, e)
+                logger.warning("FaceRecognizer error global_id=%s: %s", identity_key, e)
             self._queue.task_done()
 
     def _load_model(self):
@@ -265,12 +289,16 @@ class FaceRecognizer:
             self._db = {}
             self._uuid_to_name = {}
 
-    def _process(self, face_crop_bgr: np.ndarray, track_id: int):
-        """Infiere identidad de un crop de cara y acumula votos hasta bloquear el resultado.
+    def _process(self, face_crop_bgr: np.ndarray, global_id: str):
+        """Infiere identidad de un crop de cara y acumula votos en una ventana deslizante.
 
-        Sistema de votación: requiere FACE_VOTES_REQUIRED coincidencias antes de bloquear
-        la identidad por track_id, reduciendo falsos positivos en frames difíciles.
-        Una vez bloqueada la identidad (_locked), no se vuelve a procesar ese track.
+        Sistema de votación: requiere FACE_VOTES_REQUIRED coincidencias (de las últimas
+        FACE_VOTES_REQUIRED muestras) para (re)bloquear la identidad por global_id,
+        reduciendo falsos positivos en frames difíciles. A diferencia del esquema
+        anterior por track_id, aquí NUNCA se deja de votar aunque ya haya un candado —
+        si ReID (OSNet) le pasó este global_id a una persona distinta por error
+        (ej. uniformes parecidos), un cambio sostenido de mayoría en la ventana corrige
+        el candado en vez de quedar pegado al primer match para siempre.
         """
         if not self._db:
             return  # DB vacía — reconocimiento deshabilitado para este cliente
@@ -289,18 +317,30 @@ class FaceRecognizer:
             identity_key = "Unknown"  # below threshold — unrecognised face
 
         with self._lock:
-            if track_id in self._locked:
-                return  # identidad ya bloqueada — no procesar más frames de este track
-
-            # Agregar voto y verificar si alcanzamos el umbral de confianza
-            votes = self._votes.setdefault(track_id, [])
+            # Ventana deslizante de las últimas FACE_VOTES_REQUIRED predicciones —
+            # se sigue alimentando aunque ya haya un candado vigente.
+            votes = self._votes.setdefault(global_id, deque(maxlen=FACE_VOTES_REQUIRED))
             votes.append(identity_key)
             if len(votes) >= FACE_VOTES_REQUIRED:
-                # Elegir la identidad más votada (mayoritaria) como resultado final
+                # Elegir la identidad más votada (mayoritaria) en la ventana actual.
                 winner = Counter(votes).most_common(1)[0][0]
-                self._locked[track_id] = (winner, sim)
-                display = self.get_display_name(winner)
-                logger.debug("Face locked track=%d → %s (sim=%.3f)", track_id, display, sim)
+                current = self._locked.get(global_id)
+                if current is None:
+                    self._locked[global_id] = (winner, sim)
+                    logger.debug("Face locked global_id=%s → %s (sim=%.3f)",
+                                 global_id, self.get_display_name(winner), sim)
+                elif current[0] != winner:
+                    # La mayoría de la ventana cambió respecto al candado vigente —
+                    # corregir el tag (salvaguarda de uniformes parecidos).
+                    self._locked[global_id] = (winner, sim)
+                    logger.info(
+                        "Face re-tagged global_id=%s: %s → %s (sim=%.3f)",
+                        global_id, self.get_display_name(current[0]),
+                        self.get_display_name(winner), sim,
+                    )
+                else:
+                    # Misma identidad reconfirmada — solo refresca la confianza.
+                    self._locked[global_id] = (winner, sim)
 
     def _match(self, embedding: np.ndarray) -> Tuple[Optional[str], float]:
         """Busca la persona con mayor similitud coseno en la DB.

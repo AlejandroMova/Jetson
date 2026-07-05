@@ -607,39 +607,9 @@ class NxApiClient:
         payload.update({"track_id": track_id, "appearance_vector": appearance_vector})
         self.enqueue("POST", "/api/events", payload)
 
-    def post_employee_seen(self, camera_id: str, employee_id: str, track_id: int,
-                           similarity: float, bbox: dict) -> None:
-        """Emit employee_seen (or known_person_seen in hogar sector) on a face match."""
-        evt = "known_person_seen" if _JETSON_SECTOR == "hogar" else "employee_seen"
-        payload = self._base_event(evt, camera_id)
-        payload.update({
-            "track_id": track_id,
-            "bbox": bbox,
-            "similarity": round(similarity, 3),
-            "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id,
-        })
-        self.enqueue("POST", "/api/events", payload)
-
-    def post_employee_presence(self, camera_id: str, employee_id: str, track_id: int) -> None:
-        """Emit employee_presence periodically for employees on camera (heartbeat)."""
-        payload = self._base_event("employee_presence", camera_id)
-        payload.update({
-            "track_id": track_id,
-            "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id,
-        })
-        self.enqueue("POST", "/api/events", payload)
-
-    def post_employee_exit(self, camera_id: str, employee_id: str,
-                           track_id: int, dwell_seconds: float) -> None:
-        """Emit employee_exit (or known_person_exit in hogar sector) with dwell time."""
-        evt = "known_person_exit" if _JETSON_SECTOR == "hogar" else "employee_exit"
-        payload = self._base_event(evt, camera_id)
-        payload.update({
-            "track_id": track_id,
-            "dwell_seconds": round(dwell_seconds, 1),
-            "employee_id" if _JETSON_SECTOR != "hogar" else "name": employee_id,
-        })
-        self.enqueue("POST", "/api/events", payload)
+    # post_employee_seen/presence/exit removed — employee identity now rides
+    # along in positions_snapshot (see WsPositionClient.send_positions and
+    # _accumulate_positions below) instead of discrete REST events.
 
     def post_unknown_person_alert(self, camera_id: str, track_id: int,
                                   face_snapshot_b64: str, bbox: dict) -> None:
@@ -889,20 +859,25 @@ class _FaceRecognitionHandler:
     """Face recognition via async FaceRecognizer (InsightFace ArcFace).
 
     Receives face detections from PeopleNet class 2 (face), extracts crops,
-    enqueues to the worker, and emits sector-aware events (employee_seen,
-    unknown_person_alert, etc.).
+    and enqueues them to the worker keyed by global_id (not track_id) — see
+    process_face. Employee identity no longer goes out as discrete REST
+    events (employee_seen/presence/exit): it rides along in positions_snapshot
+    instead, via _employee_by_global_id + _face_confirmed_this_cycle, both
+    consumed by _accumulate_positions. Only the hogar unknown_person_alert
+    stays as a discrete event, since it's about intrusion detection, not
+    employee attendance.
 
     Not in _HANDLER_REGISTRY — dispatched separately because it processes
     face objects (class_id=2), not the main person loop.
     """
-    PRESENCE_HEARTBEAT_SECS: float = 30.0
 
     def __init__(self, worker):
         self._worker = worker
         self._last_sample: Dict[int, int] = {}
         self._cache: Dict[int, Tuple[str, float]] = {}
+        # Track ids already logged as EMPLEADO in stream mode — cosmetic
+        # dedup only, no REST side effect anymore.
         self._identity_reported: Set[int] = set()
-        self._last_heartbeat: Dict[int, float] = {}
         self._unknown_alerted: Set[int] = set()
         # Tracks that already received a stream log line for an unknown face — one per track.
         self._unknown_face_logged: Set[int] = set()
@@ -914,8 +889,10 @@ class _FaceRecognitionHandler:
         frame_np,
         persons_meta: list,
         camera_id: str,
+        pad_index: int,
     ) -> None:
-        """Process a face detected by PeopleNet (class_id=2): extract crop, enqueue, emit events."""
+        """Process a face detected by PeopleNet (class_id=2): extract crop,
+        enqueue to the worker keyed by global_id, and cache the result."""
         if self._worker is None or frame_np is None:
             return
         if face_obj_meta.confidence < FACE_DET_CONFIDENCE_THRESHOLD:
@@ -924,6 +901,17 @@ class _FaceRecognitionHandler:
         parent_track_id = self._find_parent_track(face_obj_meta, persons_meta)
         if parent_track_id is None:
             return
+
+        # Don't feed the recognizer until ReID has resolved a global_id for
+        # this track — indexing votes by track_id would reset every camera
+        # change. The wait is a few frames at most, negligible against the
+        # FACE_VOTES_REQUIRED sampling cycle. This also gates the hogar
+        # unknown_person_alert path below on Jetsons without OSNet installed
+        # — an accepted, documented limitation (see CLAUDE.md).
+        state = _active_tracks.get((pad_index, parent_track_id))
+        if state is None or state.global_id is None:
+            return
+        global_id = state.global_id
 
         last = self._last_sample.get(parent_track_id, -FACE_SAMPLE_INTERVAL)
         if frame_num - last < FACE_SAMPLE_INTERVAL:
@@ -939,9 +927,9 @@ class _FaceRecognitionHandler:
             return
 
         self._last_sample[parent_track_id] = frame_num
-        self._worker.enqueue(face_crop, parent_track_id, frame_num, camera_id)
+        self._worker.enqueue(face_crop, global_id, frame_num, camera_id)
 
-        result = self._worker.get_result(parent_track_id)
+        result = self._worker.get_result(global_id)
         if result:
             self._cache[parent_track_id] = result
 
@@ -961,24 +949,29 @@ class _FaceRecognitionHandler:
         # identity_key is a backend-assigned UUID string (or "Unknown" if below threshold).
         identity_key, conf = identity
         display_name = self._worker.get_display_name(identity_key)
-        now = time.monotonic()
 
         if identity_key != "Unknown":
+            # Tag the global_id (permanent for its lifetime) and mark this
+            # camera's current buffering cycle as face-confirmed — consumed
+            # by _accumulate_positions to decide employee_id/face_confirmed
+            # on the outgoing positions_snapshot entry.
+            _employee_by_global_id[global_id] = identity_key
+            _face_confirmed_this_cycle.setdefault(pad_index, set()).add(global_id)
             if parent_track_id not in self._identity_reported:
                 self._identity_reported.add(parent_track_id)
-                # identity_key is the backend UUID — used in events for FK join.
-                api_client.post_employee_seen(camera_id, identity_key, parent_track_id, conf, bbox)
                 _slog(
                     f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
                     f"{_C.get('green', '')}{_C.get('bold', '')}EMPLEADO{_C.get('reset', '')}   ",
                     f"track={parent_track_id:<4} ",
                     f"nombre={_C.get('bold', '')}{display_name}{_C.get('reset', '')}  sim={conf:.2f}",
                 )
-            last_hb = self._last_heartbeat.get(parent_track_id, 0.0)
-            if now - last_hb >= self.PRESENCE_HEARTBEAT_SECS:
-                api_client.post_employee_presence(camera_id, identity_key, parent_track_id)
-                self._last_heartbeat[parent_track_id] = now
         else:
+            # This global_id may have been a tagged employee before — the sliding
+            # vote window (or a reload()/revoke sync clearing FaceRecognizer's
+            # _locked) can flip the winner back to "Unknown". Drop the stale tag
+            # immediately so positions_snapshot stops attributing it to someone
+            # it no longer resolves to (no-op if it was never tagged).
+            _employee_by_global_id.pop(global_id, None)
             # Log once per track in stream mode.
             if parent_track_id not in self._unknown_face_logged:
                 self._unknown_face_logged.add(parent_track_id)
@@ -994,26 +987,23 @@ class _FaceRecognitionHandler:
                 face_b64 = base64.b64encode(buf).decode("utf-8")
                 api_client.post_unknown_person_alert(camera_id, parent_track_id, face_b64, bbox)
 
-    def on_track_lost(self, track_id: int, dwell_seconds: float) -> None:
-        """Called from _expire_lost_tracks. Emits employee_exit / known_person_exit."""
-        identity = self._cache.get(track_id)
-        if identity and identity[0] != "Unknown":
-            identity_key, _ = identity  # backend-assigned UUID
-            state = _active_tracks.get(
-                next((k for k in _active_tracks if k[1] == track_id), (None, None))
-            )
-            camera_id = state.camera_id if state else ""
-            api_client.post_employee_exit(camera_id, identity_key, track_id, dwell_seconds)
+    def on_track_lost(self, track_id: int) -> None:
+        """Called from _expire_lost_tracks. Cleans up this handler's local,
+        track_id-keyed caches only — _employee_by_global_id and
+        FaceRecognizer's own _locked/_votes are keyed by global_id and are
+        NOT touched here: the same physical person may still be tracked
+        under a different track/camera via ReID continuity. That state is
+        only cleared once ReIdManager itself expires the global_id (see
+        _handle_appearance_reid's use of match_or_create's expired_ids)."""
         self._cache.pop(track_id, None)
         self._identity_reported.discard(track_id)
-        self._last_heartbeat.pop(track_id, None)
         self._unknown_alerted.discard(track_id)
 
     def get_identity(self, track_id: int) -> Optional[Tuple[str, float]]:
-        """Return (name, similarity) if an identity has been recognized, else None."""
-        result = self._worker.get_result(track_id) if self._worker else None
-        if result:
-            self._cache[track_id] = result
+        """Return (name, similarity) if an identity has been recognized, else None.
+        Reads only the local cache populated by process_face — the worker
+        itself is keyed by global_id, not track_id, so it can't be queried
+        directly with a track_id here."""
         return self._cache.get(track_id)
 
     @staticmethod
@@ -1035,6 +1025,19 @@ class _FaceRecognitionHandler:
 _active_tracks: Dict[Tuple[int, int], _TrackState] = {}
 _crop_counts: Dict[int, int] = {}
 _crop_last_frame: Dict[int, int] = {}
+
+# global_id → employee UUID, once face recognition confirms it (see
+# _FaceRecognitionHandler.process_face). Cleared when: ReIdManager expires
+# that global_id (see _handle_appearance_reid's use of match_or_create's
+# expired_ids), or the sliding vote window/a reload() revoke sync flips the
+# winner back to "Unknown" (see process_face's else branch).
+_employee_by_global_id: Dict[str, str] = {}
+# pad_index → set of global_ids that got an actual face crop processed this
+# buffering cycle (cleared on each camera's own _accumulate_positions flush,
+# same cadence as _position_buffer/_position_last_sent below). Per-camera,
+# not global — each camera flushes on its own timer, so a shared set would
+# let one camera's flush wipe out another camera's still-pending confirmation.
+_face_confirmed_this_cycle: Dict[int, Set[str]] = {}
 
 # Confirmed reference frame (grayscale 64x36 float32) per camera_id.
 # None means no 2xx confirmation received from the backend yet.
@@ -1289,10 +1292,17 @@ def _accumulate_positions(
     Each person contributes exactly one entry per snapshot (the latest position within
     that second). The backend compares consecutive snapshot timestamps to calculate how
     long each global_id stayed in a given heatmap cell.
+
+    employee_id/face_confirmed ride along per entry so the backend can route
+    employee positions to attendance instead of anonymous customer stats — see
+    _employee_by_global_id/_face_confirmed_this_cycle (populated by
+    _FaceRecognitionHandler.process_face) and app/socket/positions.py on the
+    backend.
     """
     fw = frame_meta.source_frame_width
     fh = frame_meta.source_frame_height
     buf = _position_buffer.setdefault(pad_index, {})
+    confirmed_this_cycle = _face_confirmed_this_cycle.setdefault(pad_index, set())
 
     for obj in persons_meta:
         track_key = (pad_index, int(obj.object_id))
@@ -1304,7 +1314,11 @@ def _accumulate_positions(
         x_norm = round((r.left + r.width / 2) / fw, 3)
         y_norm = round((r.top + r.height / 2) / fh, 3)
         # Overwrite any earlier entry for this person within the current second.
-        buf[state.global_id] = {"global_id": state.global_id, "x_norm": x_norm, "y_norm": y_norm}
+        buf[state.global_id] = {
+            "global_id": state.global_id, "x_norm": x_norm, "y_norm": y_norm,
+            "employee_id": _employee_by_global_id.get(state.global_id),
+            "face_confirmed": state.global_id in confirmed_this_cycle,
+        }
 
     now = time.monotonic()
     last = _position_last_sent.get(pad_index, 0.0)
@@ -1312,6 +1326,10 @@ def _accumulate_positions(
         _ws_client.send_positions(camera_id, list(buf.values()))
         _position_buffer[pad_index] = {}
         _position_last_sent[pad_index] = now
+        # New buffering cycle starts for this camera — clear only this
+        # camera's confirmed set (per-pad_index, not global — see the
+        # docstring on _face_confirmed_this_cycle above).
+        _face_confirmed_this_cycle[pad_index] = set()
 
 
 def _save_and_send_crop(
@@ -1360,7 +1378,7 @@ def _expire_lost_tracks(pad_index: int, frame_num: int, visible_ids: Set[int]) -
             global_id=state.global_id,
         )
         if _face_handler:
-            _face_handler.on_track_lost(track_id, dwell)
+            _face_handler.on_track_lost(track_id)
         _crop_counts.pop(track_id, None)
         _crop_last_frame.pop(track_id, None)
         _track_labels.pop(track_id, None)
@@ -1469,9 +1487,16 @@ def _handle_appearance_reid(
 
             if not state.appearance_sent:
                 # ── First embedding for this track — run ReID match ───────────
-                global_id, event_type, prev_camera = _reid_manager.match_or_create(
+                global_id, event_type, prev_camera, expired_ids = _reid_manager.match_or_create(
                     vec, camera_id, threshold=reid_threshold, create=reid_create,
                 )
+                # Nothing else clears FaceRecognizer's own vote/lock state or
+                # _employee_by_global_id by global_id — do it here, the only
+                # place a global_id's expiry is ever observed.
+                for gid in expired_ids:
+                    if _face_recognizer is not None:
+                        _face_recognizer.forget(gid)
+                    _employee_by_global_id.pop(gid, None)
                 if global_id is None:
                     # Partial body, no existing identity matched — extend deadline
                     state.entry_deadline = frame_num + ENTRY_EMIT_DEADLINE_FRAMES
@@ -1640,7 +1665,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
         if _face_handler and face_metas and frame_np is not None:
             for face_obj_meta in face_metas:
                 _face_handler.process_face(
-                    face_obj_meta, frame_num, frame_np, persons_meta, camera_id
+                    face_obj_meta, frame_num, frame_np, persons_meta, camera_id, pad_index
                 )
 
         # ── Person track processing ───────────────────────────────────────────

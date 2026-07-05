@@ -116,6 +116,10 @@ bloquearía el pipeline y bajaría los FPS a cero.
 El resultado puede llegar varios frames después de que se encola — eso está bien, los analytics
 no necesitan respuesta inmediata frame a frame.
 
+**Excepción — `FaceRecognizer` usa `global_id`, no `track_id`:** el resto de los workers de esta
+sección se indexan por `track_id`, pero `FaceRecognizer.enqueue`/`get_result` se indexan por el
+`global_id` de ReID — ver la sección "Handler: Reconocimiento Facial" más abajo para el porqué.
+
 **Los tres workers:**
 
 | Worker | Modelo | Propósito | Archivo |
@@ -237,24 +241,46 @@ El `PoseWorker` aplica 3 reglas geométricas:
 Usa **PeopleNet class_id=2** (caras, detectadas por el mismo PGIE) — no hay SGIE adicional para caras.
 Luego `FaceRecognizer` (InsightFace ArcFace en Python) identifica a la persona.
 
+**Indexado por `global_id`, no por `track_id`.** A diferencia de los otros workers (§3), que
+reciben/devuelven resultados por `track_id`, `FaceRecognizer` usa el `global_id` de ReID como llave —
+porque `track_id` se reinicia en cada cámara nueva, lo que obligaría a re-votar desde cero cada vez
+que el empleado cambia de cámara. Con `global_id`, una identidad ya bloqueada viaja automáticamente
+entre cámaras vía la continuidad de apariencia de `ReIdManager`, sin re-votar.
+
 El probe recoge los objetos de cara directamente del PGIE y los pasa al handler:
 
 ```
 PeopleNet emite un objeto con class_id=2 (cara)
   → _find_parent_track() → busca la persona (class_id=0) que contiene esa cara
+  → busca _active_tracks[(pad_index, parent_track_id)].global_id
+  → si global_id aún no está resuelto (ReID no ha corrido) → no procesa nada este frame, espera
   → recortar crop de cara del frame full-res
-  → enqueue al FaceRecognizer worker
-  → (próximo frame) get_result → (uuid_str, similitud) o None
-  → sistema de votos: 3 coincidencias antes de fijar identidad
-  → events enviados al backend con employee_id = UUID del backend
+  → enqueue al FaceRecognizer worker, indexado por global_id
+  → (próximo frame) get_result(global_id) → (uuid_str, similitud) o None
+  → sistema de votos: ventana deslizante de 3 predicciones (deque), nunca se detiene aunque ya
+    haya un candado — si la mayoría de la ventana cambia, se corrige el tag (salvaguarda contra
+    que ReID/OSNet confunda a dos empleados con uniformes parecidos)
+  → identidad confirmada → _employee_by_global_id[global_id] = uuid, y se marca
+    _face_confirmed_this_cycle para ese global_id (consumido por _accumulate_positions)
 ```
 
-Los eventos son distintos por sector:
-- `comercio/industrial` → `employee_seen`, `employee_presence`, `employee_exit`
-- `hogar` → `known_person_seen`, `unknown_person_alert`, `known_person_exit`
+**Ya no hay eventos discretos para comercio/industrial** (`employee_seen`/`employee_presence`/
+`employee_exit` fueron eliminados). La identidad de empleado viaja en cambio dentro de
+`positions_snapshot` (§6/`ws_client.py`), vía los campos `employee_id`/`face_confirmed` de cada
+posición — ver `_accumulate_positions` en `probes.py` y `app/socket/positions.py` en el backend.
+Solo hogar conserva un evento discreto, `unknown_person_alert`, porque es una alerta de intrusión,
+no de asistencia — pero comparte el mismo gate: no se procesa ninguna cara (reconocida o no) hasta
+que `global_id` esté resuelto, así que en un Jetson sin OSNet instalado tampoco dispara (limitación
+aceptada y diferida, ver `CLAUDE.md`).
 
-**`employee_id` en los eventos es ahora un UUID** asignado por el backend (de `employees.id`).
-El backend no necesita resolver por nombre — hace join directo por UUID FK.
+**`employee_id` es un UUID** asignado por el backend (de `employees.id`), tageado sobre el
+`global_id` — el backend no necesita resolver por nombre, la tabla `employee_zone_intervals` tiene
+FK directo.
+
+**Limpieza de memoria:** cuando `ReIdManager._expire_stale()` olvida un `global_id` (1h sin verse),
+`_handle_appearance_reid()` llama `FaceRecognizer.forget(global_id)` para limpiar también sus
+diccionarios `_locked`/`_votes` — si no, crecerían indefinidamente (nada más los limpia por
+`global_id`).
 
 **Flujo de registro de empleados (automático desde plataforma):**
 ```

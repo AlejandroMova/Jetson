@@ -249,7 +249,7 @@ Use `package: manual` to set `pipeline:` and `sector:` explicitly (testing / cus
 | `cross_camera_reid` | Python worker | OSNet-x0.25 ONNX | **Always active** (tied to people_counting). Auto-downloaded by setup.sh. Generates 512-dim appearance vectors for cross-camera re-ID. |
 | `age_gender` | SGIE (gie-id=2) | ResNet-18 Pedestrian Attr | Full-body crop → 6 classes |
 | `fall_detection` | Python worker | MoveNet Lightning ONNX | **Hogar only** (hogar_avanzado / hogar_total). Auto-downloaded by setup.sh. |
-| `face_recognition` | Python worker | PeopleNet class 2 (face) + InsightFace buffalo_l | No extra model needed — uses face detections already produced by PeopleNet PGIE. Event type depends on `sector`: `employee_seen` (comercio/industrial) or `known_person_seen` + `unknown_person_alert` (hogar). |
+| `face_recognition` | Python worker | PeopleNet class 2 (face) + InsightFace buffalo_l | No extra model needed — uses face detections already produced by PeopleNet PGIE. comercio/industrial: identity rides along in `positions_snapshot` (`employee_id`/`face_confirmed` fields), no discrete event. hogar: `unknown_person_alert` (discrete event, intrusion alert). |
 | `epp_detection` | SGIE | *(pending)* | Helmet/vest/gloves |
 | `fire_smoke` | SGIE | *(pending)* | Frame-level classifier |
 | `license_plate` | SGIE | *(pending)* | LPD + LPR |
@@ -451,15 +451,15 @@ Multiple embeddings per person increase recognition robustness across poses/ligh
 
 ### Face recognition — setup by sector
 
-The same `face_recognition` capability emits different API events depending on the client's `sector`:
+The same `face_recognition` capability behaves differently depending on the client's `sector`:
 
-| Sector | Known person event | Unknown person event | Use case |
+| Sector | Known person | Unknown person event | Use case |
 |--------|--------------------|---------------------|----------|
-| `comercio` / `industrial` | `employee_seen` + `employee_presence` + `employee_exit` | — | Employee attendance per zone |
-| `hogar` | `known_person_seen` + `known_person_exit` | `unknown_person_alert` (with face crop) | Family member arrival / intruder alert |
+| `comercio` / `industrial` | Identity rides along in `positions_snapshot` (`employee_id`/`face_confirmed` fields) — no discrete event | — | Employee attendance per zone, derived by the backend from positions |
+| `hogar` | (no attendance use case) | `unknown_person_alert` (with face crop) | Intruder alert |
 
-For **comercio/industrial**: register employees with `register_face.py` as usual.  
-For **hogar**: register household members the same way — they appear as `known_person_seen` events. Anyone not in the database triggers an `unknown_person_alert` with a face snapshot.
+For **comercio/industrial**: register employees with `register_face.py` as usual — once identified, `_FaceRecognitionHandler` tags the person's cross-camera `global_id` and it flows to the backend on every position update, not as a one-off event.
+For **hogar**: register household members the same way. Anyone not in the database triggers an `unknown_person_alert` with a face snapshot — note this requires ReID (`global_id`) to be resolved for that track first (see `cross_camera_reid` below), so a Jetson without the OSNet model installed won't trigger it.
 
 ---
 
@@ -497,12 +497,15 @@ docker compose run --rm deepstream python3 tools/download_models.py --reid
 
 ## WebSocket position stream
 
-The pipeline sends normalized person centroids to the backend every 10 seconds per camera via a persistent WebSocket connection (not REST). This enables real-time heatmaps in the dashboard.
+The pipeline sends normalized person centroids to the backend every 1 second per camera (`POSITION_SEND_INTERVAL` in `probes.py`) via a persistent WebSocket connection (not REST). This enables real-time heatmaps in the dashboard, and — for comercio/industrial employees — attendance.
 
 ```
 WS /ws/positions  (Jetson is client, backend is server)
-Message: { type: "positions_snapshot", camera_id, timestamp, positions: [{track_id, x_norm, y_norm}] }
+Message: { type: "positions_snapshot", camera_id, timestamp,
+           positions: [{global_id, x_norm, y_norm, employee_id, face_confirmed}] }
 ```
+
+Entries are keyed by `global_id` (cross-camera ReID identity), not `track_id`. `employee_id` is set once face recognition tags that `global_id` as a known employee (see "Face recognition — setup by sector" above); `face_confirmed` is `true` only in the cycle a face was actually re-checked, not a persistent flag.
 
 `x_norm` and `y_norm` are in the range [0, 1] relative to frame dimensions. To map to pixel coordinates:
 ```
@@ -537,9 +540,9 @@ DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
 Async paths (background threads, never block pipeline):
   people_counting → AppearanceWorker → OSNet ONNX → 512-dim vector → ReIdManager (local match) → POST /api/events (person_entry with global_id | person_channel_change)
   fall_detection  → PoseWorker       → MoveNet ONNX → 17 keypoints → POST /api/events (fall_detected)
-  face_recognition→ FaceRecognizer   → InsightFace ArcFace → POST /api/events (employee_seen / known_person_seen)
+  face_recognition→ FaceRecognizer   → InsightFace ArcFace → tags global_id (comercio/industrial, rides in positions_snapshot) or POST /api/events unknown_person_alert (hogar)
   all cameras     → NxApiClient      → REST POST /api/events, /api/analytics, /api/crops
-  all cameras     → WsPositionClient → WS /ws/positions (positions_snapshot every 10s)
+  all cameras     → WsPositionClient → WS /ws/positions (positions_snapshot every 1s)
 ```
 
 The probe dispatcher reads PeopleNet class 0 (person) for tracking and class 2 (face) for
