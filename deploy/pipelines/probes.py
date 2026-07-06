@@ -1407,7 +1407,7 @@ def _extract_osnet_embedding(obj_meta) -> Optional[np.ndarray]:
 
     Returns an L2-normalized float32 (512,) vector, or None if:
     - The SGIE has not yet processed this object (first frame latency).
-    - The bbox is smaller than input-object-min-width/height=32 in the nvinfer config.
+    - The bbox is smaller than input-object-min-width/height=96x192 in the nvinfer config.
     """
     l_user = obj_meta.obj_user_meta_list
     while l_user is not None:
@@ -1466,7 +1466,7 @@ def _handle_appearance_reid(
     # ── Read embedding from OSNet SGIE metadata (synchronous) ─────────────────
     # The SGIE runs before the probe in the GStreamer pipeline, so the tensor is
     # already attached to obj_meta when we get here. Returns None if the bbox was
-    # below the min-size threshold in the nvinfer config (32×32 px).
+    # below the min-size threshold in the nvinfer config (96×192 px).
     vec = _extract_osnet_embedding(obj_meta)
 
     if vec is not None:
@@ -1544,8 +1544,10 @@ def _handle_appearance_reid(
                 _reid_manager.update_embedding(state.global_id, vec)
 
     # ── Deadline fallback: emit entry if SGIE never returned an embedding ─────
-    # Covers the edge case where the person's bbox never met the min-size threshold
-    # (32×32 px). person_entry goes out without global_id rather than never going out.
+    # Covers the case where the person's bbox never met the min-size threshold
+    # (96×192 px) — an intentional quality gate, not just an edge case: too-small
+    # detections shouldn't get counted, ReID'd, face-recognized, or positioned.
+    # person_entry still goes out without global_id rather than never going out.
     if not state.entry_emitted and frame_num >= state.entry_deadline:
         state.entry_emitted = True
         api_client.post_person_entry(

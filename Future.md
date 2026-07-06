@@ -919,6 +919,24 @@ python3 "${WORK_DIR}/tools/download_models.py" --reid --github-token "$GITHUB_TO
 - FastReID soporta exportar directamente desde su pipeline de entrenamiento con `--export-onnx`.
 - Esfuerzo estimado: 1 día de recolección de datos + etiquetado + 2–4 horas de entrenamiento.
 
+## Umbral mínimo del SGIE OSNet como fracción de resolución, no píxeles absolutos
+
+**Descripción:** `input-object-min-width/height` en `config_infer_sgie_osnet.txt` (96×192 px) es un valor absoluto de píxeles del streammux. Pero la resolución del streammux cambia según `stream_type` en `config.yaml` — `sub` es 960×544, `main` es 1920×1080 (ver `RESOLUTION_BY_STREAM_TYPE` en `config_loader.py`). La misma persona física, a la misma distancia real de la cámara, ocupa el doble de píxeles en main-stream que en sub-stream. Un umbral fijo en píxeles es entonces ~2x más laxo en clientes con `stream_type: main` que en los de `sub`, sin que nadie lo haya decidido así.
+
+**Por qué sería mejor:** El umbral dejaría de depender silenciosamente de qué `stream_type` eligió cada cliente — hoy dos instalaciones con la misma distancia/ángulo de cámara real pueden tener comportamiento de ReID distinto solo por ese flag.
+
+**Reemplazaría:**
+- Archivo: `deploy/models/osnet/config_infer_sgie_osnet.txt`
+- Sección: `input-object-min-width=96` / `input-object-min-height=192` (valores fijos)
+- Descripción de lo que se reemplaza: umbral absoluto en píxeles, igual para `main` y `sub`
+
+**Tech stack propuesto:**
+- No requiere librería nueva. `input-object-min-*` de nvinfer es siempre absoluto, así que esto implicaría generar el config del SGIE dinámicamente (como ya se hace con `_apply_pgie_overrides()` en `app.py` para el PGIE) calculando el valor en píxeles a partir de `cfg.stream_width/height` y un porcentaje configurable.
+
+**Consideraciones:** Solo vale la pena si en la práctica hay clientes mezclando `main` y `sub` con la misma expectativa de tamaño mínimo de persona — evaluar primero si esto es un problema real antes de agregar la generación dinámica de config (mismo patrón de riesgo que cualquier config generada en `/tmp/`, ver ErrorHistory.md 2026-05-28). Esfuerzo estimado: 1-2h.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]

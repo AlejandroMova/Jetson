@@ -42,7 +42,12 @@ operate-on-class-ids=0
 gie-unique-id=3
 
 # interval=0 runs OSNet on every frame (no frame skipping).
-# Minimum bbox size for DeepStream to pass the crop to the SGIE.
+# Minimum bbox size for DeepStream to pass the crop to the SGIE. Raised from 32x32:
+# the model expects 256x128 native input, and people below this size produce noisy
+# embeddings that pollute the ReID gallery. Below this threshold, DeepStream never
+# invokes the SGIE at all — the deadline fallback in probes.py's
+# _handle_appearance_reid emits person_entry with global_id=None instead, which is
+# excluded from person_count, cross-camera ReID, face recognition, and positions.
 interval=0
-input-object-min-width=32
-input-object-min-height=32
+input-object-min-width=96
+input-object-min-height=192
