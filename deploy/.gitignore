@@ -7,6 +7,9 @@ clients/*/known_faces.json
 # Face photos used to generate embeddings — stay on admin laptop
 clients/*/faces/
 
+# Persistent face-recognition CSV log — runtime data, per-deployment
+clients/*/logs/
+
 # TensorRT engines — rebuilt per device, large binaries
 models/**/*.engine
 

@@ -33,6 +33,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -167,6 +168,14 @@ TRACK_LOST_TIMEOUT_FRAMES: int = 60
 
 # ── Face recognition ──────────────────────────────────────────────────────────
 FACE_SAMPLE_INTERVAL: int = 30
+
+# Persistent per-client CSV log of every face-recognition sample (match or unknown),
+# for offline threshold/precision analysis. Independent of NX_STREAM_ENABLED — unlike
+# the console _slog lines, this always writes in production.
+# Columns (no header row in the file — see init_workers()):
+#   timestamp,camera_id,track_id,global_id,identity,similarity,status
+FACE_LOG_MAX_BYTES: int = 20 * 1024 * 1024  # 20 MB per file
+FACE_LOG_BACKUP_COUNT: int = 5              # ~100 MB max on disk, oldest rotated out
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
 ANALYTICS_SEND_INTERVAL_SECS: float = 60.0
@@ -950,6 +959,17 @@ class _FaceRecognitionHandler:
         identity_key, conf = identity
         display_name = self._worker.get_display_name(identity_key)
 
+        # Persistent, always-on record of every processed sample (not deduped per
+        # track like the console log below) — similarity drift over time is what
+        # later threshold tuning needs. identity_key (not display_name) is logged,
+        # so rows join directly on employees.id without a name-collision risk.
+        if _face_csv_logger is not None:
+            _face_csv_logger.info(
+                "%s,%s,%s,%s,%.4f,%s",
+                camera_id, parent_track_id, global_id, identity_key, conf,
+                "matched" if identity_key != "Unknown" else "unknown",
+            )
+
         if identity_key != "Unknown":
             # Tag the global_id (permanent for its lifetime) and mark this
             # camera's current buffering cycle as face-confirmed — consumed
@@ -1082,6 +1102,7 @@ def _on_reference_frame_confirmed(payload: dict) -> None:
 # ── Async worker globals + lifecycle ──────────────────────────────────────────
 
 _face_recognizer = None     # FaceRecognizer (InsightFace ArcFace)
+_face_csv_logger: Optional[logging.Logger] = None  # always-on persistent face-recognition log
 _reid_manager = None        # ReIdManager — local cross-camera identity DB
 _ws_client = None           # WsPositionClient (position/heatmap WebSocket)
 _jetson_sync_client = None  # JetsonSyncClient (Socket.IO face roster sync)
@@ -1113,7 +1134,7 @@ def init_workers(
       - WsPositionClient: if ws_base_url is configured (heatmaps)
       - JetsonSyncClient: if face_recognition is active and API_BASE_URL is set
     """
-    global _face_recognizer, _reid_manager, _ws_client, _jetson_sync_client
+    global _face_recognizer, _reid_manager, _ws_client, _jetson_sync_client, _face_csv_logger
 
     osnet_path = str(Path(model_dir) / "osnet" / "osnet_x1_0_market1501.onnx")
     if Path(osnet_path).exists():
@@ -1136,6 +1157,21 @@ def init_workers(
             api_base_url=API_BASE_URL,
             api_key=api_key,
         )
+
+        # Persistent CSV log — same client dir as known_faces.json, always-on
+        # (unlike the console _slog lines, not gated by NX_STREAM_ENABLED).
+        log_dir = Path(face_db_path).parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        _face_csv_logger = logging.getLogger("nx.face_csv")
+        _face_csv_logger.setLevel(logging.INFO)
+        _face_csv_logger.propagate = False  # keep separate from stdout/docker logs
+        if not _face_csv_logger.handlers:   # idempotent if init_workers ever re-runs
+            csv_handler = RotatingFileHandler(
+                log_dir / "face_recognition.csv",
+                maxBytes=FACE_LOG_MAX_BYTES, backupCount=FACE_LOG_BACKUP_COUNT,
+            )
+            csv_handler.setFormatter(logging.Formatter("%(asctime)s,%(message)s"))
+            _face_csv_logger.addHandler(csv_handler)
 
         if API_BASE_URL:
             # Deferred — only needed when face_recognition is active.
@@ -1754,12 +1790,17 @@ def osd_sink_pad_buffer_probe(_pad, info):
             if _face_handler:
                 identity = _face_handler.get_identity(p_track_id)
                 if identity:
-                    name, conf = identity
-                    if name != "Desconocido":
+                    # identity_key is the raw UUID or the literal "Unknown" sentinel
+                    # (see face_recognizer.py) — resolve it to a human name via the
+                    # same lookup the console EMPLEADO log already uses, and only
+                    # draw the overlay for actual matches.
+                    identity_key, conf = identity
+                    if identity_key != "Unknown" and _face_recognizer is not None:
+                        display_name = _face_recognizer.get_display_name(identity_key)
                         cur = str(obj_meta.text_params.display_text) or "..."
                         _set_osd_text(
                             obj_meta,
-                            f"{cur} | {name} {conf:.0%}",
+                            f"{cur} | {display_name} {conf:.0%}",
                             border_color=(0.2, 1.0, 0.4, 1.0),
                         )
 

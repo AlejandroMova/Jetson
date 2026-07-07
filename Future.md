@@ -937,6 +937,22 @@ python3 "${WORK_DIR}/tools/download_models.py" --reid --github-token "$GITHUB_TO
 
 ---
 
+## Evitar recomputar el embedding de OSNet en cada frame vía `secondary-reinfer-interval`
+
+**Descripción:** El SGIE de OSNet corre con `interval=0` ([config_infer_sgie_osnet.txt](deploy/models/osnet/config_infer_sgie_osnet.txt)) — infiere en GPU en cada frame para cada persona sobre el umbral de tamaño, aunque `_handle_appearance_reid` en `probes.py` solo use ese embedding una vez para resolver el `global_id` (línea ~1488) y luego solo cada 90 frames para refrescar la galería (línea ~1541). El resto de las inferencias se calculan y se descartan sin usarse.
+
+DeepStream tiene un mecanismo nativo para esto: cuando un SGIE corre detrás de un tracker, puede cachear el resultado por ID de objeto y solo reinferir cuando el objeto se ve por primera vez, su bbox crece ≥20%, o pasan `secondary-reinfer-interval` frames desde la última inferencia — sin quedar claro en la documentación si este cacheo aplica igual a un SGIE `network-type=1` (tensor crudo, como OSNet) o solo a "classifiers" tradicionales.
+
+**Por qué sería mejor:** Ahorraría cómputo GPU real (no solo descartar resultado en Python) si el cacheo nativo no está aplicando ya solo. Alinearía además el ritmo de refresco de la galería con el motor de inferencia en vez de un contador manual en Python.
+
+**Reemplazaría:**
+- Archivo: `deploy/models/osnet/config_infer_sgie_osnet.txt` — agregar `secondary-reinfer-interval=N`
+- Posible simplificación en `deploy/pipelines/probes.py` — el chequeo manual `frame_num % 90 == 0` en `_handle_appearance_reid` podría volverse redundante si DeepStream ya throttlea la inferencia real
+
+**Consideraciones:** No hay evidencia hoy de que esto sea un cuello de botella real (sin frames caídos ni degradación de FPS reportada) — antes de tocar el config, verificar empíricamente si el cacheo nativo ya aplica a `network-type=1` (loggear si el tensor de dos frames consecutivos del mismo track es bit-idéntico). Sin ese dato, cualquier valor de `secondary-reinfer-interval` sería una suposición. Esfuerzo estimado: 1h de verificación + 30 min de cambio si aplica.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]

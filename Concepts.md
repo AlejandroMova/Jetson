@@ -282,6 +282,14 @@ FK directo.
 diccionarios `_locked`/`_votes` — si no, crecerían indefinidamente (nada más los limpia por
 `global_id`).
 
+**Visibilidad — overlay + log persistente:** en stream mode, el bbox label agrega
+`| <nombre> NN%` cuando hay match confirmado (`get_display_name()` sobre el `identity_key`), y la
+consola imprime `EMPLEADO`/`ROSTRO Desconocido` vía `_slog` — ambos gateados por
+`NX_STREAM_ENABLED`. Aparte, y **siempre activo en producción** (independiente del stream mode),
+`process_face` escribe cada muestra procesada (match o no) en
+`clients/<cliente>/logs/face_recognition.csv` vía `_face_csv_logger` — pensado para analizar
+similitud/threshold después, no para debugging en vivo.
+
 **Flujo de registro de empleados (automático desde plataforma):**
 ```
 Admin activa empleado en plataforma
