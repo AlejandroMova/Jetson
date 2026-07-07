@@ -320,7 +320,12 @@ def _draw_tiled_overlays(frame_bgr: np.ndarray, tracks: list) -> None:
         y1 = max(0, y1)
         if x2 <= x1 or y2 <= y1:
             continue
-        color = (0, 0, 230) if t.get("fall") else (0, 210, 0)
+        if t.get("fall"):
+            color = (0, 0, 230)  # red
+        elif t.get("face"):
+            color = (0, 200, 255)  # orange — distinguishes face boxes from person boxes
+        else:
+            color = (0, 210, 0)  # green
         cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
         label = t["label"]
         txt_y = max(y1 - 3, 12)
@@ -366,8 +371,10 @@ def tiled_overlay_probe(_pad, info):
         return Gst.PadProbeReturn.OK
 
     overlay_tracks = []
+    seen_face_ids: Set[int] = set()
     for obj_meta in _iter_pyds_list(frame_meta.obj_meta_list, pyds.NvDsObjectMeta.cast):
-        if int(obj_meta.class_id) != PGIE_CLASS_PERSON:
+        cls = int(obj_meta.class_id)
+        if cls not in (PGIE_CLASS_PERSON, PGIE_CLASS_FACE):
             continue
         r = obj_meta.rect_params
         # Map bbox center to tile cell to identify the original stream.
@@ -376,16 +383,30 @@ def tiled_overlay_probe(_pad, info):
         tile_col = min(cx // cw, cols - 1)  # noqa: F841 — reserved for future per-stream logic
         tile_row = min(cy // ch, rows - 1)  # noqa: F841
         track_id = int(obj_meta.object_id)
+        if cls == PGIE_CLASS_FACE:
+            seen_face_ids.add(track_id)
         info_dict = _track_labels.get(track_id, {})
-        label = info_dict.get("label") or f"P#{track_id}"
+        default_label = f"F#{track_id}" if cls == PGIE_CLASS_FACE else f"P#{track_id}"
+        label = info_dict.get("label") or default_label
         overlay_tracks.append({
             "bbox_tiled": (int(r.left), int(r.top), int(r.width), int(r.height)),
             "label": label,
             "fall": info_dict.get("fall", False),
+            "face": info_dict.get("face", cls == PGIE_CLASS_FACE),
         })
 
     if overlay_tracks:
         _draw_tiled_overlays(frame_bgr, overlay_tracks)
+
+    # Face tracks have no _active_tracks/_expire_lost_tracks equivalent, so
+    # prune labels for faces no longer present this frame here instead —
+    # otherwise _track_labels grows unbounded over a long stream session.
+    stale_face_ids = [
+        tid for tid, info in _track_labels.items()
+        if info.get("face") and tid not in seen_face_ids
+    ]
+    for tid in stale_face_ids:
+        _track_labels.pop(tid, None)
 
     try:
         tiled_frame_queue.put_nowait(frame_bgr)
@@ -1704,6 +1725,18 @@ def osd_sink_pad_buffer_probe(_pad, info):
             elif (uid == PGIE_UNIQUE_ID
                     and int(obj_meta.class_id) == PGIE_CLASS_FACE):
                 face_metas.append(obj_meta)
+
+        # Debug: expose every raw face detection in stream mode, regardless of
+        # recognition state — lets you see what PeopleNet is finding before any
+        # ReID/recognition gating happens downstream in _face_handler.
+        if _IS_STREAM_ENABLED:
+            for face_obj_meta in face_metas:
+                f_track_id = int(face_obj_meta.object_id)
+                _track_labels[f_track_id] = {
+                    "label": f"Cara {face_obj_meta.confidence:.0%}",
+                    "fall": False,
+                    "face": True,
+                }
 
         if _face_handler and face_metas and frame_np is not None:
             for face_obj_meta in face_metas:
