@@ -34,3 +34,15 @@ cluster-mode=2
 topk=20
 nms-iou-threshold=0.20
 pre-cluster-threshold=0.35
+
+# class-id=2 (face): tamaño mínimo de bbox antes de que el crop llegue a InsightFace.
+# 64x64 — punto más bajo con evidencia real de que ArcFace sigue dando resultados
+# usables (ver estudio de degradación por resolución citado en Concepts.md/CLAUDE.md).
+# No inherimos esto de [class-attrs-all] porque ahí no existe — nvinfer solo hereda
+# topk/nms/pre-cluster-threshold entre bloques; detected-min-w/h se define aquí.
+# Asume resolución nativa de cámara (1920x1080 stream principal). En sub-stream
+# (resolución menor) este umbral es proporcionalmente más estricto — limitación
+# conocida y diferida, igual que el filtro de tamaño de persona en OSNet.
+[class-attrs-2]
+detected-min-w=64
+detected-min-h=64
