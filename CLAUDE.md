@@ -131,7 +131,7 @@ Clasifica a cada persona detectada en una de 6 categorías: female_young, female
 ### Reconocimiento Facial (`face_recognition`) — ✅ Activo
 Identifica personas conocidas (empleados, residentes) a partir de una base de datos de embeddings faciales. Usa PeopleNet class 2 (face) para detectar rostros, luego un worker Python extrae el embedding y lo compara con la DB. No hay SGIE dedicado para caras — el SGIE FaceDetectIR fue eliminado.
 - **Detección:** PeopleNet class_id=2 (face) — mismo PGIE que detecta personas, sin SGIE adicional. Filtro de tamaño mínimo `[class-attrs-2]` en `nvinfer_config.txt`: `detected-min-w/h=64` — descarta caras menores a 64×64px en la GPU, antes de que el crop llegue a `FaceRecognizer` (ver detalle y justificación del valor en la sección de modelos).
-- **Embedding:** InsightFace buffalo_l — ArcFace 512-dim, threshold similitud coseno ≥ 0.50
+- **Embedding:** InsightFace buffalo_l — ArcFace 512-dim, threshold similitud coseno ≥ 0.50. Corre en GPU (`CUDAExecutionProvider`, `ctx_id=0`) con fallback automático a CPU si CUDA no está disponible — antes forzaba CPU para evitar competir con TensorRT; revertido porque onnxruntime-gpu ya viene instalado en la imagen (se usaba para el pre-download en `docker-entrypoint.sh` pero no en el worker). **Pendiente de validar en hardware real** que no le baje FPS al pipeline principal (PeopleNet + SGIEs) — si compite de forma medible, revertir a solo `CPUExecutionProvider` en `face_recognizer.py::_load_model()`.
 - **Worker:** `FaceRecognizer` (Python thread) — indexado por `global_id` de ReID, no por `track_id`. `track_id` se reinicia en cada cámara nueva, lo que obligaba a re-votar desde cero cada vez que el empleado cambiaba de cámara; con `global_id` la identidad ya bloqueada viaja automáticamente vía la continuidad de apariencia de `ReIdManager`. `probes.py::_FaceRecognitionHandler.process_face()` no alimenta al worker hasta que `_active_tracks[(pad_index, track_id)].global_id` esté resuelto — la espera es de pocos frames, insignificante frente al ciclo de votación.
 - **Ventana de votos (`FACE_VOTES_REQUIRED=3`):** `deque(maxlen=3)` por `global_id`, se sigue alimentando aunque ya haya un candado — si la mayoría de la ventana cambia, se corrige el tag (`Face re-tagged` en logs). Salvaguarda contra que `ReIdManager`/OSNet le pase el `global_id` de un empleado a otra persona por error (ej. uniformes parecidos entre empleados) — la cara sigue siendo la única fuente de verdad para la identidad, ReID nunca la asigna por sí solo.
 - **DB:** `known_faces.json` — formato nuevo: `{"<uuid>": {"name": "...", "embeddings": [[...]]}}`. Formato legacy (nombre-clave) sigue siendo compatible en lectura.
@@ -172,7 +172,7 @@ Removidas del MVP por falta de modelos entrenados. Ver `Future.md` para el plan 
 ### Librerías Python
 | Librería | Uso |
 |----------|-----|
-| **onnxruntime** (CPU/aarch64) | Inferencia ONNX para InsightFace ArcFace (face recognition) |
+| **onnxruntime-gpu** (aarch64) | Inferencia ONNX para InsightFace ArcFace — CUDAExecutionProvider primero, fallback automático a CPU si CUDA no está disponible |
 | **insightface ≥ 0.7.3** | Pipeline de reconocimiento facial (detección + embedding) |
 | **opencv-python-headless** | Manipulación de imágenes, crops, resize |
 | **numpy** | Operaciones vectoriales, normalización de embeddings |

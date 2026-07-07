@@ -36,13 +36,16 @@ nms-iou-threshold=0.20
 pre-cluster-threshold=0.35
 
 # class-id=2 (face): tamaño mínimo de bbox antes de que el crop llegue a InsightFace.
-# 64x64 — punto más bajo con evidencia real de que ArcFace sigue dando resultados
-# usables (ver estudio de degradación por resolución citado en Concepts.md/CLAUDE.md).
+# 64x64 resultó demasiado alto para cámaras de ángulo amplio (demo Mova: 10h sin una
+# sola detección con ReID funcionando normalmente) — en cámaras de techo/gran angular
+# una cara ocupa ~25-30px incluso con el cuerpo completo apenas en el mínimo de OSNet
+# (96x192). Bajado a 10x10 — el piso de anotación de entrenamiento que NVIDIA publica
+# para las 3 clases de PeopleNet (person/bag/face) @1920x1080. No es un mínimo de
+# calidad de reconocimiento (no existe uno publicado ni para PeopleNet ni InsightFace)
+# — es solo un filtro de degenerados (0-9px). Ver CLAUDE.md para el detalle completo
+# y la limitación conocida de PeopleNet como detector de caras.
 # No inherimos esto de [class-attrs-all] porque ahí no existe — nvinfer solo hereda
 # topk/nms/pre-cluster-threshold entre bloques; detected-min-w/h se define aquí.
-# Asume resolución nativa de cámara (1920x1080 stream principal). En sub-stream
-# (resolución menor) este umbral es proporcionalmente más estricto — limitación
-# conocida y diferida, igual que el filtro de tamaño de persona en OSNet.
 [class-attrs-2]
-detected-min-w=64
-detected-min-h=64
+detected-min-w=10
+detected-min-h=10

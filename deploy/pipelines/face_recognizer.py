@@ -245,10 +245,21 @@ class FaceRecognizer:
             self._queue.task_done()
 
     def _load_model(self):
-        """Carga InsightFace buffalo_l en CPU. Retorna la app InsightFace o None si falla.
+        """Carga InsightFace buffalo_l en GPU (con fallback automático a CPU). Retorna
+        la app InsightFace o None si falla.
 
-        ctx_id=-1 forza CPU; det_size=(160, 160) es suficiente para crops de cara del SGIE.
-        CPUExecutionProvider evita conflictos con TensorRT que ya usa la GPU para los SGIEs.
+        ctx_id=0 + CUDAExecutionProvider primero en la lista de providers — onnxruntime
+        cae solo a CPUExecutionProvider si CUDA no está disponible, sin código extra.
+        det_size=(160, 160) es suficiente para crops de cara del SGIE.
+
+        Antes forzaba CPU (ctx_id=-1) para evitar competir por GPU con TensorRT
+        (PeopleNet + SGIEs). onnxruntime-gpu ya viene instalado en la imagen y se usa
+        para el pre-download en docker-entrypoint.sh — no hay motivo para no usarlo
+        también aquí. CPU-only en ARM (sin AVX) es notablemente más lento que GPU para
+        ArcFace (cabeza ResNet50) + RetinaFace, y bajo carga multi-cámara satura la cola
+        del worker (queue_size=64) y empieza a descartar crops silenciosamente.
+        Verificar FPS del pipeline antes/después en hardware real — si compite de forma
+        medible con TensorRT, revertir a CPUExecutionProvider únicamente.
         """
         try:
             import insightface
@@ -256,10 +267,10 @@ class FaceRecognizer:
             app = FaceAnalysis(
                 name="buffalo_l",
                 root=self._model_root,
-                providers=["CPUExecutionProvider"],
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
             )
-            app.prepare(ctx_id=-1, det_size=(160, 160))  # ctx_id=-1 = CPU
-            logger.info("InsightFace buffalo_l loaded.")
+            app.prepare(ctx_id=0, det_size=(160, 160))  # ctx_id=0 = GPU 0
+            logger.info("InsightFace buffalo_l loaded (requested CUDA, falls back to CPU if unavailable).")
             return app
         except Exception as e:
             logger.error("Failed to load InsightFace: %s", e)
