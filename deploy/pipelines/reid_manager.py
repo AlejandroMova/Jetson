@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -54,6 +55,11 @@ GALLERY_MAX_SIZE:          int   = 10     # max embeddings per global_id
 # Above MAX → duplicate angle, skip.
 GALLERY_DIVERSITY_THRESHOLD_MAX: float = 0.85
 GALLERY_DIVERSITY_THRESHOLD_MIN: float = 0.71
+
+# Always-on CSV analysis log (clients/<cliente>/logs/osnet_reid.csv) — same rotation
+# policy as face_recognition.csv (see probes.py's _face_csv_logger).
+CSV_LOG_MAX_BYTES:   int = 20 * 1024 * 1024  # 20 MB per file
+CSV_LOG_BACKUP_COUNT: int = 5                # ~100 MB max on disk, oldest rotated out
 
 # ── Event type constants ─────────────────────────────────────────────────────────
 EVENT_NEW_PERSON     = "new_person"
@@ -130,19 +136,47 @@ class ReIdManager:
         mgr.flush()   # call on shutdown
     """
 
-    def __init__(self, db_path: str = "/opt/nx/reid_db.json", gallery_max_size: int = GALLERY_MAX_SIZE):
+    def __init__(self, db_path: str = "/opt/nx/reid_db.json", gallery_max_size: int = GALLERY_MAX_SIZE,
+                 csv_log_dir: Optional[str] = None):
         """Carga la DB desde disco y la deja lista para usar. El lock protege todos los accesos al dict _db.
 
         gallery_max_size es configurable desde config.yaml (reid_gallery_size) para ajustarlo
         según el número de cámaras: más cámaras = más ángulos distintos = galería más grande.
         _last_save_ts controla la frecuencia de escritura a disco (máximo cada SAVE_INTERVAL_S).
+        csv_log_dir, si se pasa, activa un log CSV persistente y siempre-activo (no gateado
+        por modo stream, igual que face_recognition.csv) con una fila por cada creación/match/
+        refresh de galería — pensado para analizar después similitud y comportamiento de la
+        galería, no para debugging en vivo.
         """
         self._path = Path(db_path)
         self._gallery_max_size = gallery_max_size
         self._db: Dict[str, _Entry] = {}
         self._lock = threading.Lock()
         self._last_save_ts: float = 0.0
+        self._csv_logger = self._init_csv_logger(csv_log_dir) if csv_log_dir else None
         self._load()  # carga al iniciar, descartando entradas con TTL vencido
+
+    @staticmethod
+    def _init_csv_logger(csv_log_dir: str) -> logging.Logger:
+        """Crea (idempotente) el logger CSV en <csv_log_dir>/osnet_reid.csv.
+
+        Columnas: camera_id,track_id,global_id,event,similarity,gallery_size,added_angle,
+        prev_camera,absent_s. Separado de stdout/docker logs (propagate=False) igual que
+        el CSV de face recognition.
+        """
+        log_dir = Path(csv_log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        csv_logger = logging.getLogger("nx.osnet_csv")
+        csv_logger.setLevel(logging.INFO)
+        csv_logger.propagate = False
+        if not csv_logger.handlers:  # idempotente si ReIdManager se reinstancia
+            handler = RotatingFileHandler(
+                log_dir / "osnet_reid.csv",
+                maxBytes=CSV_LOG_MAX_BYTES, backupCount=CSV_LOG_BACKUP_COUNT,
+            )
+            handler.setFormatter(logging.Formatter("%(asctime)s,%(message)s"))
+            csv_logger.addHandler(handler)
+        return csv_logger
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
@@ -152,6 +186,7 @@ class ReIdManager:
         camera_id: str,
         threshold: Optional[float] = None,
         create: bool = True,
+        track_id: Optional[int] = None,
     ) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
         """
         Match embedding against the DB and return
@@ -167,6 +202,7 @@ class ReIdManager:
         expired_ids lists any global_ids just dropped by _expire_stale() this call —
         the caller (probes.py) uses it to purge FaceRecognizer's own vote/lock state
         for the same ids, since nothing else would ever tell it to forget them.
+        track_id is log-only (CSV analysis log) — does not affect matching.
         Thread-safe.
         """
         with self._lock:
@@ -188,6 +224,11 @@ class ReIdManager:
                 )
                 logger.info("ReID: new_person gid=%s best_sim=%.3f (no match below threshold=%.2f)",
                             gid, best_sim, threshold if threshold is not None else SIMILARITY_THRESHOLD)
+                if self._csv_logger:
+                    self._csv_logger.info(
+                        "%s,%s,%s,new_person,%.4f,1,yes,,",
+                        camera_id, track_id if track_id is not None else "", gid, best_sim,
+                    )
                 self._maybe_save()
                 return gid, EVENT_NEW_PERSON, None, expired_ids
             # TODO revisar si no poner esto en un else, porque acabamos de poner el tiempo que lo encontramos, no tiene sentido tiempo absent de una persona nueva
@@ -210,14 +251,21 @@ class ReIdManager:
                 event, best_gid, best_sim, time_absent, prev_camera, camera_id,
                 len(entry.gallery), " +angle" if added else "",
             )
+            if self._csv_logger:
+                self._csv_logger.info(
+                    "%s,%s,%s,%s,%.4f,%d,%s,%s,%.0f",
+                    camera_id, track_id if track_id is not None else "", best_gid, event,
+                    best_sim, len(entry.gallery), "yes" if added else "no", prev_camera, time_absent,
+                )
             self._maybe_save()
             return best_gid, event, prev_camera, expired_ids
 
-    def update_embedding(self, global_id: str, embedding: np.ndarray) -> None:
+    def update_embedding(self, global_id: str, embedding: np.ndarray, track_id: Optional[int] = None) -> None:
         """Add embedding to the gallery of a known global_id without matching.
         Called periodically for active tracks to keep the gallery fresh.
         Only adds when the embedding represents a novel angle (diversity check).
         No-op if global_id is not in the DB (expired or never created).
+        track_id is log-only (CSV analysis log) — does not affect the update.
         """
         with self._lock:
             entry = self._db.get(global_id)
@@ -225,12 +273,18 @@ class ReIdManager:
                 return
             added = _gallery_add(entry.gallery, embedding, self._gallery_max_size)
             entry.last_seen_ts = time.time()
-            self._maybe_save()
             if added:
                 logger.debug(
                     "ReID: gallery updated global_id=%s size=%d",
                     global_id, len(entry.gallery),
                 )
+            if self._csv_logger:
+                self._csv_logger.info(
+                    "%s,%s,%s,gallery_refresh,,%d,%s,,",
+                    entry.camera_id, track_id if track_id is not None else "", global_id,
+                    len(entry.gallery), "yes" if added else "no",
+                )
+            self._maybe_save()
 
     def flush(self) -> None:
         """Force-save the DB to disk. Call on pipeline shutdown."""

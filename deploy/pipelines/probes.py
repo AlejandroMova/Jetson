@@ -1142,7 +1142,12 @@ def init_workers(
         # The embeddings themselves come from the OSNet SGIE (app.py), not a Python worker.
         from reid_manager import ReIdManager
         reid_db_path = str(Path(model_dir).parent / "reid_db.json")
-        _reid_manager = ReIdManager(db_path=reid_db_path, gallery_max_size=reid_gallery_size)
+        # Same clients/<cliente>/logs/ dir as face_recognition.csv, so both analysis
+        # logs live together regardless of whether face_recognition is purchased.
+        osnet_csv_dir = str(Path(face_db_path).parent / "logs") if face_db_path else None
+        _reid_manager = ReIdManager(
+            db_path=reid_db_path, gallery_max_size=reid_gallery_size, csv_log_dir=osnet_csv_dir,
+        )
         logger.info("ReIdManager active — DB: %s", reid_db_path)
     else:
         logger.warning("OSNet model not found at %s — appearance SGIE and local ReID disabled. "
@@ -1524,7 +1529,7 @@ def _handle_appearance_reid(
             if not state.appearance_sent:
                 # ── First embedding for this track — run ReID match ───────────
                 global_id, event_type, prev_camera, expired_ids = _reid_manager.match_or_create(
-                    vec, camera_id, threshold=reid_threshold, create=reid_create,
+                    vec, camera_id, threshold=reid_threshold, create=reid_create, track_id=p_track_id,
                 )
                 # Nothing else clears FaceRecognizer's own vote/lock state or
                 # _employee_by_global_id by global_id — do it here, the only
@@ -1577,7 +1582,7 @@ def _handle_appearance_reid(
             elif state.global_id is not None and frame_num % 90 == 0:
                 # ── Subsequent frames — refresh the gallery periodically ──────
                 # Adds new angles/poses so cross-camera matching stays accurate.
-                _reid_manager.update_embedding(state.global_id, vec)
+                _reid_manager.update_embedding(state.global_id, vec, track_id=p_track_id)
 
     # ── Deadline fallback: emit entry if SGIE never returned an embedding ─────
     # Covers the case where the person's bbox never met the min-size threshold
