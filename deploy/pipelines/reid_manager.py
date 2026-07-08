@@ -38,13 +38,12 @@ logger = logging.getLogger(__name__)
 
 # ── Tuneable constants ──────────────────────────────────────────────────────────
 # Cosine similarity threshold for cross-camera matching (dot product on L2-normalised vecs).
-# Tuning guide for OSNet-x1.0 on DVR sub-stream:
-#   (values below were calibrated for x0.25 — x1.0 may need re-calibration)
-#   0.65 → very strict, misses real matches
-#   0.60 → too strict for x1.0 on sub-stream (misses same-person returns)
-#   0.50 → current: good balance for x1.0; reduce to 0.45 if still missing matches
-#   0.40 → too low: false positives (different people matching same global_id)
-SIMILARITY_THRESHOLD:      float = 0.68
+# Calibrated 2026-07-08 against real crops from client DEMOONE (osnet_reid.csv +
+# /api/admin/crops): of 9 verified match pairs in the 0.708-0.713 range, 6 were
+# different people wrongly merged under the same global_id. The inherited 0.68
+# (calibrated for OSNet x0.25, never re-verified for x1.0) was far too permissive.
+# Raised to 0.85 pending a second, larger calibration round.
+SIMILARITY_THRESHOLD:      float = 0.85
 PRESENCE_WINDOW_S:         float = 300.0  # 5 min — within this, camera switch = channel_change
 REID_TTL_S:                float = 3600.0 # 1 hour — global_id expires if unseen for this long
 SAVE_INTERVAL_S:           float = 30.0   # persist to disk at most every N seconds
@@ -53,7 +52,14 @@ GALLERY_MAX_SIZE:          int   = 10     # max embeddings per global_id
 # (GALLERY_DIVERSITY_THRESHOLD_MIN, GALLERY_DIVERSITY_THRESHOLD_MAX).
 # Below MIN → too dissimilar (borderline/noisy match, protects gallery from contamination).
 # Above MAX → duplicate angle, skip.
-GALLERY_DIVERSITY_THRESHOLD_MAX: float = 0.85
+# MAX raised alongside SIMILARITY_THRESHOLD (2026-07-08): _gallery_add() only runs after
+# match_or_create() already found a match (sim >= SIMILARITY_THRESHOLD) — if MAX had stayed
+# at 0.85, every successful match would score >= MAX and get rejected as a "duplicate
+# angle", freezing every gallery at 1 embedding forever. Left a 0.85-0.95 window so
+# genuine new angles of the same person still get added; only near-identical frames
+# (>=0.95) are skipped as redundant. MIN is now rarely the binding constraint at this
+# range but stays as a safety net for the periodic refresh path.
+GALLERY_DIVERSITY_THRESHOLD_MAX: float = 0.95
 GALLERY_DIVERSITY_THRESHOLD_MIN: float = 0.71
 
 # Always-on CSV analysis log (clients/<cliente>/logs/osnet_reid.csv) — same rotation
@@ -187,6 +193,7 @@ class ReIdManager:
         threshold: Optional[float] = None,
         create: bool = True,
         track_id: Optional[int] = None,
+        add_to_gallery: bool = True,
     ) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
         """
         Match embedding against the DB and return
@@ -197,6 +204,10 @@ class ReIdManager:
         If create=False and no match is found, returns (None, None, None, expired_ids)
         instead of seeding a new identity; used for partial-body detections that should
         not create new identities but can still match existing ones.
+        add_to_gallery=False skips _gallery_add on a match — the match and its logging
+        still happen, but the (possibly partial/low-quality) embedding never becomes a
+        permanent gallery member. Used for the same partial-body detections: they can
+        confirm an existing identity, but shouldn't degrade future matching quality.
         event_type is one of EVENT_NEW_PERSON, EVENT_PERSON_RETURN, EVENT_CHANNEL_CHANGE.
         prev_camera_id is None for new persons.
         expired_ids lists any global_ids just dropped by _expire_stale() this call —
@@ -236,7 +247,7 @@ class ReIdManager:
             time_absent = now - entry.last_seen_ts
             prev_camera  = entry.camera_id
 
-            added = _gallery_add(entry.gallery, embedding, self._gallery_max_size)
+            added = _gallery_add(entry.gallery, embedding, self._gallery_max_size) if add_to_gallery else False
             entry.last_seen_ts = now
             entry.camera_id    = camera_id
 

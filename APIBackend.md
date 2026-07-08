@@ -381,11 +381,12 @@ Up to 5 crops per person, minimum size 64×128 px.
   "frame_num": 150,
   "timestamp": "2025-05-01T14:32:05Z",
   "image_b64": "<jpeg base64>",
-  "bbox": { "left": 100, "top": 200, "width": 64, "height": 128 }
+  "bbox": { "left": 100, "top": 200, "width": 64, "height": 128 },
+  "global_id": "a1b2c3d4e5f6"
 }
 ```
 
-Used for building the re-ID training dataset and for manual review.
+`global_id` is optional — omitted if ReID hasn't resolved an identity for this track yet when the crop is captured. Used for building the re-ID training dataset and for manual review; `global_id` lets the dataset gallery filter/group crops by cross-camera identity, not just per-camera `track_id`.
 
 ---
 

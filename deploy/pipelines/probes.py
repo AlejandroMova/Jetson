@@ -660,8 +660,12 @@ class NxApiClient:
         self.enqueue("POST", "/api/analytics", payload)
 
     def post_crop(self, camera_id: str, track_id: int, frame_num: int,
-                  crop_b64: str, bbox: dict) -> None:
-        """Send a base64-encoded person crop to /api/crops."""
+                  crop_b64: str, bbox: dict, global_id: Optional[str] = None) -> None:
+        """Send a base64-encoded person crop to /api/crops.
+
+        global_id is the cross-camera ReID identity for this track, if
+        already resolved when the crop was captured (None otherwise —
+        crops taken before ReID resolves still ship, just without it)."""
         payload = {
             "camera_id": camera_id,
             "jetson_id": JETSON_ID,
@@ -671,6 +675,8 @@ class NxApiClient:
             "image_b64": crop_b64,
             "bbox": bbox,
         }
+        if global_id:
+            payload["global_id"] = global_id
         self.enqueue("POST", "/api/crops", payload)
 
     def post_reference_frame(self, camera_id: str, frame_num: int,
@@ -1400,6 +1406,7 @@ def _save_and_send_crop(
     track_id: int,
     frame_num: int,
     bbox: dict,
+    global_id: Optional[str] = None,
 ) -> None:
     """Save a person crop to disk and send it to the backend via API."""
     person_dir = Path(CROPS_DIR) / camera_id / str(track_id)
@@ -1408,7 +1415,7 @@ def _save_and_send_crop(
     cv2.imwrite(str(filepath), crop_bgr)
     _, buf = cv2.imencode(".jpg", crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     crop_b64 = base64.b64encode(buf).decode("utf-8")
-    api_client.post_crop(camera_id, track_id, frame_num, crop_b64, bbox)
+    api_client.post_crop(camera_id, track_id, frame_num, crop_b64, bbox, global_id=global_id)
 
 
 def _expire_lost_tracks(pad_index: int, frame_num: int, visible_ids: Set[int]) -> None:
@@ -1549,8 +1556,13 @@ def _handle_appearance_reid(
 
             if not state.appearance_sent:
                 # ── First embedding for this track — run ReID match ───────────
+                # add_to_gallery=not partial: a partial view can still confirm an
+                # existing identity (lower threshold above), but never becomes a
+                # permanent gallery member — avoids baking low-quality/occluded
+                # views into the vectors used for future cross-camera matching.
                 global_id, event_type, prev_camera, expired_ids = _reid_manager.match_or_create(
                     vec, camera_id, threshold=reid_threshold, create=reid_create, track_id=p_track_id,
+                    add_to_gallery=not partial,
                 )
                 # Nothing else clears FaceRecognizer's own vote/lock state or
                 # _employee_by_global_id by global_id — do it here, the only
@@ -1600,9 +1612,12 @@ def _handle_appearance_reid(
                             if event_type == "new_person":
                                 _get_analytics(pad_index)["person_count"] += 1
 
-            elif state.global_id is not None and frame_num % 90 == 0:
+            elif state.global_id is not None and not partial and frame_num % 90 == 0:
                 # ── Subsequent frames — refresh the gallery periodically ──────
                 # Adds new angles/poses so cross-camera matching stays accurate.
+                # Skipped entirely for partial views (not just excluded from
+                # _gallery_add) — no reason to even attempt the diversity check
+                # with a low-quality embedding.
                 _reid_manager.update_embedding(state.global_id, vec, track_id=p_track_id)
 
     # ── Deadline fallback: emit entry if SGIE never returned an embedding ─────
@@ -1856,7 +1871,10 @@ def osd_sink_pad_buffer_probe(_pad, info):
                         bbox["left"]:bbox["left"] + bbox["width"],
                     ]
                     if crop.size > 0:
-                        _save_and_send_crop(crop, camera_id, p_track_id, frame_num, bbox)
+                        _save_and_send_crop(
+                            crop, camera_id, p_track_id, frame_num, bbox,
+                            global_id=state.global_id,
+                        )
                         _crop_counts[p_track_id] = count + 1
                         _crop_last_frame[p_track_id] = frame_num
 

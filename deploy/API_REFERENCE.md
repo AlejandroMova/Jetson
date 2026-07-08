@@ -376,11 +376,12 @@ Sent only when the frame has zero detections. Use as heatmap background for that
   "frame_num": 150,
   "timestamp": "2025-05-01T14:32:05Z",
   "image_b64": "<jpg base64>",
-  "bbox": { "left": 100, "top": 200, "width": 64, "height": 128 }
+  "bbox": { "left": 100, "top": 200, "width": 64, "height": 128 },
+  "global_id": "a1b2c3d4e5f6"
 }
 ```
 
-Used for building the re-ID training dataset. Minimum crop size: 64×128 px.
+`global_id` is optional — omitted if ReID hasn't resolved an identity for this track yet. Used for building the re-ID training dataset. Minimum crop size: 64×128 px.
 
 ---
 
