@@ -176,7 +176,7 @@ FACE_SAMPLE_INTERVAL: int = 30
 # for offline threshold/precision analysis. Independent of NX_STREAM_ENABLED — unlike
 # the console _slog lines, this always writes in production.
 # Columns (no header row in the file — see init_workers()):
-#   timestamp,camera_id,track_id,global_id,identity,similarity,status
+#   timestamp,camera_id,track_id,global_id,identity,similarity,yaw,status
 FACE_LOG_MAX_BYTES: int = 20 * 1024 * 1024  # 20 MB per file
 FACE_LOG_BACKUP_COUNT: int = 5              # ~100 MB max on disk, oldest rotated out
 
@@ -986,17 +986,20 @@ class _FaceRecognitionHandler:
             return
 
         # identity_key is a backend-assigned UUID string (or "Unknown" if below threshold).
-        identity_key, conf = identity
+        identity_key, conf, yaw = identity
         display_name = self._worker.get_display_name(identity_key)
 
         # Persistent, always-on record of every processed sample (not deduped per
         # track like the console log below) — similarity drift over time is what
         # later threshold tuning needs. identity_key (not display_name) is logged,
         # so rows join directly on employees.id without a name-collision risk.
+        # yaw: diagnóstico del filtro de ángulo en face_recognizer.py — solo se ve
+        # aquí el yaw de la muestra que ganó el candado, no el de las rechazadas
+        # (esas nunca llegan a votar; ver logger.debug en FaceRecognizer._process).
         if _face_csv_logger is not None:
             _face_csv_logger.info(
-                "%s,%s,%s,%s,%.4f,%s",
-                camera_id, parent_track_id, global_id, identity_key, conf,
+                "%s,%s,%s,%s,%.4f,%.1f,%s",
+                camera_id, parent_track_id, global_id, identity_key, conf, yaw,
                 "matched" if identity_key != "Unknown" else "unknown",
             )
 
@@ -1836,7 +1839,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
                     # (see face_recognizer.py) — resolve it to a human name via the
                     # same lookup the console EMPLEADO log already uses, and only
                     # draw the overlay for actual matches.
-                    identity_key, conf = identity
+                    identity_key, conf, _yaw = identity
                     if identity_key != "Unknown" and _face_recognizer is not None:
                         display_name = _face_recognizer.get_display_name(identity_key)
                         cur = str(obj_meta.text_params.display_text) or "..."

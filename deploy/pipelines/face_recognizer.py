@@ -6,7 +6,7 @@ ArcFace embeddings via InsightFace buffalo_l, and matches against known_faces.js
 Architecture: same non-blocking queue pattern as NxApiClient / AppearanceWorker.
   probe → enqueue(face_crop, global_id, frame_num, camera_id)   ← O(1)
   worker thread → InsightFace align+embed → cosine similarity → vote cache
-  probe (next frame) → get_result(global_id) → (uuid_str, confidence) | None
+  probe (next frame) → get_result(global_id) → (uuid_str, confidence, yaw) | None
 
 Identity is keyed by the cross-camera global_id from ReIdManager, not by the
 local per-camera track_id — a track_id resets every time the person changes
@@ -39,16 +39,29 @@ import json
 import logging
 import queue
 import threading
+import time
 from collections import Counter, deque
 from pathlib import Path
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 FACE_SIMILARITY_THRESHOLD: float = 0.50  # cosine sim minimum for a positive match
 FACE_VOTES_REQUIRED: int         = 3     # votes in the sliding window before (re)locking identity
+
+# Muestra de mal ángulo: yaw absoluto (grados) por encima del cual una cara no
+# cuenta como voto — la persona está de perfil/casi de espaldas, el embedding
+# sale como ruido sin importar qué tan bueno sea el modelo. face.pose viene
+# gratis del modelo landmark_3d_68 que buffalo_l ya carga, sin costo extra.
+FACE_MAX_YAW_DEGREES: float = 35.0
+
+# ponytail: diagnóstico temporal — guarda hasta N crops crudos (antes de CLAHE)
+# a disco para inspección visual manual. Quitar cuando ya no se necesite ver
+# a ojo qué le está llegando al reconocedor.
+FACE_CROP_SAMPLE_MAX: int = 30
 
 
 class FaceRecognizer:
@@ -64,7 +77,7 @@ class FaceRecognizer:
                  api_base_url: str = "", api_key: str = "", queue_size: int = 64):
         """Configura el worker. InsightFace se carga en start() para evitar conflictos CUDA con TRT.
 
-        _locked almacena el resultado actual por global_id (uuid, conf). _votes es una ventana
+        _locked almacena el resultado actual por global_id (uuid, conf, yaw). _votes es una ventana
         deslizante (deque, maxlen=FACE_VOTES_REQUIRED) de las últimas predicciones por global_id —
         se sigue alimentando incluso después de bloquear, así que un cambio sostenido de mayoría
         corrige el candado en vez de quedar congelado en el primer match.
@@ -82,7 +95,7 @@ class FaceRecognizer:
         self._api_base_url = api_base_url.rstrip("/")
         self._api_key = api_key
         self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
-        self._locked: Dict[str, Tuple[str, float]] = {}   # global_id → (uuid/name, conf)
+        self._locked: Dict[str, Tuple[str, float, float]] = {}  # global_id → (uuid/name, conf, yaw)
         self._votes: Dict[str, Deque[str]] = {}            # global_id → ventana de predicciones
         self._lock = threading.Lock()
         self._running = False
@@ -90,6 +103,10 @@ class FaceRecognizer:
         self._app = None   # InsightFace — se carga en start() después de que TRT inicialice CUDA
         self._db: Dict[str, List[np.ndarray]] = {}
         self._uuid_to_name: Dict[str, str] = {}  # uuid → nombre legible para OSD
+        # ponytail: diagnóstico temporal (ver FACE_CROP_SAMPLE_MAX) — carpeta y contador
+        # para guardar una muestra acotada de crops crudos.
+        self._crop_sample_dir = Path(self._db_path).parent / "logs" / "face_crops_sample"
+        self._crop_sample_count = 0
         self._load_db()
 
     def start(self):
@@ -130,8 +147,8 @@ class FaceRecognizer:
         except queue.Full:
             pass  # descarte silencioso — el probe reintentará en el próximo frame
 
-    def get_result(self, identity_key: str) -> Optional[Tuple[str, float]]:
-        """Retorna (uuid_or_name, confidence) si la identidad ya tiene un candado
+    def get_result(self, identity_key: str) -> Optional[Tuple[str, float, float]]:
+        """Retorna (uuid_or_name, confidence, yaw) si la identidad ya tiene un candado
         vigente para este global_id, o None si aún no hay suficientes votos."""
         with self._lock:
             return self._locked.get(identity_key)
@@ -308,17 +325,37 @@ class FaceRecognizer:
         si ReID (OSNet) le pasó este global_id a una persona distinta por error
         (ej. uniformes parecidos), un cambio sostenido de mayoría en la ventana corrige
         el candado en vez de quedar pegado al primer match para siempre.
+
+        Muestras de mal ángulo (yaw > FACE_MAX_YAW_DEGREES) no cuentan como voto —
+        se descartan antes de tocar la ventana, igual que "sin cara detectada".
         """
         if not self._db:
             return  # DB vacía — reconocimiento deshabilitado para este cliente
+
+        self._maybe_save_crop_sample(face_crop_bgr, global_id)
+
+        # CLAHE sobre el canal L (LAB) — mejora contraste sin distorsionar color,
+        # ayuda al detector interno de InsightFace en escenas de poca luz. Barato
+        # (una operación por crop, no por frame) y no afecta la medición de yaw
+        # (geometría de landmarks, no intensidad de píxel).
+        face_crop_bgr = _apply_clahe(face_crop_bgr)
 
         # Detectar y alinear la cara en el crop usando InsightFace
         faces = self._app.get(face_crop_bgr)
         if not faces:
             return  # sin cara detectada en este crop (blur, oclusión, etc.)
 
-        # Usar el embedding de la primera cara (mayor bbox = más prominente)
-        emb = faces[0].normed_embedding  # vector 512-dim ya L2-normalizado por InsightFace
+        face = faces[0]  # mayor bbox = más prominente
+
+        # face.pose = [pitch, yaw, roll], viene gratis del modelo landmark_3d_68
+        # que buffalo_l ya carga — sin inferencia extra. Cara muy de perfil no
+        # cuenta como voto: el embedding sale como ruido sin importar el modelo.
+        yaw = float(face.pose[1]) if face.pose is not None else 0.0
+        if abs(yaw) > FACE_MAX_YAW_DEGREES:
+            logger.debug("Face yaw rechazado global_id=%s yaw=%.1f°", global_id, yaw)
+            return
+
+        emb = face.normed_embedding  # vector 512-dim ya L2-normalizado por InsightFace
 
         # Comparar con la DB y obtener el mejor match
         identity_key, sim = self._match(emb)
@@ -335,21 +372,37 @@ class FaceRecognizer:
                 winner = Counter(votes).most_common(1)[0][0]
                 current = self._locked.get(global_id)
                 if current is None:
-                    self._locked[global_id] = (winner, sim)
-                    logger.debug("Face locked global_id=%s → %s (sim=%.3f)",
-                                 global_id, self.get_display_name(winner), sim)
+                    self._locked[global_id] = (winner, sim, yaw)
+                    logger.debug("Face locked global_id=%s → %s (sim=%.3f, yaw=%.1f°)",
+                                 global_id, self.get_display_name(winner), sim, yaw)
                 elif current[0] != winner:
                     # La mayoría de la ventana cambió respecto al candado vigente —
                     # corregir el tag (salvaguarda de uniformes parecidos).
-                    self._locked[global_id] = (winner, sim)
+                    self._locked[global_id] = (winner, sim, yaw)
                     logger.info(
-                        "Face re-tagged global_id=%s: %s → %s (sim=%.3f)",
+                        "Face re-tagged global_id=%s: %s → %s (sim=%.3f, yaw=%.1f°)",
                         global_id, self.get_display_name(current[0]),
-                        self.get_display_name(winner), sim,
+                        self.get_display_name(winner), sim, yaw,
                     )
                 else:
                     # Misma identidad reconfirmada — solo refresca la confianza.
-                    self._locked[global_id] = (winner, sim)
+                    self._locked[global_id] = (winner, sim, yaw)
+
+    def _maybe_save_crop_sample(self, face_crop_bgr: np.ndarray, global_id: str) -> None:
+        """ponytail: diagnóstico temporal — guarda hasta FACE_CROP_SAMPLE_MAX crops
+        crudos (antes de CLAHE) a disco para inspección visual manual. Quitar esta
+        llamada (y el método) cuando ya no se necesite ver a ojo qué le está
+        llegando al reconocedor."""
+        if self._crop_sample_count >= FACE_CROP_SAMPLE_MAX:
+            return
+        try:
+            self._crop_sample_dir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = self._crop_sample_dir / f"{ts}_{global_id}_{self._crop_sample_count:02d}.jpg"
+            cv2.imwrite(str(path), face_crop_bgr)
+            self._crop_sample_count += 1
+        except Exception as e:
+            logger.warning("No se pudo guardar crop de muestra: %s", e)
 
     def _match(self, embedding: np.ndarray) -> Tuple[Optional[str], float]:
         """Busca la persona con mayor similitud coseno en la DB.
@@ -378,6 +431,19 @@ class FaceRecognizer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def _apply_clahe(crop_bgr: np.ndarray) -> np.ndarray:
+    """Aplica CLAHE al canal L (LAB) de un crop BGR — mejora contraste local sin
+    distorsionar el balance de color. clipLimit=2.0/tileGridSize=8x8 son los
+    valores por defecto recomendados de OpenCV, sin calibrar contra footage real."""
+    lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = _clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
 
 def _parse_raw_db(raw: dict) -> Tuple[Dict[str, List[np.ndarray]], Dict[str, str]]:
     """Parsea known_faces.json en estructura interna y mapa UUID → nombre.
