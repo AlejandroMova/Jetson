@@ -953,6 +953,30 @@ DeepStream tiene un mecanismo nativo para esto: cuando un SGIE corre detrás de 
 
 ---
 
+## AdaFace como reemplazo de ArcFace para reconocimiento facial en baja calidad
+
+**Descripción:** Reemplazar `w600k_r50.onnx` (cabeza de reconocimiento ArcFace de `buffalo_l`) por un modelo entrenado con AdaFace (CVPR 2022, "Quality Adaptive Margin for Face Recognition"). AdaFace ajusta el margen de la función de pérdida según un indicador de calidad de imagen estimado durante el entrenamiento — para imágenes de baja calidad prioriza muestras "fáciles" en vez de forzar difíciles, lo que lo hace más robusto a las condiciones típicas de CCTV (crops chicos, ángulo oblicuo, poca luz) que ArcFace.
+
+**Por qué sería mejor:** En IJB-B e IJB-C (benchmarks de calidad mixta, los más parecidos a condiciones de CCTV real — a diferencia de LFW, que es fotos curadas de alta calidad), AdaFace reduce el error 11% y 9% respectivamente contra el segundo mejor método evaluado en el paper original. En datos de alta calidad rinde aproximadamente igual que ArcFace — la ganancia real está específicamente en el régimen de baja calidad, que es el problema diagnosticado con el cliente Mova (similitudes de 0.10-0.31 contra un threshold de 0.50, cara casi siempre en mal ángulo).
+
+**Reemplazaría:**
+- Archivo: `deploy/models/insightface/` (modelo `w600k_r50.onnx` dentro de `buffalo_l`)
+- Sección / función: `face_recognizer.py::_load_model()` y el uso de `FaceAnalysis.get()` en `_process()` — la alineación (`norm_crop` con landmarks de `det_10g.onnx`) y la detección no cambian, solo el modelo final de embedding
+- Descripción de lo que se reemplaza: la cabeza de reconocimiento ArcFace por una cabeza AdaFace, manteniendo el mismo pipeline de detección+alineación de `buffalo_l`
+
+**Tech stack propuesto:**
+- Modelo: AdaFace, repo oficial `mk-minchul/AdaFace` — licencia MIT (permisiva, confirmado en el LICENSE del repo)
+- Input/output: 112×112×3 BGR (normalizado mean=0.5/std=0.5), embedding 512-dim — mismo shape que ArcFace, compatible con el resto del pipeline (`known_faces.json`, columna de embeddings en el backend) sin cambios de schema
+- Forma de integración: exportar el checkpoint de PyTorch a ONNX (no hay un ONNX oficial pre-exportado disponible — hay que hacerlo manualmente) y cargarlo en el lugar de `w600k_r50.onnx`
+
+**Consideraciones:**
+- `FACE_SIMILARITY_THRESHOLD=0.50` deja de ser válido — es un modelo distinto con otra distribución de similitud, hay que recalibrar con datos reales del cliente.
+- **Todos los embeddings existentes quedan obsoletos** — son vectores de ArcFace, no comparables con AdaFace. Requiere re-enrollment de todos los empleados de todos los clientes. El backend ya soporta `model_version` en `EmployeeEmbedding` para esto, así que no es un rediseño de schema, pero sí una migración operativa real.
+- No hay ONNX pre-exportado listo — exportarlo y verificar que el preprocesamiento coincide exacto con lo que espera `norm_crop()` es trabajo real de ingeniería, no un cambio de config.
+- Evaluar solo después de probar el filtro de pose por track y CLAHE (ver entradas relacionadas) — si esos dos ya mejoran lo suficiente, esta migración (la más cara de las opciones evaluadas) puede no ser necesaria. Esfuerzo estimado: alto (exportación + recalibración de threshold + re-enrollment), no cuantificado en horas por la incertidumbre del paso de exportación.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]
