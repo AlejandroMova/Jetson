@@ -977,6 +977,34 @@ DeepStream tiene un mecanismo nativo para esto: cuando un SGIE corre detrás de 
 
 ---
 
+## ReID robusto a vistas parciales/oclusión — cómo lo resuelven otras empresas/investigación
+
+**Descripción:** El 2026-07-08 se eliminó por completo la rama de "vista parcial" de `ReIdManager` (`PARTIAL_BODY_MAX_RATIO`/`PARTIAL_BODY_REID_THRESHOLD`, ver `CLAUDE.md` sección "Re-ID entre Cámaras") — bajaba el umbral de match a 0.64 para compensar que OSNet da similitudes más bajas cuando solo se ve torso/hombros, y calibrando con crops reales del cliente DEMOONE se encontró que esa puerta fusionaba personas distintas con la misma frecuencia que el 0.68 original. Se decidió simplificar: un solo `SIMILARITY_THRESHOLD` para todo, sin manejo especial de vistas parciales — el costo aceptado es que una persona vista solo parcialmente puede tardar más en confirmar su identidad (o nunca confirmarla si la cámara nunca la ve de cuerpo completo), en vez del riesgo de fusionar personas distintas. Esta entrada registra qué opciones más sofisticadas existen si ese costo (menos recall en cámaras con vistas parciales frecuentes) resulta ser un problema real en producción.
+
+**Por qué sería mejor:** recuperar la capacidad de confirmar identidad en vistas parciales sin reintroducir el riesgo de falsos positivos que motivó eliminar la rama actual.
+
+**Opciones investigadas (de más simple a más compleja):**
+
+1. **Umbral parcial recalibrado con datos reales, en vez de 0.64 a ciegas** — la opción más barata: mantener una rama de vista parcial pero con `create=False`/`add_to_gallery=False` (nunca crea identidad ni contamina galería, solo confirma) y un umbral calibrado con crops reales del rango de similitud real observado, no un número heredado sin verificar. Es la que se propuso y el usuario decidió no hacer por ahora (prioriza simplicidad).
+
+2. **Matching por partes basado en pose (occlusion-aware ReID)** — el enfoque que usan sistemas de investigación robustos a oclusión (ej. "Dual-Branch Occlusion-Aware Semantic Part-Features Extraction Network", MDPI 2025): usan un modelo de estimación de pose para identificar qué partes del cuerpo son visibles en cada crop, y comparan similitud solo sobre las partes visibles en AMBAS imágenes (query y galería), en vez de comparar el embedding completo cuando falta información. Mucho más preciso en teoría, pero requiere un modelo adicional de pose (nuevo SGIE o worker) — no es un cambio de threshold, es una arquitectura nueva.
+
+3. **Fusión ponderada por calidad ("quality-aware pooling")** — en vez de un umbral fijo, ponderar cada frame por un score de calidad (qué tan completo/nítido es el crop) al promediar o comparar embeddings — usado en ReID de video multi-frame. Requeriría calcular y propagar un score de calidad por detección, que hoy no existe en el pipeline.
+
+4. **EMA (exponential moving average) en vez de galería de snapshots** — el enfoque de StrongSORT/BoT-SORT (tracking multi-objeto): un solo vector por identidad que se actualiza con cada nueva lectura en vez de guardar una galería de ángulos distintos. Ya se descartó en una conversación anterior (ver notas de la sesión 2026-07-07) porque "olvida" ángulos de cámaras distintas — no aplica bien al caso de re-id cross-cámara con ángulos muy diferentes por cámara, que es justo el problema principal de este proyecto.
+
+**Reemplazaría:**
+- Archivo: `deploy/pipelines/reid_manager.py` (`match_or_create`, `_find_best_match`) y `deploy/pipelines/probes.py` (`_handle_appearance_reid`)
+- Descripción de lo que se reemplaza: el umbral único `SIMILARITY_THRESHOLD` actual, sin distinción por calidad/completitud de la vista
+
+**Tech stack propuesto (solo para opción 2, la más completa):**
+- Modelo / librería: un modelo de pose estimation ligero compatible con TensorRT (ej. MoveNet, ya usado como referencia en otras partes del proyecto) para generar keypoints por detección
+- Forma de integración: nuevo SGIE o worker Python que anote qué región del bbox es visible antes de comparar embeddings
+
+**Consideraciones:** las opciones 2-4 son inversión real de ingeniería (modelo nuevo, o cambio de arquitectura de galería) — solo valdría la pena evaluarlas si, con el sistema simplificado actual, se observa en producción que las cámaras con ángulos que rara vez muestran cuerpo completo (ej. muy altas o muy cercanas) tienen `person_count` inflado por falta de re-id, no antes. La opción 1 es la más barata de las cuatro si se necesita una solución intermedia sin ingeniería nueva.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]

@@ -137,15 +137,18 @@ PGIE_UNIQUE_ID: int = 1      # PeopleNet
 SGIE_AGE_GENDER_ID: int = 2  # ResNet-18 Pedestrian Attr
 OSNET_GIE_ID: int = 3        # OSNet-x1.0 appearance SGIE — 512-dim embedding per person
 
-# ── Partial-body ReID thresholds ─────────────────────────────────────────────
-# Standing person bbox: height/width ≈ 3–4. When only the torso/shoulders are
-# visible (camera-edge crop or lower-body occlusion) the ratio drops to 1–2.
-# Very low ratios (< MIN) are too noisy for reliable ReID; skip them entirely.
-# Mid-range ratios use a lower similarity threshold since partial views produce
-# lower similarity scores for the same person (observed ~0.64–0.67).
-PARTIAL_BODY_MIN_RATIO:      float = 1.3   # below → skip, don't match or create
-PARTIAL_BODY_MAX_RATIO:      float = 1.8   # below MAX and above MIN → partial, lower threshold
-PARTIAL_BODY_REID_THRESHOLD: float = 0.64  # threshold used for partial-body range
+# ── Partial-body ReID floor ──────────────────────────────────────────────────
+# Standing person bbox: height/width ≈ 3–4. Below this ratio only legs/feet or a
+# small sliver of torso are visible (camera-edge crop or heavy occlusion) — too
+# degraded to be worth even attempting a match. Skip and wait for a better view.
+# Removed 2026-07-08: a separate, lower similarity threshold for the mid-range
+# (ratio 1.3-1.8) used to exist (PARTIAL_BODY_REID_THRESHOLD=0.64) — calibration
+# against real DEMOONE crops showed it merged different people just as often as
+# the original 0.68 full-body threshold did. Every detection above this floor
+# now goes through the same SIMILARITY_THRESHOLD as full-body views; a partial
+# view that doesn't match yet just extends the deadline (see below) instead of
+# being accepted on a lower bar.
+PARTIAL_BODY_MIN_RATIO: float = 1.3
 
 # ── PGIE class ids ────────────────────────────────────────────────────────────
 PGIE_CLASS_PERSON: int = 0
@@ -1539,30 +1542,23 @@ def _handle_appearance_reid(
     vec = _extract_osnet_embedding(obj_meta)
 
     if vec is not None:
-        # ── Aspect-ratio filter: skip or lower threshold for partial-body views ─
-        # A standing person has height/width ≈ 3–4. Partial views (torso/shoulders
-        # only) drop to ~1–2. Ratios below MIN are too noisy; the mid-range uses a
-        # lower similarity threshold (OSNet gives ~0.64–0.67 for partial views of
-        # the same person). Full-body views use the normal SIMILARITY_THRESHOLD.
+        # ── Aspect-ratio floor: skip detections too degraded to be worth trying ─
+        # A standing person has height/width ≈ 3–4. Below PARTIAL_BODY_MIN_RATIO
+        # only legs/feet or a sliver of torso are visible — extend the deadline
+        # and wait for a better view instead of matching against noise. Anything
+        # at or above the floor goes through the same SIMILARITY_THRESHOLD as any
+        # other detection (see PARTIAL_BODY_MIN_RATIO comment for why there's no
+        # longer a separate lower threshold for partial views).
         ratio = bbox["height"] / bbox["width"] if bbox["width"] > 0 else 0.0
         if ratio < PARTIAL_BODY_MIN_RATIO:
             # Too partial to be useful — extend deadline and wait for a better view
             state.entry_deadline = frame_num + ENTRY_EMIT_DEADLINE_FRAMES
             logger.debug("ReID: ratio=%.2f too low track=%d — skip", ratio, p_track_id)
         else:
-            partial        = ratio < PARTIAL_BODY_MAX_RATIO
-            reid_threshold = PARTIAL_BODY_REID_THRESHOLD if partial else None
-            reid_create    = not partial
-
             if not state.appearance_sent:
                 # ── First embedding for this track — run ReID match ───────────
-                # add_to_gallery=not partial: a partial view can still confirm an
-                # existing identity (lower threshold above), but never becomes a
-                # permanent gallery member — avoids baking low-quality/occluded
-                # views into the vectors used for future cross-camera matching.
                 global_id, event_type, prev_camera, expired_ids = _reid_manager.match_or_create(
-                    vec, camera_id, threshold=reid_threshold, create=reid_create, track_id=p_track_id,
-                    add_to_gallery=not partial,
+                    vec, camera_id, track_id=p_track_id,
                 )
                 # Nothing else clears FaceRecognizer's own vote/lock state or
                 # _employee_by_global_id by global_id — do it here, the only
@@ -1571,53 +1567,46 @@ def _handle_appearance_reid(
                     if _face_recognizer is not None:
                         _face_recognizer.forget(gid)
                     _employee_by_global_id.pop(gid, None)
-                if global_id is None:
-                    # Partial body, no existing identity matched — extend deadline
-                    state.entry_deadline = frame_num + ENTRY_EMIT_DEADLINE_FRAMES
-                    logger.debug("ReID: partial no match ratio=%.2f track=%d — extending deadline",
-                                 ratio, p_track_id)
-                else:
-                    state.appearance_sent = True
-                    state.global_id = global_id
-                    logger.info("ReID track=%d cam=%s → %s gid=%s prev=%s",
-                                p_track_id, camera_id, event_type, global_id, prev_camera)
-                    _slog(
-                        f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
-                        f"{_C.get('bold', '')}DETECCIÓN{_C.get('reset', '')}  ",
-                        f"track={p_track_id:<4} ",
-                        f"gid={_C.get('green', '')}{global_id[:8]}{_C.get('reset', '')}  ",
-                        f"tipo={_C.get('yellow', '')}{event_type}{_C.get('reset', '')}",
-                        f"  prev={prev_camera}" if prev_camera else "",
-                    )
+                # match_or_create() always resolves a global_id now (matches or
+                # creates) — no more "partial body, no create" case to handle here.
+                state.appearance_sent = True
+                state.global_id = global_id
+                logger.info("ReID track=%d cam=%s → %s gid=%s prev=%s",
+                            p_track_id, camera_id, event_type, global_id, prev_camera)
+                _slog(
+                    f"{_C.get('cyan', '')}[{camera_id}]{_C.get('reset', '')} ",
+                    f"{_C.get('bold', '')}DETECCIÓN{_C.get('reset', '')}  ",
+                    f"track={p_track_id:<4} ",
+                    f"gid={_C.get('green', '')}{global_id[:8]}{_C.get('reset', '')}  ",
+                    f"tipo={_C.get('yellow', '')}{event_type}{_C.get('reset', '')}",
+                    f"  prev={prev_camera}" if prev_camera else "",
+                )
 
-                    # Same-camera re-detection: demote to person_return to avoid a
-                    # spurious channel_change when the tracker re-detects on the same camera.
-                    if event_type == "channel_change" and prev_camera == camera_id:
-                        event_type = "person_return"
+                # Same-camera re-detection: demote to person_return to avoid a
+                # spurious channel_change when the tracker re-detects on the same camera.
+                if event_type == "channel_change" and prev_camera == camera_id:
+                    event_type = "person_return"
 
-                    if not state.entry_emitted:
-                        state.entry_emitted = True
-                        if event_type == "channel_change":
-                            api_client.post_person_channel_change(
-                                camera_id, p_track_id, bbox, confidence,
-                                global_id, prev_camera, is_entry_exit_cam,
-                            )
-                        else:
-                            api_client.post_person_entry(
-                                camera_id, p_track_id, bbox, confidence,
-                                is_entry_exit_cam,
-                                global_id=global_id,
-                                is_return=(event_type == "person_return"),
-                            )
-                            if event_type == "new_person":
-                                _get_analytics(pad_index)["person_count"] += 1
+                if not state.entry_emitted:
+                    state.entry_emitted = True
+                    if event_type == "channel_change":
+                        api_client.post_person_channel_change(
+                            camera_id, p_track_id, bbox, confidence,
+                            global_id, prev_camera, is_entry_exit_cam,
+                        )
+                    else:
+                        api_client.post_person_entry(
+                            camera_id, p_track_id, bbox, confidence,
+                            is_entry_exit_cam,
+                            global_id=global_id,
+                            is_return=(event_type == "person_return"),
+                        )
+                        if event_type == "new_person":
+                            _get_analytics(pad_index)["person_count"] += 1
 
-            elif state.global_id is not None and not partial and frame_num % 90 == 0:
+            elif state.global_id is not None and frame_num % 90 == 0:
                 # ── Subsequent frames — refresh the gallery periodically ──────
                 # Adds new angles/poses so cross-camera matching stays accurate.
-                # Skipped entirely for partial views (not just excluded from
-                # _gallery_add) — no reason to even attempt the diversity check
-                # with a low-quality embedding.
                 _reid_manager.update_embedding(state.global_id, vec, track_id=p_track_id)
 
     # ── Deadline fallback: emit entry if SGIE never returned an embedding ─────

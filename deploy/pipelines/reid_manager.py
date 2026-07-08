@@ -190,26 +190,15 @@ class ReIdManager:
         self,
         embedding: np.ndarray,
         camera_id: str,
-        threshold: Optional[float] = None,
-        create: bool = True,
         track_id: Optional[int] = None,
-        add_to_gallery: bool = True,
     ) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
         """
         Match embedding against the DB and return
         (global_id, event_type, prev_camera_id, expired_ids).
 
-        threshold overrides SIMILARITY_THRESHOLD for this call — probes.py computes the
-        right value based on the detection's aspect ratio before calling this method.
-        If create=False and no match is found, returns (None, None, None, expired_ids)
-        instead of seeding a new identity; used for partial-body detections that should
-        not create new identities but can still match existing ones.
-        add_to_gallery=False skips _gallery_add on a match — the match and its logging
-        still happen, but the (possibly partial/low-quality) embedding never becomes a
-        permanent gallery member. Used for the same partial-body detections: they can
-        confirm an existing identity, but shouldn't degrade future matching quality.
-        event_type is one of EVENT_NEW_PERSON, EVENT_PERSON_RETURN, EVENT_CHANNEL_CHANGE.
-        prev_camera_id is None for new persons.
+        Always resolves a global_id — either an existing match (>= SIMILARITY_THRESHOLD)
+        or a freshly created identity. event_type is one of EVENT_NEW_PERSON,
+        EVENT_PERSON_RETURN, EVENT_CHANNEL_CHANGE. prev_camera_id is None for new persons.
         expired_ids lists any global_ids just dropped by _expire_stale() this call —
         the caller (probes.py) uses it to purge FaceRecognizer's own vote/lock state
         for the same ids, since nothing else would ever tell it to forget them.
@@ -220,11 +209,9 @@ class ReIdManager:
             expired_ids = self._expire_stale()
             now = time.time()
 
-            best_gid, best_sim = self._find_best_match(embedding, threshold=threshold)
+            best_gid, best_sim = self._find_best_match(embedding)
 
             if best_gid is None:
-                if not create:
-                    return None, None, None, expired_ids
                 gid = uuid.uuid4().hex[:12]
                 self._db[gid] = _Entry(
                     global_id=gid,
@@ -234,7 +221,7 @@ class ReIdManager:
                     camera_id=camera_id,
                 )
                 logger.info("ReID: new_person gid=%s best_sim=%.3f (no match below threshold=%.2f)",
-                            gid, best_sim, threshold if threshold is not None else SIMILARITY_THRESHOLD)
+                            gid, best_sim, SIMILARITY_THRESHOLD)
                 if self._csv_logger:
                     self._csv_logger.info(
                         "%s,%s,%s,new_person,%.4f,1,yes,,",
@@ -247,7 +234,7 @@ class ReIdManager:
             time_absent = now - entry.last_seen_ts
             prev_camera  = entry.camera_id
 
-            added = _gallery_add(entry.gallery, embedding, self._gallery_max_size) if add_to_gallery else False
+            added = _gallery_add(entry.gallery, embedding, self._gallery_max_size)
             entry.last_seen_ts = now
             entry.camera_id    = camera_id
 
@@ -304,21 +291,15 @@ class ReIdManager:
 
     # ── Internal ────────────────────────────────────────────────────────────────
 
-    def _find_best_match(
-        self,
-        embedding: np.ndarray,
-        threshold: Optional[float] = None,
-    ) -> Tuple[Optional[str], float]:
+    def _find_best_match(self, embedding: np.ndarray) -> Tuple[Optional[str], float]:
         """Busca la identidad con mayor similitud coseno en la DB usando una sola llamada BLAS.
 
         Concatena todas las galerías en una sola matriz para evitar loops Python con numpy.
-        Devuelve (global_id, sim) si sim >= effective_threshold, o (None, best_sim) si no hay match.
-        threshold overrides SIMILARITY_THRESHOLD when provided (e.g. for partial-body views).
+        Devuelve (global_id, sim) si sim >= SIMILARITY_THRESHOLD, o (None, best_sim) si no hay match.
         Debe llamarse dentro del lock (_lock).
         """
         if not self._db:
             return None, -1.0
-        effective_threshold = threshold if threshold is not None else SIMILARITY_THRESHOLD
         ids       = list(self._db.keys())
         galleries = [self._db[gid].gallery for gid in ids]
         sizes     = [len(g) for g in galleries]
@@ -338,7 +319,7 @@ class ReIdManager:
                 best_idx = i
             offset += size
 
-        return (ids[best_idx], best_sim) if best_sim >= effective_threshold else (None, best_sim)
+        return (ids[best_idx], best_sim) if best_sim >= SIMILARITY_THRESHOLD else (None, best_sim)
 
     def _expire_stale(self) -> List[str]:
         """Elimina entradas que no han sido vistas en REID_TTL_S segundos. Llamar dentro del lock.
