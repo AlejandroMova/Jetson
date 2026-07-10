@@ -102,8 +102,13 @@ class WsPositionClient:
     def _connect_loop(self) -> None:
         """Loop de reconexión con backoff exponencial: 1s → 2s → 4s → ... → 30s.
 
-        Al conectar exitosamente: asigna _ws y entra al ping loop interno (ws.ping() cada 15 s).
-        Si el ping falla o la conexión cae, sale del loop interno y reintenta tras el backoff.
+        Al conectar exitosamente: asigna _ws y entra al loop de keepalive interno, que
+        llama ws.recv() en bucle para procesar los PING del servidor (uvicorn envía uno
+        cada ws_ping_interval=20s por defecto y cierra la conexión si no recibe PONG en
+        otros 20s). websocket-client solo auto-responde PING con PONG dentro de .recv();
+        no basta con enviar pings propios. Un timeout de .recv() (sin datos en 10s, ver
+        connect(..., timeout=10)) es normal y no indica conexión caída — solo un error
+        distinto de timeout la corta y hace salir al loop externo para reconectar.
         El backoff se resetea a _INITIAL_BACKOFF en cada conexión exitosa.
         """
         try:
@@ -130,13 +135,21 @@ class WsPositionClient:
                 logger.info("WS connected → %s", self._ws_url)
                 backoff = self._INITIAL_BACKOFF  # resetear backoff al conectar con éxito
 
-                # ── Mantener conexión viva con ping ──────────────────────────────
+                # ── Mantener conexión viva leyendo el socket ─────────────────────
+                # uvicorn (servidor) envía su propio PING cada ~20 s y cierra la conexión
+                # (code 1011) si no recibe PONG dentro de otros ~20 s. websocket-client
+                # solo procesa/auto-responde frames de control entrantes (incluido el PONG
+                # al PING del servidor) cuando la app llama a .recv() — un ws.ping() saliente
+                # no sirve para esto, por eso se elimina. .recv() respeta el timeout=10
+                # pasado a connect(), así que un WebSocketTimeoutException aquí solo
+                # significa "no llegó nada en 10s", no que la conexión murió.
                 while self._running:
                     try:
-                        ws.ping()
-                        time.sleep(15)  # ping cada 15 s — suficiente para keepalive sin saturar
+                        ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue  # nada que leer — normal, seguir esperando
                     except Exception:
-                        break  # conexión caída → salir al loop externo para reconectar
+                        break  # conexión caída de verdad → salir al loop externo para reconectar
 
             except Exception as e:
                 logger.debug("WS connect failed: %s — retry in %.0fs", e, backoff)

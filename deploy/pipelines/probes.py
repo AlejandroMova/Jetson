@@ -1387,6 +1387,13 @@ def _accumulate_positions(
         r = obj.rect_params
         x_norm = round((r.left + r.width / 2) / fw, 3)
         y_norm = round((r.top + r.height / 2) / fh, 3)
+        # Un bbox parcialmente fuera de frame (oclusión, borde de cámara) es una
+        # situación esperada, no un bug — pero el backend valida x_norm/y_norm
+        # con ge=0.0/le=1.0 (PositionItem, StrictModel) y como positions es una
+        # lista, un solo valor fuera de rango invalida el snapshot ENTERO,
+        # descartando también a todas las demás personas de ese segundo.
+        x_norm = min(1.0, max(0.0, x_norm))
+        y_norm = min(1.0, max(0.0, y_norm))
         # Overwrite any earlier entry for this person within the current second.
         buf[state.global_id] = {
             "global_id": state.global_id, "x_norm": x_norm, "y_norm": y_norm,
