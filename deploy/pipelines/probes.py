@@ -1387,6 +1387,13 @@ def _accumulate_positions(
         r = obj.rect_params
         x_norm = round((r.left + r.width / 2) / fw, 3)
         y_norm = round((r.top + r.height / 2) / fh, 3)
+        # ponytail: diagnóstico temporal — confirma con datos reales si el clamp de abajo
+        # se activa por bboxes fuera de frame; quitar este log una vez confirmado.
+        if not (0.0 <= x_norm <= 1.0) or not (0.0 <= y_norm <= 1.0):
+            logger.info(
+                "Coordenada fuera de frame antes de clamp: camera=%s global_id=%s x=%.3f y=%.3f",
+                camera_id, state.global_id, x_norm, y_norm,
+            )
         # Un bbox parcialmente fuera de frame (oclusión, borde de cámara) es una
         # situación esperada, no un bug — pero el backend valida x_norm/y_norm
         # con ge=0.0/le=1.0 (PositionItem, StrictModel) y como positions es una
