@@ -191,14 +191,20 @@ class ReIdManager:
         embedding: np.ndarray,
         camera_id: str,
         track_id: Optional[int] = None,
+        create: bool = True,
     ) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
         """
         Match embedding against the DB and return
         (global_id, event_type, prev_camera_id, expired_ids).
 
-        Always resolves a global_id — either an existing match (>= SIMILARITY_THRESHOLD)
-        or a freshly created identity. event_type is one of EVENT_NEW_PERSON,
-        EVENT_PERSON_RETURN, EVENT_CHANNEL_CHANGE. prev_camera_id is None for new persons.
+        If create=False and no match is found, returns (None, None, None, expired_ids)
+        instead of seeding a new identity — used by probes.py to retry an ambiguous
+        view on a later frame rather than committing to a new identity from a single
+        bad-angle first look (see FULL_BODY_MIN_RATIO in probes.py). When create=True
+        (the default), always resolves a global_id — either an existing match
+        (>= SIMILARITY_THRESHOLD) or a freshly created identity.
+        event_type is one of EVENT_NEW_PERSON, EVENT_PERSON_RETURN, EVENT_CHANNEL_CHANGE.
+        prev_camera_id is None for new persons.
         expired_ids lists any global_ids just dropped by _expire_stale() this call —
         the caller (probes.py) uses it to purge FaceRecognizer's own vote/lock state
         for the same ids, since nothing else would ever tell it to forget them.
@@ -212,6 +218,8 @@ class ReIdManager:
             best_gid, best_sim = self._find_best_match(embedding)
 
             if best_gid is None:
+                if not create:
+                    return None, None, None, expired_ids
                 gid = uuid.uuid4().hex[:12]
                 self._db[gid] = _Entry(
                     global_id=gid,

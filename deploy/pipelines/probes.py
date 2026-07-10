@@ -145,10 +145,23 @@ OSNET_GIE_ID: int = 3        # OSNet-x1.0 appearance SGIE — 512-dim embedding 
 # (ratio 1.3-1.8) used to exist (PARTIAL_BODY_REID_THRESHOLD=0.64) — calibration
 # against real DEMOONE crops showed it merged different people just as often as
 # the original 0.68 full-body threshold did. Every detection above this floor
-# now goes through the same SIMILARITY_THRESHOLD as full-body views; a partial
-# view that doesn't match yet just extends the deadline (see below) instead of
-# being accepted on a lower bar.
+# now goes through the same SIMILARITY_THRESHOLD as full-body views.
 PARTIAL_BODY_MIN_RATIO: float = 1.3
+
+# Ratio at/above which a view is confident enough (clearly more than torso/
+# shoulders) to seed a brand-new identity if it doesn't match anything. Added
+# 2026-07-09: without this, a track's very first valid-embedding frame decided
+# its fate permanently — state.appearance_sent locked in on the first attempt,
+# match or not, so a person whose first visible frame happened to be a bad angle
+# (e.g. bent over, only torso visible) got a new global_id immediately and never
+# got a second chance, even if a much clearer view arrived a second later on the
+# same track. Dashboard counts (301 personas/día on a small demo store) confirmed
+# this was inflating person_count. Now a new identity is only created once EITHER
+# this ratio is reached (confident full-body view, still didn't match) OR
+# ENTRY_EMIT_DEADLINE_FRAMES is reached (gave it a fair chance, camera angle
+# never cooperated — don't wait forever). Starting value, not yet calibrated
+# with real data — adjust if needed.
+FULL_BODY_MIN_RATIO: float = 2.2
 
 # ── PGIE class ids ────────────────────────────────────────────────────────────
 PGIE_CLASS_PERSON: int = 0
@@ -1146,6 +1159,9 @@ _jetson_sync_client = None  # JetsonSyncClient (Socket.IO face roster sync)
 # The backend compares consecutive snapshot timestamps to calculate dwell per person.
 _position_buffer: Dict[int, Dict[str, dict]] = {}
 _position_last_sent: Dict[int, float] = {}
+# ponytail: dedupe del log de diagnóstico "Coordenada fuera de frame" — una entrada por
+# (camera_id, global_id), no por frame. Quitar junto con el log cuando ya no haga falta.
+_oob_logged: Set[Tuple[str, str]] = set()
 # 1-second flush gives 1-second timestamp resolution for dwell tracking.
 # At a 5-second threshold, a person needs ~5 consecutive snapshots in the same cell.
 POSITION_SEND_INTERVAL: float = 1.0
@@ -1387,13 +1403,21 @@ def _accumulate_positions(
         r = obj.rect_params
         x_norm = round((r.left + r.width / 2) / fw, 3)
         y_norm = round((r.top + r.height / 2) / fh, 3)
-        # ponytail: diagnóstico temporal — confirma con datos reales si el clamp de abajo
-        # se activa por bboxes fuera de frame; quitar este log una vez confirmado.
+        # ponytail: diagnóstico temporal — una sola línea por (cámara, persona), no por
+        # frame, para no inundar el log. Incluye fw/fh y el bbox crudo en píxeles para
+        # poder confirmar si el problema es fw/fh mal leído (vs. 1920x1080 real) o el
+        # bbox del tracker. Quitar una vez confirmada la causa raíz.
         if not (0.0 <= x_norm <= 1.0) or not (0.0 <= y_norm <= 1.0):
-            logger.info(
-                "Coordenada fuera de frame antes de clamp: camera=%s global_id=%s x=%.3f y=%.3f",
-                camera_id, state.global_id, x_norm, y_norm,
-            )
+            oob_key = (camera_id, state.global_id)
+            if oob_key not in _oob_logged:
+                _oob_logged.add(oob_key)
+                logger.info(
+                    "Coordenada fuera de frame (1x por persona): camera=%s global_id=%s "
+                    "x_norm=%.3f y_norm=%.3f fw=%d fh=%d bbox_left=%.1f bbox_top=%.1f "
+                    "bbox_w=%.1f bbox_h=%.1f",
+                    camera_id, state.global_id, x_norm, y_norm, fw, fh,
+                    r.left, r.top, r.width, r.height,
+                )
         # Un bbox parcialmente fuera de frame (oclusión, borde de cámara) es una
         # situación esperada, no un bug — pero el backend valida x_norm/y_norm
         # con ge=0.0/le=1.0 (PositionItem, StrictModel) y como positions es una
@@ -1574,8 +1598,15 @@ def _handle_appearance_reid(
         else:
             if not state.appearance_sent:
                 # ── First embedding for this track — run ReID match ───────────
+                # Only allowed to CREATE a new identity once the view is confidently
+                # full-body (ratio >= FULL_BODY_MIN_RATIO) or the retry window has
+                # run out (frame_num >= state.entry_deadline) — see FULL_BODY_MIN_RATIO
+                # comment above. Matching itself is unconditional and always uses the
+                # same SIMILARITY_THRESHOLD; this only gates whether a no-match result
+                # is allowed to seed a brand-new global_id yet.
+                should_create = ratio >= FULL_BODY_MIN_RATIO or frame_num >= state.entry_deadline
                 global_id, event_type, prev_camera, expired_ids = _reid_manager.match_or_create(
-                    vec, camera_id, track_id=p_track_id,
+                    vec, camera_id, track_id=p_track_id, create=should_create,
                 )
                 # Nothing else clears FaceRecognizer's own vote/lock state or
                 # _employee_by_global_id by global_id — do it here, the only
@@ -1584,8 +1615,13 @@ def _handle_appearance_reid(
                     if _face_recognizer is not None:
                         _face_recognizer.forget(gid)
                     _employee_by_global_id.pop(gid, None)
-                # match_or_create() always resolves a global_id now (matches or
-                # creates) — no more "partial body, no create" case to handle here.
+                if global_id is None:
+                    # Ambiguous view, no match, not confident enough to create yet —
+                    # leave state.appearance_sent False so this track gets another
+                    # shot on a later frame instead of committing to a bad first look.
+                    logger.debug("ReID: ratio=%.2f no match track=%d — retrying",
+                                 ratio, p_track_id)
+                    return
                 state.appearance_sent = True
                 state.global_id = global_id
                 logger.info("ReID track=%d cam=%s → %s gid=%s prev=%s",
