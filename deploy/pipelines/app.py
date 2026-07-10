@@ -36,7 +36,7 @@ import pyds
 from config_loader import load_config
 from probes import (
     osd_sink_pad_buffer_probe, tiled_overlay_probe, api_client,
-    init_channel_map, init_sector, init_entry_exit_pads, init_camera_types,
+    init_channel_map, init_stream_resolution, init_sector, init_entry_exit_pads, init_camera_types,
     init_handlers, init_workers, start_workers, stop_workers,
     init_stream_grid, tiled_frame_queue,
     _IS_STREAM_ENABLED,
@@ -302,6 +302,7 @@ def main():
     active_channels = [ch for ch in cfg.channels if ch not in cfg.external_channels] if not cfg.count_external else cfg.channels
 
     init_channel_map(active_channels)
+    init_stream_resolution(cfg.stream_width, cfg.stream_height)
 
     init_sector(cfg.sector)
     init_entry_exit_pads(cfg.entry_exit_pad_indices())

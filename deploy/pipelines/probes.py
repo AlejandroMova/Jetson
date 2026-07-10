@@ -94,6 +94,24 @@ def init_channel_map(channels: list) -> None:
     logger.info("Channel map: %s", _channel_map)
 
 
+# Lienzo de salida del streammux — sobreescrito por init_stream_resolution() antes de
+# arrancar el pipeline. Defaults iguales a ClientConfig en config_loader.py.
+_stream_width: int = 1920
+_stream_height: int = 1080
+
+
+def init_stream_resolution(width: int, height: int) -> None:
+    """Call from app.py (o app_video_testing.py) después de load_config()/probing de
+    resolución, antes de iniciar el pipeline. width/height deben ser el mismo valor pasado
+    a streammux.set_property("width"/"height", ...) — rect_params de nvinfer/nvtracker se
+    reportan en ese lienzo de salida, no en la resolución nativa de entrada
+    (frame_meta.source_frame_width/height, que puede diferir si stream_type y
+    rtsp_url_pattern quedan desincronizados — ver ErrorHistory.md)."""
+    global _stream_width, _stream_height
+    _stream_width, _stream_height = width, height
+    logger.info("Stream resolution: %dx%d", width, height)
+
+
 def init_sector(sector: str) -> None:
     """Set the client sector: 'comercio', 'industrial', or 'hogar'.
 
@@ -1372,7 +1390,7 @@ def _get_analytics_last_sent(pad_index: int) -> float:
 
 
 def _accumulate_positions(
-    pad_index: int, camera_id: str, persons_meta: list, frame_meta,
+    pad_index: int, camera_id: str, persons_meta: list,
 ) -> None:
     """Update the per-camera position buffer and flush to the backend every POSITION_SEND_INTERVAL s.
 
@@ -1389,8 +1407,13 @@ def _accumulate_positions(
     _FaceRecognitionHandler.process_face) and app/socket/positions.py on the
     backend.
     """
-    fw = frame_meta.source_frame_width
-    fh = frame_meta.source_frame_height
+    # fw/fh son el lienzo de salida del streammux (init_stream_resolution()), no la
+    # resolución nativa de entrada — rect_params se reporta en ese lienzo. Usar
+    # frame_meta.source_frame_width/height acá era el bug: ese campo refleja la
+    # resolución pre-streammux, que puede no coincidir si stream_type/rtsp_url_pattern
+    # quedan desincronizados (ver ErrorHistory.md).
+    fw = _stream_width
+    fh = _stream_height
     buf = _position_buffer.setdefault(pad_index, {})
     confirmed_this_cycle = _face_confirmed_this_cycle.setdefault(pad_index, set())
 
@@ -1931,7 +1954,7 @@ def osd_sink_pad_buffer_probe(_pad, info):
         _expire_lost_tracks(pad_index, frame_num, visible_ids)
 
         if _ws_client is not None and visible_ids:
-            _accumulate_positions(pad_index, camera_id, persons_meta, frame_meta)
+            _accumulate_positions(pad_index, camera_id, persons_meta)
 
         # ── Periodic analytics snapshot ───────────────────────────────────────
         now = time.monotonic()

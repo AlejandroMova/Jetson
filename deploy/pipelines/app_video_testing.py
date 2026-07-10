@@ -34,6 +34,7 @@ from probes import (
     tiled_overlay_probe,
     api_client,
     init_channel_map,
+    init_stream_resolution,
     init_sector,
     init_handlers,
     init_workers,
@@ -135,6 +136,7 @@ def main() -> None:
     init_sector(sector)
 
     init_channel_map([1])
+    init_stream_resolution(video_width, video_height)
     init_workers(pipeline_caps, model_dir=str(_MODELS_DIR), face_db_path=face_db_path)
     init_handlers(pipeline_caps)
 
