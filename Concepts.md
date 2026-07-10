@@ -70,12 +70,12 @@ El probe detecta esto comparando los tracks activos con los que llegaron en el f
 Los que no aparecen → `_expire_lost_tracks()` los elimina, emite `person_exit`, y limpia
 `_active_tracks`. Pero **la entrada en `ReIdManager._db` sigue viva** durante hasta 1 hora.
 
-- Función de expiración: [probes.py línea 1459](deploy/pipelines/probes.py#L1459)
+- Función de expiración: [probes.py — `_expire_lost_tracks`](deploy/pipelines/probes.py#L1465)
 
 ### Reentrada — misma cámara
 Si la misma persona sale y vuelve a entrar al encuadre de **la misma cámara**:
 - DeepStream le asigna un nuevo `track_id` → nuevo `_TrackState` en `_active_tracks`
-- `AppearanceWorker` genera un nuevo embedding
+- El SGIE de OSNet genera un nuevo embedding (mismo frame que la detección)
 - `ReIdManager.match_or_create()` lo reconoce por similitud coseno y devuelve el mismo `global_id`
 - Como `prev_camera == camera_id`, el evento `channel_change` se **demota a `person_return`**
   para no emitir un cambio de cámara espurio cuando en realidad la persona nunca cambió de cámara
@@ -120,20 +120,24 @@ no necesitan respuesta inmediata frame a frame.
 sección se indexan por `track_id`, pero `FaceRecognizer.enqueue`/`get_result` se indexan por el
 `global_id` de ReID — ver la sección "Handler: Reconocimiento Facial" más abajo para el porqué.
 
-**Los tres workers:**
+**El worker que queda (nota: esta sección describe un patrón que aplicaba a varios workers —
+`AppearanceWorker` ya no existe, ver abajo; `PoseWorker`/`pose_worker.py` tampoco están en el
+repo actual — si `fall_detection` sigue siendo una capacidad activa, su implementación actual
+no sigue este patrón y esta sección necesitaría una revisión más amplia que la de este cambio):**
 
 | Worker | Modelo | Propósito | Archivo |
 |--------|--------|-----------|---------|
-| `AppearanceWorker` | OSNet-x0.25 ONNX | Embedding 512-dim por persona para re-ID | [appearance_worker.py](deploy/pipelines/appearance_worker.py) |
-| `PoseWorker` | MoveNet Lightning ONNX | Detección de caídas (17 keypoints) | [pose_worker.py](deploy/pipelines/pose_worker.py) |
 | `FaceRecognizer` | InsightFace ArcFace | Identifica personas conocidas por cara | [face_recognizer.py](deploy/pipelines/face_recognizer.py) |
+
+**OSNet ya no usa este patrón (cambio previo a esta sesión):** el embedding de apariencia se
+extrae directamente del SGIE de DeepStream (gie-id=3) vía `NvDsInferTensorMeta` en el mismo
+frame de la detección — sin worker de Python, sin cola, sin `AppearanceWorker`. Ver sección 6
+más abajo.
 
 **Por qué los modelos se cargan en `start()` y no en `__init__()`:**
 TensorRT inicializa su contexto CUDA cuando el pipeline hace `set_state(PLAYING)`.
-Si ONNX Runtime se carga antes, hay conflictos de contexto CUDA. Por eso todos los workers
+Si ONNX Runtime se carga antes, hay conflictos de contexto CUDA. Por eso los workers
 cargan el modelo en `start()`, que se llama después de arrancar el pipeline.
-
-Ver ejemplo: [appearance_worker.py línea 64](deploy/pipelines/appearance_worker.py#L64)
 
 ---
 
@@ -320,19 +324,24 @@ Formato legacy (nombre-clave) sigue siendo compatible en lectura.
 **El problema:** Cuando una persona pasa de la cámara 1 a la cámara 2, el tracker le asigna
 un nuevo `track_id` porque es un stream distinto. ¿Cómo sabemos que es la misma persona?
 
-**La solución:** OSNet-x0.25 genera un vector de 512 números (embedding) que representa el
-"aspecto visual" de la persona — ropa, silueta, color. Dos embeddings de la misma persona
-tienen alta similitud coseno (≥ 0.55).
+**La solución:** OSNet-x1.0 genera un vector de 512 números (embedding) que representa el
+"aspecto visual" de la persona — ropa, silueta, color. El embedding se extrae **directamente
+del SGIE de DeepStream** (gie-id=3) vía `NvDsInferTensorMeta` en el probe — sin worker de
+Python, sin copiar el crop; DeepStream ya hizo el crop y corrió el engine TRT antes de que
+el probe llegue a este punto. Dos embeddings de la misma persona tienen alta similitud
+coseno (≥ 0.85, `SIMILARITY_THRESHOLD` — calibrado 2026-07-08 con crops reales de un
+cliente; el 0.68 heredado, calibrado para OSNet x0.25, resultó demasiado permisivo para
+x1.0 y fusionaba personas distintas).
 
 **Escenario A — persona nueva:**
-1. Persona entra a cámara 1, AppearanceWorker genera embedding `[0.1, -0.3, 0.8, ...]`
-2. `ReIdManager.match_or_create(embedding, "ch01")` busca en la DB — no hay nadie con similitud ≥ 0.55
+1. Persona entra a cámara 1, el SGIE ya generó el embedding `[0.1, -0.3, 0.8, ...]` en el mismo frame
+2. `ReIdManager.match_or_create(embedding, "ch01")` busca en la DB — no hay nadie con similitud ≥ 0.85
 3. Crea nuevo `global_id="a3f7c2"`, guarda el embedding en su galería
 4. Emite `person_entry` con `entry_type: "new"`
 
 **Escenario B — misma persona, otra cámara:**
-1. Persona llega a cámara 2 (estuvo 5 min ausente), AppearanceWorker genera nuevo embedding
-2. `ReIdManager.match_or_create(embedding, "ch02")` busca en DB → encuentra `"a3f7c2"` con similitud 0.72 → MATCH
+1. Persona llega a cámara 2 (estuvo 5 min ausente), el SGIE genera un nuevo embedding
+2. `ReIdManager.match_or_create(embedding, "ch02")` busca en DB → encuentra `"a3f7c2"` con similitud 0.90 → MATCH
 3. Tiempo ausente > 5 min → emite `person_entry` con `entry_type: "return"`
 4. Tiempo ausente ≤ 5 min → emite `person_channel_change`
 
@@ -342,21 +351,39 @@ tienen alta similitud coseno (≥ 0.55).
 3. Detecta que `prev_camera == camera_id` → el `channel_change` se **demota a `person_return`**
 4. Evita emitir "cambio de cámara" cuando la persona nunca salió de la cámara
 
-**La galería:** Cada persona almacena hasta 10 embeddings de distintos ángulos/poses.
-El matching usa el máximo de similitud contra todos los ángulos de la galería — si cualquiera coincide,
-la persona se reconoce aunque el ángulo actual sea distinto a los anteriores.
+**Escenario D — primera vista ambigua, no crear todavía (agregado 2026-07-09):**
+1. Persona aparece agachada — el bbox solo muestra el torso (`ratio=1.5`, entre
+   `PARTIAL_BODY_MIN_RATIO=1.3` y `FULL_BODY_MIN_RATIO=2.2`)
+2. `match_or_create(embedding, "ch01", create=False)` no encuentra match — como `create=False`,
+   retorna `(None, None, None, [])` **sin crear** una identidad nueva
+3. `state.appearance_sent` se queda en `False` — el track vuelve a intentar en el siguiente frame
+4. ~1.5s después la misma persona ya está de pie, de cuerpo completo (`ratio=3.0`) — si matchea
+   contra la galería, se resuelve como retorno/cambio de cámara en vez de persona nueva
+5. Si nunca matchea: se crea la identidad nueva recién cuando `ratio >= FULL_BODY_MIN_RATIO`
+   (vista confiable) **o** `frame_num >= state.entry_deadline` (se acabaron los ~30 frames de
+   espera) — lo que ocurra primero. Antes de este cambio, el primer frame con embedding válido
+   decidía la identidad para siempre, sin reintentar — inflaba `person_count` con personas
+   "nuevas" que en realidad eran retornos vistos desde un ángulo malo.
+
+**La galería:** Cada persona almacena hasta 10 embeddings de distintos ángulos/poses
+(`GALLERY_MAX_SIZE`). El matching usa el máximo de similitud contra todos los ángulos de la
+galería — si cualquiera coincide, la persona se reconoce aunque el ángulo actual sea distinto
+a los anteriores. Un embedding nuevo se agrega a la galería solo si es lo bastante distinto a
+los existentes (0.71 ≤ similitud < 0.95, `GALLERY_DIVERSITY_THRESHOLD_MIN/MAX`) — ni tan
+parecido que sea un duplicado, ni tan distinto que sea ruido.
 
 - Manager: [reid_manager.py](deploy/pipelines/reid_manager.py)
-- Función de matching: [reid_manager.py — `_find_best_match`](deploy/pipelines/reid_manager.py#L213)
-- `match_or_create`: [reid_manager.py — línea 134](deploy/pipelines/reid_manager.py#L134)
-- Worker que genera embeddings: [appearance_worker.py](deploy/pipelines/appearance_worker.py)
+- Función de matching: [reid_manager.py — `_find_best_match`](deploy/pipelines/reid_manager.py#L302)
+- `match_or_create`: [reid_manager.py — línea 189](deploy/pipelines/reid_manager.py#L189)
+- Extracción del embedding desde el tensor del SGIE: `_extract_osnet_embedding()` en [probes.py](deploy/pipelines/probes.py)
 
-**El entry diferido:** El embedding tarda ~1-2 frames en estar listo. El `person_entry`
-se retrasa hasta que `_handle_appearance_reid()` tiene el embedding para incluir `global_id`.
-Si después de `ENTRY_EMIT_DEADLINE_FRAMES=30` frames no hay embedding, se emite sin `global_id`.
+**El entry diferido:** El embedding llega en el mismo frame de la detección (el SGIE corre
+antes que el probe). El `person_entry` se retrasa hasta que `_handle_appearance_reid()`
+resuelve un `global_id` para incluirlo. Si después de `ENTRY_EMIT_DEADLINE_FRAMES=30` frames
+(~1s) nunca hay un embedding válido (bbox nunca supera 96×192 px), se emite sin `global_id`.
 
-- Lógica de entry diferido: [probes.py línea 1510](deploy/pipelines/probes.py#L1510)
-- Deadline: [probes.py línea 222](deploy/pipelines/probes.py#L222)
+- Lógica de entry diferido y reintento: [probes.py — `_handle_appearance_reid`](deploy/pipelines/probes.py#L1555)
+- Deadline: [probes.py — `ENTRY_EMIT_DEADLINE_FRAMES`](deploy/pipelines/probes.py#L230)
 
 ---
 

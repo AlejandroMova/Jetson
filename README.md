@@ -246,7 +246,7 @@ Use `package: manual` to set `pipeline:` and `sector:` explicitly (testing / cus
 | Capability | Type | Model | Notes |
 |-----------|------|-------|-------|
 | `people_counting` | PGIE | PeopleNet v2.3.4 | Always active |
-| `cross_camera_reid` | Python worker | OSNet-x0.25 ONNX | **Always active** (tied to people_counting). Auto-downloaded by setup.sh. Generates 512-dim appearance vectors for cross-camera re-ID. |
+| `cross_camera_reid` | SGIE (gie-id=3) | OSNet-x1.0 ONNX | **Always active** (tied to people_counting, if the ONNX exists on disk). Auto-downloaded by setup.sh. Generates 512-dim appearance vectors for cross-camera re-ID directly via DeepStream tensor metadata — no Python worker. |
 | `age_gender` | SGIE (gie-id=2) | ResNet-18 Pedestrian Attr | Full-body crop → 6 classes |
 | `fall_detection` | Python worker | MoveNet Lightning ONNX | **Hogar only** (hogar_avanzado / hogar_total). Auto-downloaded by setup.sh. |
 | `face_recognition` | Python worker | PeopleNet class 2 (face) + InsightFace buffalo_l | No extra model needed — uses face detections already produced by PeopleNet PGIE. comercio/industrial: identity rides along in `positions_snapshot` (`employee_id`/`face_confirmed` fields), no discrete event. hogar: `unknown_person_alert` (discrete event, intrusion alert). |
@@ -465,15 +465,15 @@ For **hogar**: register household members the same way. Anyone not in the databa
 
 ## Cross-camera person tracking
 
-The pipeline generates a 512-dimensional **appearance embedding** (OSNet-x0.25 ONNX) for every detected person. This vector captures clothing/silhouette, not face — it works without `face_recognition` enabled.
+The pipeline generates a 512-dimensional **appearance embedding** (OSNet-x1.0 ONNX) for every detected person, extracted **directly from the OSNet SGIE** (gie-id=3) via DeepStream tensor metadata — no Python worker, no crop copy. This vector captures clothing/silhouette, not face — it works without `face_recognition` enabled.
 
 **How it works:**
 
-1. Person detected → `person_entry` emission deferred until embedding is ready (up to ~1 s / 30 frames)
-2. AppearanceWorker processes the crop in a background thread → 512-dim L2-normalized vector
-3. `ReIdManager` matches the vector against the local DB (cosine similarity ≥ 0.60) and returns a `global_id`
+1. Person detected → `person_entry` emission deferred until the SGIE embedding is ready (same frame as detection; up to ~1 s / 30 frames as a safety fallback if the bbox never clears the SGIE's min size, 96×192 px)
+2. `ReIdManager.match_or_create()` matches the vector against the local DB (cosine similarity ≥ 0.85, `SIMILARITY_THRESHOLD` — calibrated 2026-07-08 against real client crops) and returns a `global_id`
+3. **Retry before creating a new identity:** a track's very first embedding no longer decides its fate permanently. A brand-new `global_id` is only seeded once the view is confidently full-body (`ratio ≥ FULL_BODY_MIN_RATIO=2.2`) or the ~1 s deadline is reached — an ambiguous view (e.g. bent over, only torso visible) that doesn't match anything just waits for a better frame on the same track instead of committing early. Bboxes below `PARTIAL_BODY_MIN_RATIO=1.3` (only legs/feet visible) are skipped entirely, no match attempt at all.
 4. `person_entry` event is sent with `global_id` and `entry_type: "new"` | `"return"`, or `person_channel_change` if same person moved cameras within 5 min
-5. If embedding never arrives before deadline, `person_entry` is sent with `global_id: null`
+5. If no embedding ever clears the SGIE's min-size threshold before the deadline, `person_entry` is sent with `global_id: null`
 
 **Event types emitted:**
 - `person_entry` (`entry_type: "new"`) — never seen before
@@ -486,7 +486,7 @@ The pipeline generates a 512-dimensional **appearance embedding** (OSNet-x0.25 O
 - Calculate true store dwell time (entry cam → exit cam)
 - Identify employees in cameras where their face is not visible
 
-The cross-camera matching runs **locally on the Jetson** via `ReIdManager` (no cloud round-trip). Identity DB persists across restarts at `deploy/reid_db.json` with a 1-hour TTL. Note: internal AppearanceWorker key is `(pad_index, track_id)` because DeepStream assigns track IDs locally per stream — two cameras can have the same track ID simultaneously.
+The cross-camera matching runs **locally on the Jetson** via `ReIdManager` (no cloud round-trip). Identity DB persists across restarts at `deploy/reid_db.json` with a 1-hour TTL. Each identity keeps a gallery of up to 10 embeddings (angles/poses); a new embedding is added only if it's diverse enough from existing ones (0.71 ≤ similarity < 0.95, `GALLERY_DIVERSITY_THRESHOLD_MIN/MAX`) so near-duplicate frames don't waste a gallery slot.
 
 OSNet model is auto-downloaded by `setup.sh`. To download manually:
 ```bash
@@ -538,8 +538,8 @@ DVR (RTSP) → rtspsrc → nvv4l2decoder → nvstreammux
   (QA mode: probe also draws overlays + feeds MjpegServer on :8080 + publishes Redis metadata)
 
 Async paths (background threads, never block pipeline):
-  people_counting → AppearanceWorker → OSNet ONNX → 512-dim vector → ReIdManager (local match) → POST /api/events (person_entry with global_id | person_channel_change)
-  fall_detection  → PoseWorker       → MoveNet ONNX → 17 keypoints → POST /api/events (fall_detected)
+  people_counting → OSNet SGIE (gie-id=3, in-pipeline, not async) → 512-dim vector → ReIdManager (local match, 0.85 threshold) → POST /api/events (person_entry with global_id | person_channel_change)
+  fall_detection  → PoseWorker       → MoveNet ONNX → 17 keypoints → POST /api/events (fall_detected)  # NOTE: pose_worker.py not found in current repo — this line may be stale, not verified in this pass
   face_recognition→ FaceRecognizer   → InsightFace ArcFace → tags global_id (comercio/industrial, rides in positions_snapshot) or POST /api/events unknown_person_alert (hogar)
   all cameras     → NxApiClient      → REST POST /api/events, /api/analytics, /api/crops
   all cameras     → WsPositionClient → WS /ws/positions (positions_snapshot every 1s)

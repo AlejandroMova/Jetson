@@ -269,7 +269,7 @@ El proyecto usa un patrón de **capacidades por paquete**. Cada capacidad perten
 **Código del pipeline:**
 - Nueva capacidad de inferencia → agregar como handler en `probes.py` siguiendo el patrón `_XxxHandler`
 - Nuevo modelo SGIE → agregar entrada en `SGIE_CONFIGS` dict en `app.py`
-- Worker Python (modelo no-DeepStream) → crear `xxx_worker.py` con patrón queue + thread, como `appearance_worker.py` o `face_recognizer.py`
+- Worker Python (modelo no-DeepStream) → crear `xxx_worker.py` con patrón queue + thread, como `face_recognizer.py`
 
 **Sistema de capacidades y paquetes (`config_loader.py`):**
 - Agregar la nueva capacidad a `KNOWN_CAPABILITIES`
@@ -513,7 +513,7 @@ el ciclo de vida de los tracks, el patrón worker, y cómo funciona cada detecci
 
 **Actualizar `Concepts.md` cuando ocurra cualquiera de estos cambios:**
 - Se agrega o elimina un handler (`_AgeGenderHandler`, `_FallDetectionHandler`, etc.)
-- Se agrega o elimina un worker async (`AppearanceWorker`, `FaceRecognizer`, etc.)
+- Se agrega o elimina un worker async (`FaceRecognizer`, etc.)
 - Cambia el flujo del pipeline GStreamer (nuevo elemento, cambio de probe, QA mode)
 - Cambia cómo se emiten eventos al backend (nuevo tipo de evento, nueva lógica de ReID)
 - Cambia el sistema de paquetes/capacidades (nuevo paquete, nueva capacidad)
@@ -545,6 +545,7 @@ Cada vez que se agrega, elimina o cambia un campo configurable en `config_loader
 - Tiene un comentario que explica qué hace, cuál es el default, y un rango útil de valores
 - Los campos opcionales van comentados con `# campo: valor_ejemplo` para que el técnico pueda activarlos sin buscar en el código
 - El archivo `demo/config.yaml` es la plantilla de referencia — si se agrega un campo aquí, también hay que agregarlo a cualquier otro `clients/*/config.yaml` que exista
+- **Aclaración importante (2026-07-10):** `demo/config.yaml` no es un cliente real que corra en producción — es la plantilla que se copia a mano a `clients/<cliente_real>/config.yaml` al aprovisionar un cliente nuevo, y después se ajusta (`dvr_port`, `rtsp_url_pattern`, `channels`, etc.). `setup.sh` (líneas 594-604), si no encuentra `config.yaml` en la carpeta del cliente, genera uno **mínimo** desde cero (no una copia de `demo/config.yaml`) con solo `dvr_port`/`rtsp_url_pattern`/`stream_type`/`channels`, y luego `identify_dvr.py --update-config` lo completa. Un cliente real en campo (ej. `clients/Mova/`) puede tener valores completamente distintos a `demo/config.yaml` — **nunca asumir que la config de `demo` refleja lo que corre en un dispositivo real**; siempre leer `clients/<nombre_real>/config.yaml` desde el propio dispositivo (`docker exec <container> cat /nx_tech/clients/<cliente>/config.yaml`) antes de diagnosticar algo dependiente de config.
 
 **Qué NO va en `config.yaml`:**
 - Credenciales (`DVR_USER`, `DVR_PASS` → `.env`)
@@ -621,7 +622,7 @@ Gestor local de identidades cross-cámara. Mantiene un dict en memoria (`global_
 - `match_or_create(embedding, camera_id, track_id=None, create=True)` — `threshold`/`add_to_gallery` eliminados 2026-07-08 junto con la ruta de vistas parciales (ver "Re-ID entre Cámaras" arriba); `create` se reintrodujo 2026-07-09 para el reintento antes de crear identidad nueva (mismo lugar). Con `create=False` y sin match, retorna `(None, None, None, expired_ids)` en vez de sembrar una identidad — el caller (`probes.py`) decide `create=` según `FULL_BODY_MIN_RATIO`/deadline. Retorna `(global_id, event_type, prev_camera_id, expired_ids)`. `expired_ids` son los `global_id`s que `_expire_stale()` acaba de olvidar en esta llamada — el caller los usa para limpiar `FaceRecognizer.forget()` y `_employee_by_global_id`. `track_id` es opcional y solo alimenta el log CSV, no afecta el matching.
 - `update_embedding(global_id, embedding, track_id=None)` — añade a la galería con diversity check (0.71 ≤ sim < 0.95)
 - `flush()` — persiste a disco al apagar el pipeline
-Persiste la DB en `deploy/reid_db.json` cada 30 s. Constantes: `SIMILARITY_THRESHOLD=0.68`, `GALLERY_MAX_SIZE=10`, `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
+Persiste la DB en `deploy/reid_db.json` cada 30 s. Constantes: `SIMILARITY_THRESHOLD=0.85`, `GALLERY_MAX_SIZE=10`, `PRESENCE_WINDOW_S=300`, `REID_TTL_S=3600`.
 `__init__` acepta `csv_log_dir` opcional — si se pasa, activa el log CSV siempre-activo en `<csv_log_dir>/osnet_reid.csv` (ver sección "Re-ID entre Cámaras" arriba para el detalle de columnas). `probes.py::init_workers()` le pasa el mismo directorio `clients/<cliente>/logs/` que usa `face_recognition.csv`.
 
 **`ws_client.py`** (~150 líneas)
