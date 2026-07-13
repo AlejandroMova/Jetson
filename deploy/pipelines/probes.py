@@ -1459,6 +1459,16 @@ def _accumulate_positions(
     last = _position_last_sent.get(pad_index, 0.0)
     if now - last >= POSITION_SEND_INTERVAL and buf:
         _ws_client.send_positions(camera_id, list(buf.values()))
+        # ponytail: diagnóstico temporal para el delay reportado en modo stream —
+        # muestra el gap real entre envíos (debe rondar 1.0s) y qué global_ids van en
+        # cada snapshot. Si un global_id desaparece y reaparece entre envíos consecutivos
+        # mientras la persona sigue en cuadro, el delay está en su track/ReID, no solo en
+        # el dibujo del cuadro en el viewer. Quitar una vez confirmada la causa raíz.
+        _slog(
+            f"{_C.get('magenta', '')}[POS]{_C.get('reset', '')} ",
+            f"cam={camera_id} gap={now - last:.2f}s n={len(buf)} ",
+            f"gids={[gid[:8] for gid in buf.keys()]}",
+        )
         _position_buffer[pad_index] = {}
         _position_last_sent[pad_index] = now
         # New buffering cycle starts for this camera — clear only this
