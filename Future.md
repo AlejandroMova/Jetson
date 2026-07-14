@@ -1005,6 +1005,39 @@ DeepStream tiene un mecanismo nativo para esto: cuando un SGIE corre detrás de 
 
 ---
 
+## Incluir `global_id` (o un manifest) en el export de crops de `download_crops_zip()`
+
+**Descripción:** El export de crops para calibración (`/superadmin/dataset` → `admin_crops.py::download_crops_zip()`) nombra los archivos `track_<track_id>_frame_<frame_num>.jpg`, sin `global_id`. La tabla `Crop` en el backend sí tiene `global_id` por fila (`models.py`), pero se pierde al exportar. Esto obliga a cruzar el CSV `osnet_reid.csv` contra los crops de forma heurística (proximidad de tiempo + cámara) en vez de un join exacto — ver el playbook agregado en `CLAUDE.md` (sección "Re-ID entre Cámaras", ronda 2026-07-14).
+
+**Por qué sería mejor:** Con `global_id` en el nombre (o un `manifest.csv` adicional dentro del zip con `track_id,global_id,frame_num,camera_id,timestamp`), una ronda de calibración futura podría agrupar crops por `global_id` directamente y comparar galerías completas entre sí, sin depender de que dos tracks distintos hayan aparecido a pocos segundos de diferencia en la misma cámara para poder verificarlos visualmente. También eliminaría el riesgo de cruce heurístico incorrecto por reuso de `track_id` (ver caso `track_id=57` descartado en la ronda 2026-07-14).
+
+**Reemplazaría:**
+- Archivo: `AV-Platform/Backend/app/routes/admin_crops.py`
+- Función: `download_crops_zip()` (línea ~267, construcción de `filename`)
+- Descripción de lo que se agrega: incluir `global_id` en el nombre de archivo o escribir un `manifest.csv` junto a las carpetas de cámara dentro del zip.
+
+**Tech stack propuesto:** ninguno nuevo — es un cambio de formato en una ruta ya existente (Python/FastAPI, `zipfile` de stdlib).
+
+**Consideraciones:** cambio pequeño y de bajo riesgo (no toca producción en el Jetson, solo la herramienta de export del admin). Esfuerzo estimado: 15-20 min.
+
+---
+
+## Señal adicional a similitud coseno para el rango ambiguo de OSNet (0.65-0.83)
+
+**Descripción:** La ronda de calibración 2026-07-14 (ver `CLAUDE.md`) encontró que, incluso restringiendo la comparación a la misma cámara y un gap temporal corto (<60s), la similitud coseno de OSNet-x1.0 **no separa** pares confirmados como la misma persona de pares confirmados como personas distintas — ambos grupos caen en el mismo rango (~0.64-0.81), con solapamiento total. El único patrón que sí se sostuvo en la muestra fue el gap temporal (0-60s → 75% misma persona; ≥60s → 0% misma persona, 6/6 personas distintas), pero no es lo bastante confiable como para automatizar una decisión de match/no-match por sí solo.
+
+**Por qué sería mejor:** Ahora mismo, `SIMILARITY_THRESHOLD=0.85` es la única señal para decidir si dos apariciones son la misma persona, y estamos limitados por el techo de lo que esa señal puede resolver de forma segura en este local (ropa de tono genérico, iluminación de tienda, cámaras de resolución media). Una señal adicional y barata podría reducir el rango ambiguo sin arriesgar más fusiones incorrectas.
+
+**Reemplazaría:** nada todavía — es exploratorio. Candidato de integración: `reid_manager.py::_find_best_match()`, como una señal secundaria que solo se consulta cuando `best_sim` cae en la zona ambigua (ej. 0.65-0.83), no como reemplazo del umbral.
+
+**Tech stack propuesto (a evaluar, no decidido):**
+- Histograma de color de la ropa (HSV, unas pocas líneas con OpenCV) como corroboración barata — descarta candidatos con colores de prenda muy distintos incluso si el embedding OSNet los acerca.
+- Continuidad de posición/trayectoria (bbox del track saliente vs. bbox del track entrante, ya disponible en `probes.py` vía `rect_params`) — un salto de posición físicamente imposible en el gap de tiempo descarta el match sin tocar apariencia.
+
+**Consideraciones:** requiere una muestra etiquetada más grande (idealmente con ground truth real, no verificación visual manual) antes de comprometerse a una de las dos opciones — esto es una nota para no repetir el análisis desde cero, no una decisión tomada.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]

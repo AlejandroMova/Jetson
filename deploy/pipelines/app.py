@@ -385,7 +385,7 @@ def main():
     # ── OSNet SGIE (appearance re-ID) — activo si el ONNX existe en disco ────────
     # No es una capacidad en cfg.pipeline; se activa igual que hoy: si el modelo está presente.
     _osnet_onnx = _MODELS_DIR / "osnet" / "osnet_x1_0_market1501.onnx"
-    _osnet_cfg  = _MODELS_DIR / "osnet" / "config_infer_sgie_osnet.txt"
+    _osnet_cfg  = Path(cfg.osnet_config_path())
     if _osnet_onnx.exists() and _osnet_cfg.exists():
         sgie_appearance = Gst.ElementFactory.make("nvinfer", "sgie-appearance")
         if not sgie_appearance:

@@ -1,0 +1,57 @@
+[property]
+gpu-id=0
+
+# Absolute paths to ONNX and compiled TRT engine.
+# The engine is auto-generated on first run (~2 min, same as PeopleNet).
+# /nx_tech is the repo mount point inside the container (docker-compose.yml).
+# model-engine-file must match DeepStream's auto-generated name exactly
+# (<onnx>_b<batch-size>_gpu<gpu-id>_<network-mode>.engine) or it rebuilds
+# from scratch on every restart instead of loading the cached engine.
+onnx-file=/nx_tech/models/osnet/osnet_x1_0_market1501.onnx
+model-engine-file=/nx_tech/models/osnet/osnet_x1_0_market1501.onnx_b8_gpu0_fp16.engine
+
+# ImageNet normalization: output_c = (pixel_c - mean_c*255) / (std_c*255)
+# DeepStream formula: output = (pixel - offset) * net_scale_factor
+# mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225] (per-channel std ~0.226 avg)
+# offsets = mean * 255 per channel (R, G, B)
+# net-scale-factor = 1 / (255 * avg_std) ≈ 0.01737
+net-scale-factor=0.01737
+offsets=123.675;116.28;103.53
+model-color-format=0
+
+# FP16 variant (agregado 2026-07-14) — igual que config_infer_sgie_osnet.txt salvo
+# network-mode y model-engine-file. No es el default: un cliente lo activa poniendo
+# osnet_precision: fp16 en su config.yaml (ver ClientConfig.osnet_config_path() en
+# config_loader.py). Antes de confiar en este modo en producción, reverificar que la
+# distribución de similitudes no cambió respecto a FP32 — el SIMILARITY_THRESHOLD=0.85
+# calibrado en reid_manager.py se calibró con embeddings FP32.
+network-mode=2
+
+# network-type=1 = other (not a classifier or detector — just extracts the output tensor).
+# output-tensor-meta=1 exposes the tensor via NvDsInferTensorMeta so the probe can read it.
+network-type=1
+output-blob-names=output
+output-tensor-meta=1
+force-implicit-batch-dim=0
+batch-size=8
+
+# process-mode=2 = SGIE (runs on object crops from the PGIE).
+# operate-on-gie-id=1 = PeopleNet. operate-on-class-ids=0 = class 0 (person), not class 2 (face).
+process-mode=2
+operate-on-gie-id=1
+operate-on-class-ids=0
+
+# gie-unique-id=3 — 1=PeopleNet, 2=AgeGender, 3=OSNet (previously reserved for FaceDetectIR).
+# The probe uses this to filter the correct tensor from obj_user_meta_list.
+gie-unique-id=3
+
+# interval=0 runs OSNet on every frame (no frame skipping).
+# Minimum bbox size for DeepStream to pass the crop to the SGIE. Raised from 32x32:
+# the model expects 256x128 native input, and people below this size produce noisy
+# embeddings that pollute the ReID gallery. Below this threshold, DeepStream never
+# invokes the SGIE at all — the deadline fallback in probes.py's
+# _handle_appearance_reid emits person_entry with global_id=None instead, which is
+# excluded from person_count, cross-camera ReID, face recognition, and positions.
+interval=0
+input-object-min-width=96
+input-object-min-height=192

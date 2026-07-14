@@ -38,6 +38,17 @@ TRACKER_CONFIGS = {
     "iou":   "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml",
 }
 
+# OSNet appearance SGIE — dos archivos separados en vez de reescribir network-mode
+# en el lugar, para no pisar el engine TRT ya compilado de un modo al probar el otro
+# (cada archivo apunta a su propio model-engine-file, ver ErrorHistory.md 2026-07-04).
+# "fp32" es el default calibrado (SIMILARITY_THRESHOLD en reid_manager.py); "fp16" es
+# más rápido en Orin Nano pero requiere reverificar que la distribución de similitudes
+# no cambió antes de confiar en el umbral calibrado.
+OSNET_SGIE_CONFIGS = {
+    "fp32": str(_REPO_ROOT / "models" / "osnet" / "config_infer_sgie_osnet.txt"),
+    "fp16": str(_REPO_ROOT / "models" / "osnet" / "config_infer_sgie_osnet_fp16.txt"),
+}
+
 # Stream type → default resolution fed to nvstreammux.
 # "main" — full-resolution main stream (1920×1080). OK for ≤6 cameras on Orin Nano.
 # "sub"  — DVR sub-stream (960×544). Required for 16-camera deployments; also update
@@ -109,6 +120,19 @@ class ClientConfig:
     pgie_nms_iou_threshold: float = -1.0   # ≥0 = NMS IoU threshold; -1 = use file value (0.35)
     pgie_pre_cluster_threshold: float = -1.0  # ≥0 = min confidence before NMS; -1 = use file value (0.3)
     reid_gallery_size: int = 10  # max embeddings per global_id in ReIdManager (1 per distinct angle/camera)
+    osnet_precision: str = "fp32"  # "fp32" (default, calibrado) | "fp16" (más rápido, sin recalibrar)
+
+    def osnet_config_path(self) -> str:
+        """Devuelve la ruta absoluta del config nvinfer del SGIE de OSNet según `osnet_precision`.
+
+        Lanza RuntimeError si el valor no está en OSNET_SGIE_CONFIGS. Mismo patrón que
+        tracker_config_path(): dos archivos completos en vez de reescribir uno en el lugar.
+        """
+        if self.osnet_precision not in OSNET_SGIE_CONFIGS:
+            raise RuntimeError(
+                f"Unknown osnet_precision '{self.osnet_precision}'. Valid options: {list(OSNET_SGIE_CONFIGS)}"
+            )
+        return OSNET_SGIE_CONFIGS[self.osnet_precision]
 
     def tracker_config_path(self) -> str:
         """Devuelve la ruta absoluta del YAML de config para el tracker seleccionado.
@@ -164,6 +188,7 @@ class ClientConfig:
         logger.info("PGIE batch : %s", self.pgie_batch_size or "(from nvinfer_config.txt)")
         logger.info("PGIE interval: %s", self.pgie_interval if self.pgie_interval >= 0 else "(from nvinfer_config.txt)")
         logger.info("SGIE interval: %s", self.sgie_interval if self.sgie_interval >= 0 else "(from config_infer.txt)")
+        logger.info("OSNet precision: %s", self.osnet_precision)
         logger.info("PGIE topk  : %s", self.pgie_topk if self.pgie_topk > 0 else "(from nvinfer_config.txt)")
         logger.info("PGIE NMS IoU : %s", self.pgie_nms_iou_threshold if self.pgie_nms_iou_threshold >= 0 else "(from nvinfer_config.txt)")
         logger.info("PGIE pre-cluster: %s", self.pgie_pre_cluster_threshold if self.pgie_pre_cluster_threshold >= 0 else "(from nvinfer_config.txt)")
@@ -355,6 +380,7 @@ def load_config() -> ClientConfig:
         pgie_nms_iou_threshold=float(cfg.get("pgie_nms_iou_threshold", -1.0)),
         pgie_pre_cluster_threshold=float(cfg.get("pgie_pre_cluster_threshold", -1.0)),
         reid_gallery_size=int(cfg.get("reid_gallery_size", 10)),
+        osnet_precision=cfg.get("osnet_precision", "fp32"),
     )
     _warn_decoder_load(config)
     return config

@@ -163,6 +163,17 @@ pgie_interval: 2
 #
 # reid_gallery_size: 10
 
+# osnet_precision — precisión del SGIE de apariencia OSNet (re-ID entre cámaras).
+#   fp32 (default) — el modo con el que está calibrado SIMILARITY_THRESHOLD=0.85
+#     en reid_manager.py. Más lento en Orin Nano (sin tensor cores para FP32).
+#   fp16 — más rápido, pero NO recalibrado: antes de dejarlo en producción hay que
+#     reverificar que la distribución de similitudes no cambió respecto a fp32
+#     (ver CLAUDE.md, sección "Re-ID entre Cámaras").
+#   Requiere reiniciar el pipeline para tomar efecto; la primera vez en fp16 tarda
+#   ~2 min extra compilando el engine TRT nuevo (se cachea después, igual que fp32).
+#
+# osnet_precision: fp32
+
 # ── Grabación automática de clips ─────────────────────────────────────────
 #
 # recording_enabled — graba clips MP4 cuando se detectan personas.
