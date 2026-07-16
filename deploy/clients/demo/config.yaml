@@ -80,10 +80,15 @@ package: comercio_basico
 stream_type: main
 
 # Tracker algorithm:
-#   nvdcf — NvDCF correlation filter. More precise tracking through occlusions.
-#            Stable up to ~6 streams on Jetson Orin Nano. Use for clients with few cameras.
-#   iou   — IoU matching. Simpler, no CUDA kernels. Stable with 16 streams.
-#            Loses track ID on crossing/occlusion but sufficient for people counting.
+#   nvdcf          — NvDCF correlation filter. Stable up to ~6 streams on Jetson Orin
+#                     Nano. Default — cheapest, but loses track easily on occlusion or
+#                     fast movement (fragments one person into several new_person events).
+#   nvdcf_accuracy — NvDCF con ventana de búsqueda más ancha + re-identificación propia.
+#                     Más costo de GPU, pero mucho más robusto a oclusión/movimiento
+#                     rápido — usar si new_person está inflado y ya se descartó que sea
+#                     el threshold de OSNet (ver CLAUDE.md, calibración ronda 3).
+#   iou            — IoU matching. Simpler, no CUDA kernels. Stable with 16 streams.
+#                     Loses track ID on crossing/occlusion but sufficient for people counting.
 tracker: nvdcf
 
 # Cámaras de entrada/salida (subconjunto de channels).

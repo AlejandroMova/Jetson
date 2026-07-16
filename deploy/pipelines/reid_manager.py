@@ -16,6 +16,23 @@ belong to the same identity.
 Matching is vectorised: gallery_matrix @ query → shape (N×K,), then max per entry.
 O(N×K) but K≤5, negligible vs. OSNet inference.
 
+match_or_create()'s embedding param accepts either a single (512,) vector or a list of
+up to a few candidate vectors from the same track's retry window (see
+probes.py's EMBEDDING_BUFFER_MAX) — the match uses the best-of-N against the gallery,
+using whichever candidate actually won to update the gallery (never an average, to
+avoid blurring distinct angles together). Added 2026-07-16 (calibración ronda 3):
+before this, a single bad-angle/blurred frame could doom a track to a spurious
+new_person even though the tracker never lost it.
+
+Acceptance has two tiers: SIMILARITY_THRESHOLD (0.85) applies everywhere; a lower
+SIMILARITY_THRESHOLD_QUICK_REMATCH (0.75) applies only when the best candidate was
+last seen on the SAME camera less than QUICK_REMATCH_WINDOW_S (45s) ago — this targets
+the dominant real-world failure mode confirmed via visual calibration against real
+crops (tracker loses and re-acquires the same physical person within seconds on the
+same camera), without loosening the bar for cross-camera or longer-gap matches, where
+a lower global threshold was already proven (2026-07-08 calibration) to merge
+different people.
+
 Returned event types:
   EVENT_NEW_PERSON    — no match found; new global_id created
   EVENT_PERSON_RETURN — same global_id, but last seen > PRESENCE_WINDOW_S ago
@@ -30,7 +47,7 @@ import uuid
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -44,6 +61,16 @@ logger = logging.getLogger(__name__)
 # (calibrated for OSNet x0.25, never re-verified for x1.0) was far too permissive.
 # Raised to 0.85 pending a second, larger calibration round.
 SIMILARITY_THRESHOLD:      float = 0.85
+# Umbral acotado para re-match rápido — agregado 2026-07-16 (calibración ronda 3) junto
+# con el buffer multi-frame en probes.py. Bajar SIMILARITY_THRESHOLD globalmente ya se
+# probó y se descartó (calibración 2026-07-08: fusiona personas distintas). Pero el gap
+# de tiempo sí separó bien en la data real: <60s en la misma cámara → mayoría misma
+# persona; >=60s → casi siempre personas distintas. Estos dos números acotan el umbral
+# más bajo exactamente a ese caso — ver match_or_create() para la lógica de aceptación.
+# Pendiente de validar con una ronda de calibración post-despliegue (osnet_reid.csv +
+# manifest.csv) — son puntos de partida razonados, no un óptimo medido.
+SIMILARITY_THRESHOLD_QUICK_REMATCH: float = 0.75
+QUICK_REMATCH_WINDOW_S:             float = 45.0
 PRESENCE_WINDOW_S:         float = 300.0  # 5 min — within this, camera switch = channel_change
 REID_TTL_S:                float = 3600.0 # 1 hour — global_id expires if unseen for this long
 SAVE_INTERVAL_S:           float = 30.0   # persist to disk at most every N seconds
@@ -167,8 +194,10 @@ class ReIdManager:
         """Crea (idempotente) el logger CSV en <csv_log_dir>/osnet_reid.csv.
 
         Columnas: camera_id,track_id,global_id,event,similarity,gallery_size,added_angle,
-        prev_camera,absent_s. Separado de stdout/docker logs (propagate=False) igual que
-        el CSV de face recognition.
+        prev_camera,absent_s,quick_rematch (agregada 2026-07-16 — "yes" si el match pasó
+        por el umbral acotado SIMILARITY_THRESHOLD_QUICK_REMATCH en vez del global; vacía
+        para new_person/gallery_refresh, donde no aplica). Separado de stdout/docker logs
+        (propagate=False) igual que el CSV de face recognition.
         """
         log_dir = Path(csv_log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -188,21 +217,34 @@ class ReIdManager:
 
     def match_or_create(
         self,
-        embedding: np.ndarray,
+        embedding: Union[np.ndarray, List[np.ndarray]],
         camera_id: str,
         track_id: Optional[int] = None,
         create: bool = True,
     ) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
         """
-        Match embedding against the DB and return
+        Match embedding(s) against the DB and return
         (global_id, event_type, prev_camera_id, expired_ids).
+
+        embedding accepts a single (512,) vector or a list of a few candidate vectors
+        from the same track's retry window (see EMBEDDING_BUFFER_MAX in probes.py) —
+        matching uses the best-of-N against the gallery; the winning candidate (never
+        an average) is what gets used for _gallery_add()/seeding a new identity.
+
+        Acceptance is two-tier: best_sim >= SIMILARITY_THRESHOLD (0.85) always accepts.
+        Below that, best_sim >= SIMILARITY_THRESHOLD_QUICK_REMATCH (0.75) also accepts
+        IF the best candidate's global_id was last seen on the SAME camera_id less than
+        QUICK_REMATCH_WINDOW_S (45s) ago — targets the dominant real failure mode
+        (tracker loses and re-acquires the same person within seconds on the same
+        camera) without loosening the bar for cross-camera/longer-gap matches (proven
+        unsafe by the 2026-07-08 calibration).
 
         If create=False and no match is found, returns (None, None, None, expired_ids)
         instead of seeding a new identity — used by probes.py to retry an ambiguous
         view on a later frame rather than committing to a new identity from a single
         bad-angle first look (see FULL_BODY_MIN_RATIO in probes.py). When create=True
-        (the default), always resolves a global_id — either an existing match
-        (>= SIMILARITY_THRESHOLD) or a freshly created identity.
+        (the default), always resolves a global_id — either an existing match or a
+        freshly created identity.
         event_type is one of EVENT_NEW_PERSON, EVENT_PERSON_RETURN, EVENT_CHANNEL_CHANGE.
         prev_camera_id is None for new persons.
         expired_ids lists any global_ids just dropped by _expire_stale() this call —
@@ -211,19 +253,35 @@ class ReIdManager:
         track_id is log-only (CSV analysis log) — does not affect matching.
         Thread-safe.
         """
+        embeddings = [embedding] if isinstance(embedding, np.ndarray) else list(embedding)
         with self._lock:
             expired_ids = self._expire_stale()
             now = time.time()
 
-            best_gid, best_sim = self._find_best_match(embedding)
+            best_gid, best_sim, best_embedding = self._find_best_match(embeddings)
 
-            if best_gid is None:
+            accepted_gid: Optional[str] = None
+            quick_rematch = False
+            if best_gid is not None:
+                entry = self._db[best_gid]
+                if best_sim >= SIMILARITY_THRESHOLD:
+                    accepted_gid = best_gid
+                elif (best_sim >= SIMILARITY_THRESHOLD_QUICK_REMATCH
+                      and entry.camera_id == camera_id
+                      and (now - entry.last_seen_ts) <= QUICK_REMATCH_WINDOW_S):
+                    accepted_gid = best_gid
+                    quick_rematch = True
+
+            if accepted_gid is None:
                 if not create:
                     return None, None, None, expired_ids
                 gid = uuid.uuid4().hex[:12]
+                # embeddings[-1]: frame más reciente del buffer — normalmente el de
+                # mejor ratio, ya que fue el que disparó should_create. best_embedding
+                # solo tiene sentido cuando sí hubo match contra algo existente.
                 self._db[gid] = _Entry(
                     global_id=gid,
-                    gallery=[embedding.copy()],
+                    gallery=[embeddings[-1].copy()],
                     first_seen_ts=now,
                     last_seen_ts=now,
                     camera_id=camera_id,
@@ -232,17 +290,17 @@ class ReIdManager:
                             gid, best_sim, SIMILARITY_THRESHOLD)
                 if self._csv_logger:
                     self._csv_logger.info(
-                        "%s,%s,%s,new_person,%.4f,1,yes,,",
+                        "%s,%s,%s,new_person,%.4f,1,yes,,,",
                         camera_id, track_id if track_id is not None else "", gid, best_sim,
                     )
                 self._maybe_save()
                 return gid, EVENT_NEW_PERSON, None, expired_ids
             # TODO revisar si no poner esto en un else, porque acabamos de poner el tiempo que lo encontramos, no tiene sentido tiempo absent de una persona nueva
-            entry = self._db[best_gid]
+            entry = self._db[accepted_gid]
             time_absent = now - entry.last_seen_ts
             prev_camera  = entry.camera_id
 
-            added = _gallery_add(entry.gallery, embedding, self._gallery_max_size)
+            added = _gallery_add(entry.gallery, best_embedding, self._gallery_max_size)
             entry.last_seen_ts = now
             entry.camera_id    = camera_id
 
@@ -253,18 +311,20 @@ class ReIdManager:
                 entry.visit_count += 1
 
             logger.info(
-                "ReID: %s gid=%s sim=%.3f absent=%.0fs cam=%s→%s gallery=%d%s",
-                event, best_gid, best_sim, time_absent, prev_camera, camera_id,
+                "ReID: %s gid=%s sim=%.3f absent=%.0fs cam=%s→%s gallery=%d%s%s",
+                event, accepted_gid, best_sim, time_absent, prev_camera, camera_id,
                 len(entry.gallery), " +angle" if added else "",
+                " [quick-rematch]" if quick_rematch else "",
             )
             if self._csv_logger:
                 self._csv_logger.info(
-                    "%s,%s,%s,%s,%.4f,%d,%s,%s,%.0f",
-                    camera_id, track_id if track_id is not None else "", best_gid, event,
+                    "%s,%s,%s,%s,%.4f,%d,%s,%s,%.0f,%s",
+                    camera_id, track_id if track_id is not None else "", accepted_gid, event,
                     best_sim, len(entry.gallery), "yes" if added else "no", prev_camera, time_absent,
+                    "yes" if quick_rematch else "no",
                 )
             self._maybe_save()
-            return best_gid, event, prev_camera, expired_ids
+            return accepted_gid, event, prev_camera, expired_ids
 
     def update_embedding(self, global_id: str, embedding: np.ndarray, track_id: Optional[int] = None) -> None:
         """Add embedding to the gallery of a known global_id without matching.
@@ -286,7 +346,7 @@ class ReIdManager:
                 )
             if self._csv_logger:
                 self._csv_logger.info(
-                    "%s,%s,%s,gallery_refresh,,%d,%s,,",
+                    "%s,%s,%s,gallery_refresh,,%d,%s,,,",
                     entry.camera_id, track_id if track_id is not None else "", global_id,
                     len(entry.gallery), "yes" if added else "no",
                 )
@@ -299,35 +359,43 @@ class ReIdManager:
 
     # ── Internal ────────────────────────────────────────────────────────────────
 
-    def _find_best_match(self, embedding: np.ndarray) -> Tuple[Optional[str], float]:
-        """Busca la identidad con mayor similitud coseno en la DB usando una sola llamada BLAS.
+    def _find_best_match(
+        self, embeddings: List[np.ndarray]
+    ) -> Tuple[Optional[str], float, Optional[np.ndarray]]:
+        """Busca la identidad con mayor similitud coseno en la DB usando una sola llamada BLAS,
+        contra el mejor de embeddings (una o varias vistas candidatas del mismo track).
 
         Concatena todas las galerías en una sola matriz para evitar loops Python con numpy.
-        Devuelve (global_id, sim) si sim >= SIMILARITY_THRESHOLD, o (None, best_sim) si no hay match.
+        NO aplica ningún threshold — devuelve siempre el mejor candidato encontrado junto con
+        cuál de los embeddings de entrada fue el ganador (para que match_or_create() lo use
+        en _gallery_add()/como semilla de identidad nueva, sin promediar). La decisión de
+        aceptar vive en match_or_create(), que necesita camera_id/last_seen_ts —contexto que
+        esta función no tiene— para el umbral acotado de re-match rápido.
+        Devuelve (None, -1.0, None) si la DB está vacía.
         Debe llamarse dentro del lock (_lock).
         """
         if not self._db:
-            return None, -1.0
+            return None, -1.0, None
         ids       = list(self._db.keys())
         galleries = [self._db[gid].gallery for gid in ids]
         sizes     = [len(g) for g in galleries]
 
-        # Una sola multiplicación matricial sobre todos los vectores de galería concatenados.
+        # Una sola multiplicación matricial: todas las galerías × todos los embeddings candidatos.
         all_vecs = np.concatenate([np.stack(g) for g in galleries])  # (sum_K, 512)
-        all_sims = all_vecs @ embedding                               # (sum_K,)
+        query    = np.stack(embeddings)                               # (M, 512)
+        all_sims = all_vecs @ query.T                                 # (sum_K, M)
 
-        # Reducir: max similarity por entrada usando offsets acumulados.
-        best_sim = -1.0
-        best_idx = 0
-        offset   = 0
+        # Reducir: max similarity por entrada (sobre K y M a la vez) usando offsets acumulados.
+        best_sim, best_idx, best_q, offset = -1.0, 0, 0, 0
         for i, size in enumerate(sizes):
-            s = float(np.max(all_sims[offset:offset + size]))
+            block = all_sims[offset:offset + size]          # (size, M)
+            flat  = int(np.argmax(block))
+            s     = float(block.flat[flat])
             if s > best_sim:
-                best_sim = s
-                best_idx = i
+                best_sim, best_idx, best_q = s, i, flat % block.shape[1]
             offset += size
 
-        return (ids[best_idx], best_sim) if best_sim >= SIMILARITY_THRESHOLD else (None, best_sim)
+        return ids[best_idx], best_sim, embeddings[best_q]
 
     def _expire_stale(self) -> List[str]:
         """Elimina entradas que no han sido vistas en REID_TTL_S segundos. Llamar dentro del lock.

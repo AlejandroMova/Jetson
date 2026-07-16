@@ -1005,7 +1005,7 @@ DeepStream tiene un mecanismo nativo para esto: cuando un SGIE corre detrás de 
 
 ---
 
-## Incluir `global_id` (o un manifest) en el export de crops de `download_crops_zip()`
+## ~~Incluir `global_id` (o un manifest) en el export de crops de `download_crops_zip()`~~ ✅ IMPLEMENTADO (2026-07-14)
 
 **Descripción:** El export de crops para calibración (`/superadmin/dataset` → `admin_crops.py::download_crops_zip()`) nombra los archivos `track_<track_id>_frame_<frame_num>.jpg`, sin `global_id`. La tabla `Crop` en el backend sí tiene `global_id` por fila (`models.py`), pero se pierde al exportar. Esto obliga a cruzar el CSV `osnet_reid.csv` contra los crops de forma heurística (proximidad de tiempo + cámara) en vez de un join exacto — ver el playbook agregado en `CLAUDE.md` (sección "Re-ID entre Cámaras", ronda 2026-07-14).
 
@@ -1035,6 +1035,8 @@ DeepStream tiene un mecanismo nativo para esto: cuando un SGIE corre detrás de 
 - Continuidad de posición/trayectoria (bbox del track saliente vs. bbox del track entrante, ya disponible en `probes.py` vía `rect_params`) — un salto de posición físicamente imposible en el gap de tiempo descarta el match sin tocar apariencia.
 
 **Consideraciones:** requiere una muestra etiquetada más grande (idealmente con ground truth real, no verificación visual manual) antes de comprometerse a una de las dos opciones — esto es una nota para no repetir el análisis desde cero, no una decisión tomada.
+
+**Actualización 2026-07-16 (calibración ronda 3):** se implementó una versión de "señal adicional" distinta a las dos candidatas de arriba — tiempo+cámara en vez de color/posición. `SIMILARITY_THRESHOLD_QUICK_REMATCH=0.75` en `reid_manager.py` solo se activa si el mejor candidato fue visto por última vez en la misma cámara hace menos de `QUICK_REMATCH_WINDOW_S=45s`. Motivada por evidencia visual directa en el piloto de bodega (bata azul, polo con placa, sin uniforme de por medio, fragmentados en varias identidades en cuestión de minutos — ver CLAUDE.md). Color de ropa y continuidad de posición **siguen como candidatas** si esta mitigación no es suficiente — no se implementaron todavía.
 
 ---
 

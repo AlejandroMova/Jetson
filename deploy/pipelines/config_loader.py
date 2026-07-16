@@ -34,8 +34,18 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 TRACKER_CONFIGS = {
-    "nvdcf": "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml",
-    "iou":   "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml",
+    "nvdcf":          "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml",
+    # nvdcf_accuracy — ventana de búsqueda de correlación más ancha + submódulo de
+    # re-identificación propio de NvDCF (a diferencia de "nvdcf", que la sacrifica por
+    # velocidad). Agregado 2026-07-16 tras confirmar con evidencia visual (bata azul,
+    # polo con placa — ver CLAUDE.md, calibración ronda 3) que la causa dominante de
+    # new_person espurios es el tracker perdiendo el objeto por oclusión/movimiento
+    # rápido, no el SIMILARITY_THRESHOLD de OSNet. Sin verificar en el dispositivo real
+    # que este archivo exista con ese nombre exacto en el Jetson (viene del SDK
+    # DeepStream 7.1, no está en este repo) — confirmar antes de usarlo en producción:
+    # docker exec <container> ls .../deepstream-app/ | grep NvDCF
+    "nvdcf_accuracy": "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_NvDCF_accuracy.yml",
+    "iou":            "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml",
 }
 
 # OSNet appearance SGIE — dos archivos separados en vez de reescribir network-mode
@@ -105,7 +115,7 @@ class ClientConfig:
     pipeline: List[str]
     stream_width: int = 1920
     stream_height: int = 1080
-    tracker: str = "nvdcf"      # "nvdcf" (precise, ≤6 streams) | "iou" (stable, 16 streams)
+    tracker: str = "nvdcf"      # "nvdcf" (precise, ≤6 streams) | "nvdcf_accuracy" (occlusion-robust, more GPU) | "iou" (stable, 16 streams)
     stream_type: str = "main"   # "main" (1920×1080, ≤6 cams) | "sub" (960×544, ≤16 cams)
     sector: str = "comercio"    # "comercio" | "industrial" | "hogar"
     package: str = "manual"     # contracted package; "manual" = custom/testing

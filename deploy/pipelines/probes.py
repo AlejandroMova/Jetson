@@ -31,7 +31,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -247,6 +247,16 @@ CROP_MIN_HEIGHT: int = 96
 # 30 frames ≈ 1 second — enough for OSNet on CPU even under queue pressure.
 ENTRY_EMIT_DEADLINE_FRAMES: int = 30
 
+# Máximo de embeddings retenidos por track (state.pending_embeddings) antes de que
+# match_or_create() decida — agregado 2026-07-16 (calibración ronda 3). Antes, cada
+# intento de match usaba solo el embedding del frame actual; si ese frame tenía mal
+# ángulo/blur, se descartaba sin dejar rastro y el siguiente intento empezaba de cero.
+# ReIdManager.match_or_create() ahora recibe la lista completa y usa el mejor-de-N
+# contra la galería — no es un sistema de votos por mayoría (ver FACE_VOTES_REQUIRED
+# en face_recognizer.py), es "mejor de N observaciones", ya que ReID no elige entre
+# un conjunto fijo de candidatos.
+EMBEDDING_BUFFER_MAX: int = 3
+
 
 # ── Stream mode — active only when NX_STREAM_ENABLED=true ────────────────────
 
@@ -457,7 +467,8 @@ class _TrackState:
     """Per-track state. Lives in _active_tracks[track_key] from first frame to exit.
 
     The ReID fields (entry_emitted, entry_deadline, global_id, pending_bbox,
-    pending_conf) are only populated when _reid_manager is active (OSNet found).
+    pending_conf, pending_embeddings) are only populated when _reid_manager is active
+    (OSNet found).
     """
     first_frame: int
     last_frame: int
@@ -470,6 +481,10 @@ class _TrackState:
     global_id: Optional[str] = None
     pending_bbox: Optional[dict] = None
     pending_conf: float = 0.0
+    # Embeddings acumulados mientras se reintenta el match (antes de appearance_sent).
+    # Buffer rolling de hasta EMBEDDING_BUFFER_MAX — se queda con los más recientes, no
+    # los primeros, porque el ratio/calidad de la vista tiende a mejorar con el tiempo.
+    pending_embeddings: List[np.ndarray] = field(default_factory=list)
 
 
 # ── GStreamer bus handler ─────────────────────────────────────────────────────
@@ -1637,9 +1652,14 @@ def _handle_appearance_reid(
                 # comment above. Matching itself is unconditional and always uses the
                 # same SIMILARITY_THRESHOLD; this only gates whether a no-match result
                 # is allowed to seed a brand-new global_id yet.
+                # Acumular en el buffer rolling (ver EMBEDDING_BUFFER_MAX) — match_or_create
+                # usa el mejor-de-N contra la galería en vez de solo el frame actual.
+                state.pending_embeddings.append(vec)
+                if len(state.pending_embeddings) > EMBEDDING_BUFFER_MAX:
+                    state.pending_embeddings.pop(0)
                 should_create = ratio >= FULL_BODY_MIN_RATIO or frame_num >= state.entry_deadline
                 global_id, event_type, prev_camera, expired_ids = _reid_manager.match_or_create(
-                    vec, camera_id, track_id=p_track_id, create=should_create,
+                    state.pending_embeddings, camera_id, track_id=p_track_id, create=should_create,
                 )
                 # Nothing else clears FaceRecognizer's own vote/lock state or
                 # _employee_by_global_id by global_id — do it here, the only
