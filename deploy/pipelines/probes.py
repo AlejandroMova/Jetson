@@ -177,9 +177,17 @@ PARTIAL_BODY_MIN_RATIO: float = 1.3
 # this was inflating person_count. Now a new identity is only created once EITHER
 # this ratio is reached (confident full-body view, still didn't match) OR
 # ENTRY_EMIT_DEADLINE_FRAMES is reached (gave it a fair chance, camera angle
-# never cooperated — don't wait forever). Starting value, not yet calibrated
-# with real data — adjust if needed.
-FULL_BODY_MIN_RATIO: float = 2.2
+# never cooperated — don't wait forever).
+# Bajado de 2.2 a 1.8 (2026-07-16, calibración ronda 3): personas casi completas
+# en cámara nunca llegaban a disparar should_create — se iban del cuadro antes de
+# los 30 frames del deadline sin que el ratio alcanzara 2.2 (ángulo de cámara o
+# estatura de la persona lo impedían), y como el track desaparece antes de que se
+# vuelva a evaluar el deadline, esa persona nunca recibía un veredicto de ReID
+# (nunca aparece en osnet_reid.csv, aunque sí llega al backend con global_id=None
+# vía el fallback de _expire_lost_tracks). 1.8 sigue siendo un punto de partida
+# razonado, no un valor calibrado con datos reales — ajustar según la altura/
+# ángulo de montaje de cada cámara si hace falta.
+FULL_BODY_MIN_RATIO: float = 1.8
 
 # ── PGIE class ids ────────────────────────────────────────────────────────────
 PGIE_CLASS_PERSON: int = 0

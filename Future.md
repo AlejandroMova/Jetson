@@ -1040,6 +1040,25 @@ DeepStream tiene un mecanismo nativo para esto: cuando un SGIE corre detrás de 
 
 ---
 
+## Submódulo de ReID propio de NvDCF (`nvdcf_accuracy`) — requiere modelo de NGC
+
+**Descripción:** DeepStream trae, además del filtro de correlación normal de NvDCF (`_perf`, el que corre hoy en producción), una variante `_accuracy` que habilita un submódulo de re-identificación por apariencia *dentro del propio tracker* — una red neuronal separada que corre por objeto/por frame, por cámara, para recuperar un track_id tras una oclusión o pérdida más larga de lo que un filtro de correlación puro puede seguir. Es un mecanismo distinto y complementario a nuestro propio OSNet + `ReIdManager` (que sí cruza cámaras); el de NvDCF solo ayuda a que el tracker no fragmente a la misma persona en varios `track_id` *dentro de una misma cámara*, reduciendo cuántas veces le toca a OSNet decidir desde cero.
+
+**Por qué está pendiente, no descartada:** se intentó activar el 2026-07-16 en el cliente Mova (producción) vía `tracker: nvdcf_accuracy` y **truena el pipeline** — el YAML carga bien, pero su submódulo de ReID necesita su propio engine TRT/TAO que nunca se descargó en ningún Jetson de este proyecto (`"TAO model file does not exist"`, ver `ErrorHistory.md` 2026-07-16). Se revirtió a `nvdcf` de inmediato. En su lugar se implementó la Opción B (ventana de búsqueda más ancha dentro de `_perf`, sin modelo nuevo — ver Parte 1 del plan de calibración ronda 3) como mitigación de menor riesgo mientras tanto.
+
+**Por qué sería mejor que la Opción B:** una red de re-identificación no depende de que el objeto siga siendo visible/rastreable por correlación — puede reconocer a alguien después de una oclusión total más larga (no solo movimiento rápido que se sale de la ventana de búsqueda), que es un caso que la Opción B no cubre.
+
+**Qué haría falta para retomarla:**
+- Ubicar el modelo exacto que espera `config_tracker_NvDCF_accuracy.yml` en su sección de ReID — candidato sin confirmar: `ReIdentificationNet` de NVIDIA TAO Toolkit, publicado en NGC (mismo tipo de fuente que ya se usa para PeopleNet en este proyecto). Verificar licencia, tamaño, y si requiere cuenta/API key de NGC para descargar.
+- Agregar la descarga al flujo existente de `download_models.py`/`setup.sh` (mismo patrón que PeopleNet/OSNet).
+- Apuntar el path del modelo dentro del YAML de `_accuracy` (posiblemente haga falta copiar el YAML a este repo y editarlo, como ya se hizo con `config_infer_sgie_osnet_fp16.txt`, en vez de depender del archivo stock de NVIDIA).
+- Medir el costo de GPU real en un cliente no crítico antes de desplegarlo — es una red completa corriendo por objeto/por frame, encima de PeopleNet + OSNet + AgeGender ya corriendo; podría volver a comerse el margen que se ganó con `sgie_interval`/`osnet_precision`.
+- Probar primero en un cliente de prueba, nunca directo en producción (lección del incidente del 07-16).
+
+**Consideraciones:** más piezas nuevas = más que puede romperse — ya lo demostró el intento del 07-16. Solo vale la pena si, después de medir el efecto de la Opción B + el buffer multi-frame + el umbral acotado (ya implementados), el sobreconteo por oclusión larga (no solo movimiento rápido) sigue siendo significativo.
+
+---
+
 <!-- Agregar entradas aquí siguiendo el formato:
 
 ## [Título de la mejora]
