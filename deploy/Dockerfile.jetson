@@ -28,8 +28,11 @@ RUN pip3 install --no-cache-dir \
     https://github.com/nschloe/onnxruntime-aarch64-ubuntu22/releases/download/v1.17.1/onnxruntime_gpu-1.17.1-cp310-cp310-linux_aarch64.whl \
     || pip3 install --no-cache-dir onnxruntime  # fallback to CPU if wheel not compatible
 
-# InsightFace — face recognition (ArcFace embeddings)
-RUN pip3 install --no-cache-dir insightface>=0.7.3
+# InsightFace — face recognition (ArcFace embeddings).
+# Las comillas son obligatorias: sin ellas el shell lee `>=0.7.3` como una
+# redirección de salida, instala insightface sin pin de versión y deja un
+# archivo basura llamado `=0.7.3` en la imagen.
+RUN pip3 install --no-cache-dir 'insightface>=0.7.3'
 
 # Entrypoint: compiles custom softmax parser + patches ONNX dynamic batch.
 # Invoked via bash so the execute bit is not required — the volume mount in

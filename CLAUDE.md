@@ -645,6 +645,28 @@ WebSocket persistente hacia el backend. Envía snapshots de posiciones normaliza
 
 ### `deploy/tools/` — Scripts utilitarios
 
+#### Cómo correr las tools — siempre dentro de Docker
+
+**Las tools de Python que dependen de `requirements.txt` se ejecutan dentro del contenedor, nunca directo en el host.** `requirements.txt` solo se instala en la imagen (`Dockerfile.jetson` líneas 21-22); el host únicamente tiene `ruamel.yaml`, que `setup.sh` instala para dos `python3 -c` inline que parchean `config.yaml` (líneas 422 y 497).
+
+Forma correcta:
+
+```bash
+cd <WORK_DIR>/deploy
+docker compose run --rm deepstream python3 tools/identify_dvr.py --update-config --stream-type main
+docker compose run --rm deepstream python3 tools/probe_cameras.py --update-config
+docker compose run --rm deepstream python3 tools/register_face.py --help
+```
+
+Correrlas directo en el host (`python3 tools/identify_dvr.py ...`) falla con `ModuleNotFoundError: No module named 'dotenv'` — o `yaml`, `cv2`, `insightface`, según la tool. **No es un bug ni un setup incompleto: es el diseño.** La Regla 6 mantiene el host limpio (solo Docker + Tailscale como dependencias), así que la solución nunca es `pip3 install` en el host — es anteponer `docker compose run --rm deepstream`.
+
+`setup.sh` ya las invoca así internamente (líneas 611 y 620), y sus mensajes de error imprimen el comando Docker completo cuando algo falla. Un Jetson recién configurado no requiere ningún paso manual de instalación de dependencias.
+
+**Excepciones — sí corren en el host:**
+- `download_models.py` — solo usa stdlib (`urllib`, `json`, `argparse`); `setup.sh` la llama directo en las líneas 530 y 552
+- `dvr_watchdog.sh` — bash puro (`/dev/tcp` + `nmap`), corre como servicio systemd fuera de Docker
+- `test_rtsp.py` — solo stdlib (`socket`, `re`, `hashlib`)
+
 **`setup.sh`** (~629 líneas)
 **El único comando que ejecuta el técnico instalador.** Realiza la configuración completa del Jetson desde cero:
 - Instala Docker CE, Tailscale, x11vnc

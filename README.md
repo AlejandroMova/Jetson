@@ -96,6 +96,19 @@ docker compose run --rm deepstream python3 tools/probe_cameras.py --update-confi
 docker compose up -d
 ```
 
+> **Always run these tools inside the container.** Their dependencies come from
+> `requirements.txt`, which is installed only in the Docker image — the Jetson host
+> deliberately stays clean (Docker + Tailscale only). Running them directly, e.g.
+> `python3 tools/identify_dvr.py`, fails with `ModuleNotFoundError: No module named 'dotenv'`
+> (or `yaml`, `cv2`, `insightface`, depending on the tool). **This is by design, not a broken
+> setup — never fix it with `pip3 install` on the host.** Prefix the command with
+> `docker compose run --rm deepstream` instead.
+>
+> Exceptions that do run on the host, because they only use the standard library:
+> `download_models.py`, `test_rtsp.py`, and `dvr_watchdog.sh` (pure bash).
+> `register_face.py` is a separate case — it runs on your laptop, not the Jetson
+> (see [Face Recognition](#face-recognition)).
+
 ### Overriding the pipeline without re-running setup
 
 ```bash
