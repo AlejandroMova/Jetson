@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 # different people wrongly merged under the same global_id. The inherited 0.68
 # (calibrated for OSNet x0.25, never re-verified for x1.0) was far too permissive.
 # Raised to 0.85 pending a second, larger calibration round.
-SIMILARITY_THRESHOLD:      float = 0.85
+SIMILARITY_THRESHOLD:      float = 0.76
 # Umbral acotado para re-match rápido — agregado 2026-07-16 (calibración ronda 3) junto
 # con el buffer multi-frame en probes.py. Bajar SIMILARITY_THRESHOLD globalmente ya se
 # probó y se descartó (calibración 2026-07-08: fusiona personas distintas). Pero el gap
