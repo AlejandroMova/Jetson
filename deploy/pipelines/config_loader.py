@@ -51,6 +51,17 @@ TRACKER_CONFIGS = {
     # mismo tracker de siempre, un solo parámetro ajustado. Ver el archivo para el
     # detalle completo de qué cambió y por qué.
     "nvdcf_extended_shadow": str(_REPO_ROOT / "models" / "tracker" / "config_tracker_NvDCF_extended_shadow.yml"),
+    # nvdcf_reid — mismo perfil que "nvdcf_extended_shadow" (BaseConfig/DataAssociator/
+    # StateEstimator/VisualTracker calibrados, maxShadowTrackingAge=100) con el submódulo de
+    # ReID/Re-Assoc de NvDCF agregado encima (recupera track_id intra-cámara tras oclusión más
+    # larga de lo que el shadow tracking cubre). A diferencia de "nvdcf_accuracy" (arriba), el
+    # modelo SÍ se descarga: download_models.py::download_tracker_reid() trae
+    # resnet50_market1501.etlt (NVIDIA TAO ReIdentificationNet, deployable_v1.0, NGC público) a
+    # models/tracker/. Valores de la sección ReID copiados exactos del stock
+    # config_tracker_NvDCF_accuracy.yml (DS 7.1, verificado en el Jetson real 2026-07-22) — no
+    # calibrados para este proyecto. Intra-cámara, no cruza cámaras — complementario a OSNet +
+    # ReIdManager, no los reemplaza. Ver el YAML para el detalle completo.
+    "nvdcf_reid":       str(_REPO_ROOT / "models" / "tracker" / "config_tracker_NvDCF_reid.yml"),
     "iou":              "/opt/nvidia/deepstream/deepstream/samples/configs/deepstream-app/config_tracker_IOU.yml",
 }
 
@@ -121,7 +132,7 @@ class ClientConfig:
     pipeline: List[str]
     stream_width: int = 1920
     stream_height: int = 1080
-    tracker: str = "nvdcf"      # "nvdcf" (default) | "nvdcf_accuracy" (⚠️ roto, ver TRACKER_CONFIGS) | "nvdcf_extended_shadow" (mismo tracker, más tolerante a oclusión breve) | "iou" (stable, 16 streams)
+    tracker: str = "nvdcf"      # "nvdcf" (default) | "nvdcf_accuracy" (⚠️ roto, ver TRACKER_CONFIGS) | "nvdcf_extended_shadow" (mismo tracker, más tolerante a oclusión breve) | "nvdcf_reid" (extended_shadow + submódulo ReID intra-cámara, ver TRACKER_CONFIGS) | "iou" (stable, 16 streams)
     stream_type: str = "main"   # "main" (1920×1080, ≤6 cams) | "sub" (960×544, ≤16 cams)
     sector: str = "comercio"    # "comercio" | "industrial" | "hogar"
     package: str = "manual"     # contracted package; "manual" = custom/testing

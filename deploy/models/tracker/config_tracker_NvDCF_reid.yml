@@ -1,0 +1,168 @@
+%YAML:1.0
+####################################################################################################
+# SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+####################################################################################################
+#
+# NX Computing AI — copia de config_tracker_NvDCF_extended_shadow.yml (mismo BaseConfig /
+# TargetManagement / DataAssociator / StateEstimator / VisualTracker ya calibrados, incluyendo
+# maxShadowTrackingAge=100) con UNA capacidad agregada encima: el submódulo de re-identificación
+# propio de NvDCF (TrajectoryManagement.enableReAssoc + sección ReID), que recupera el track_id
+# original de un objeto tras una oclusión más larga de lo que el filtro de correlación puede
+# seguir — complementario al shadow tracking, no un reemplazo. Es INTRA-cámara (recupera
+# track_id); no toca OSNet ni ReIdManager, que son cross-cámara (asignan global_id).
+#
+# Por qué no partir de config_tracker_NvDCF_accuracy.yml (el archivo stock de NVIDIA que ya
+# trae ReID): tiene un BaseConfig/DataAssociator/StateEstimator/VisualTracker completamente
+# distinto (perfil "accuracy" vs nuestro "perf" ya calibrado en producción) — mezclar ambos
+# habría cambiado el comportamiento de asociación frame-a-frame Y agregado ReID al mismo
+# tiempo, dos variables en un solo experimento. Ver systemrefactor.md (filosofía de no
+# confundir el experimento con varias variables a la vez).
+#
+# Origen de los valores de la sección ReID/TrajectoryManagement.enableReAssoc: copiados
+# EXACTOS de config_tracker_NvDCF_accuracy.yml stock (DeepStream 7.1, leído en el Jetson real
+# el 2026-07-22 vía `docker compose exec deepstream cat .../config_tracker_NvDCF_accuracy.yml`)
+# — no adivinados. Esa es la lección del incidente 2026-07-16 (tracker: nvdcf_accuracy truena
+# con "TAO model file does not exist" porque el modelo nunca se descargó): aquí el modelo SÍ
+# se descarga (ver download_models.py::download_tracker_reid()) y las rutas apuntan a nuestra
+# propia copia en el repo, no a samples/ del stock.
+#
+# maxShadowTrackingAge: subido de 51 a 100 (heredado de extended_shadow, 2026-07-16,
+# calibración ronda 3) — ver TargetManagement abajo para el valor, sin cambios aquí.
+
+BaseConfig:
+  minDetectorConfidence: 0.0430    # If the confidence of a detector bbox is lower than this, then it won't be considered for tracking
+
+TargetManagement:
+  enableBboxUnClipping: 1    # In case the bbox is likely to be clipped by image border, unclip bbox
+  preserveStreamUpdateOrder: 0    # When assigning new target ids, preserve input streams' order to keep target ids in a deterministic order over multuple runs
+  maxTargetsPerStream: 150    # Max number of targets to track per stream. Recommended to set >10. Note: this value should account for the targets being tracked in shadow mode as well. Max value depends on the GPU memory capacity
+
+  # [Creation & Termination Policy]
+  minIouDiff4NewTarget: 0.7418    # If the IOU between the newly detected object and any of the existing targets is higher than this threshold, this newly detected object will be discarded.
+  minTrackerConfidence: 0.4009    # If the confidence of an object tracker is lower than this on the fly, then it will be tracked in shadow mode. Valid Range: [0.0, 1.0]
+  probationAge: 2    # If the target's age exceeds this, the target will be considered to be valid.
+  maxShadowTrackingAge: 100    # Max length of shadow tracking. If the shadowTrackingAge exceeds this limit, the tracker will be terminated. (heredado de extended_shadow — 51→100, ronda 3)
+  earlyTerminationAge: 1    # If the shadowTrackingAge reaches this threshold while in TENTATIVE period, the target will be terminated prematurely.
+
+TrajectoryManagement:
+  useUniqueID: 0    # Use 64-bit long Unique ID when assignining tracker ID.
+
+  # ── Re-Assoc (submódulo de ReID de NvDCF) — AGREGADO respecto a extended_shadow ──────────
+  # Recupera el track_id original de un objeto perdido comparando su apariencia (feature ReID,
+  # ver sección ReID abajo) contra tracklets recién terminados — no limitado por ventana de
+  # frames como el shadow tracking. Todos los valores de este bloque son el default stock de
+  # NVIDIA (config_tracker_NvDCF_accuracy.yml, DS 7.1) — sin recalibrar para este proyecto.
+  enableReAssoc: 1    # Enable Re-Assoc
+
+  # [Re-Assoc Metric: Thresholds for valid candidates] — namespace propio de Re-Assoc, DISTINTO
+  # del minMatchingScore4Overall de DataAssociator (frame-a-frame) más abajo. No confundir.
+  minMatchingScore4Overall: 0.6622    # min matching score for overall
+  minTrackletMatchingScore: 0.2940    # min tracklet similarity score for re-assoc
+  minMatchingScore4ReidSimilarity: 0.0771    # min reid similarity score for re-assoc
+
+  # [Re-Assoc Metric: Weights]
+  matchingScoreWeight4TrackletSimilarity: 0.7981    # weight for tracklet similarity score
+  matchingScoreWeight4ReidSimilarity: 0.3848    # weight for reid similarity score
+
+  # [Re-Assoc: Motion-based]
+  minTrajectoryLength4Projection: 34    # min trajectory length required to make projected trajectory
+  prepLength4TrajectoryProjection: 58    # the length of the trajectory during which the state estimator is updated to make projections
+  trajectoryProjectionLength: 33    # the length of the projected trajectory
+  maxAngle4TrackletMatching: 67    # max angle difference for tracklet matching [degree]
+  minSpeedSimilarity4TrackletMatching: 0.0574    # min speed similarity for tracklet matching
+  minBboxSizeSimilarity4TrackletMatching: 0.1013    # min bbox size similarity for tracklet matching
+  maxTrackletMatchingTimeSearchRange: 27    # the search space in time for max tracklet similarity
+  trajectoryProjectionProcessNoiseScale: 0.0100    # trajectory projector's process noise scale w.r.t. state estimator
+  trajectoryProjectionMeasurementNoiseScale: 100    # trajectory projector's measurement noise scale w.r.t. state estimator
+  trackletSpacialSearchRegionScale: 0.0100    # the search region scale for peer tracklet
+
+  # [Re-Assoc: Reid based. Reid model params are set in ReID section]
+  reidExtractionInterval: 8    # frame interval to extract reid features per target
+
+DataAssociator:
+  dataAssociatorType: 0    # the type of data associator among { DEFAULT= 0 }
+  associationMatcherType: 1    # the type of matching algorithm among { GREEDY=0, CASCADED=1 }
+  checkClassMatch: 1    # If checked, only the same-class objects are associated with each other. Default: true
+
+  # [Association Metric: Thresholds for valid candidates]
+  minMatchingScore4Overall: 0.4290    # Min total score
+  minMatchingScore4SizeSimilarity: 0.3627    # Min bbox size similarity score
+  minMatchingScore4Iou: 0.2575    # Min IOU score
+  minMatchingScore4VisualSimilarity: 0.5356    # Min visual similarity score
+
+  # [Association Metric: Weights]
+  matchingScoreWeight4VisualSimilarity: 0.3370    # Weight for the visual similarity (in terms of correlation response ratio)
+  matchingScoreWeight4SizeSimilarity: 0.4354    # Weight for the Size-similarity score
+  matchingScoreWeight4Iou: 0.3656    # Weight for the IOU score
+
+  # [Association Metric: Tentative detections] only uses iou similarity for tentative detections
+  tentativeDetectorConfidence: 0.2008    # If a detection's confidence is lower than this but higher than minDetectorConfidence, then it's considered as a tentative detection
+  minMatchingScore4TentativeIou: 0.5296    # Min iou threshold to match targets and tentative detection
+
+StateEstimator:
+  stateEstimatorType: 1    # the type of state estimator among { DUMMY=0, SIMPLE=1, REGULAR=2 }
+
+  # [Dynamics Modeling]
+  processNoiseVar4Loc: 1.5110    # Process noise variance for bbox center
+  processNoiseVar4Size: 1.3159    # Process noise variance for bbox size
+  processNoiseVar4Vel: 0.0300    # Process noise variance for velocity
+  measurementNoiseVar4Detector: 3.0283    # Measurement noise variance for detector's detection
+  measurementNoiseVar4Tracker: 8.1505    # Measurement noise variance for tracker's localization
+
+VisualTracker:
+  visualTrackerType: 1    # the type of visual tracker among { DUMMY=0, NvDCF=1 }
+
+  # [NvDCF: Feature Extraction]
+  useColorNames: 1    # Use ColorNames feature
+  useHog: 0    # Use Histogram-of-Oriented-Gradient (HOG) feature
+  featureImgSizeLevel: 2    # Size of a feature image. Valid range: {1, 2, 3, 4, 5}, from the smallest to the largest
+  featureFocusOffsetFactor_y: -0.2000    # The offset for the center of hanning window relative to the feature height. The center of hanning window would move by (featureFocusOffsetFactor_y*featureMatSize.height) in vertical direction
+
+  # [NvDCF: Correlation Filter]
+  filterLr: 0.0750    # learning rate for DCF filter in exponential moving average. Valid Range: [0.0, 1.0]
+  filterChannelWeightsLr: 0.1000    # learning rate for the channel weights among feature channels. Valid Range: [0.0, 1.0]
+  gaussianSigma: 0.7500    # Standard deviation for Gaussian for desired response when creating DCF filter [pixels]
+
+# ── ReID — AGREGADO respecto a extended_shadow ──────────────────────────────────────────────
+# Todos los valores (batchSize, dims, offsets, netScaleFactor, etc.) son el default stock de
+# NVIDIA para resnet50_market1501 (config_tracker_NvDCF_accuracy.yml, DS 7.1) — específicos del
+# modelo, no calibrables a ojo. Solo las rutas de archivo cambian, para apuntar a nuestra propia
+# copia descargada por download_models.py::download_tracker_reid() en vez de samples/ del stock.
+ReID:
+  reidType: 2    # The type of reid among { DUMMY=0, NvDEEPSORT=1, Reid based reassoc=2, both NvDEEPSORT and reid based reassoc=3}
+
+  # [Reid Network Info]
+  batchSize: 100    # Batch size of reid network
+  workspaceSize: 1000    # Workspace size to be used by reid engine, in MB
+  reidFeatureSize: 256    # Size of reid feature
+  reidHistorySize: 100    # Max number of reid features kept for one object
+  inferDims: [3, 256, 128]    # Reid network input dimension CHW or HWC based on inputOrder
+  networkMode: 1    # Reid network inference precision mode among {fp32=0, fp16=1, int8=2 }
+
+  # [Input Preprocessing]
+  inputOrder: 0    # Reid network input order among { NCHW=0, NHWC=1 }. Batch will be converted to the specified order before reid input.
+  colorFormat: 0    # Reid network input color format among {RGB=0, BGR=1 }. Batch will be converted to the specified color before reid input.
+  offsets: [123.6750, 116.2800, 103.5300]    # Array of values to be subtracted from each input channel, with length equal to number of channels
+  netScaleFactor: 0.01735207    # Scaling factor for reid network input after substracting offsets
+  keepAspc: 1    # Whether to keep aspc ratio when resizing input objects for reid
+
+  # [Output Postprocessing]
+  addFeatureNormalization: 1       # If reid feature is not normalized in network, adding normalization on output so each reid feature has l2 norm equal to 1
+  minVisibility4GalleryUpdate: 0.6 # Add ReID embedding to the gallery only if the visibility is not lower than this
+
+  # [Paths and Names] — apuntan a deploy/models/tracker/ (montado en /nx_tech/models/tracker/
+  # por docker-compose.yml), descargado por download_models.py::download_tracker_reid().
+  # modelEngineFile debe coincidir EXACTO con <archivo>_b<batchSize>_gpu<gpu-id>_<networkMode>.engine
+  # o el engine nunca se cachea y se recompila en cada restart (~misma trampa que OSNet, ver
+  # ErrorHistory.md 2026-07-04).
+  tltEncodedModel: "/nx_tech/models/tracker/resnet50_market1501.etlt" # NVIDIA TAO model path
+  tltModelKey: "nvidia_tao" # NVIDIA TAO model key
+  modelEngineFile: "/nx_tech/models/tracker/resnet50_market1501.etlt_b100_gpu0_fp16.engine" # Engine file path

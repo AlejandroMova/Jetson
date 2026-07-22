@@ -101,7 +101,7 @@ La capacidad activa se lee desde `/etc/nx_pipeline` en el Jetson.
 ### Conteo de Personas (`people_counting`) — ✅ Activo
 Detecta y trackea personas en cada cámara. Emite eventos `person_entry` y `person_exit` con tiempo de permanencia. Acumula conteos y envía snapshots de analytics cada 60 segundos al backend.
 - **Modelo:** PeopleNet v2.3.4 (ResNet-34, INT8, NVIDIA NGC) — detecta 3 clases: person, bag, face
-- **Tracker:** NvDCF (correlación, recomendado ≤6 streams) o IOU (ligero, hasta 16 streams)
+- **Tracker:** NvDCF (correlación, recomendado ≤6 streams) o IOU (ligero, hasta 16 streams). Variantes de NvDCF sin modelo extra: `nvdcf_extended_shadow` (más tolerante a oclusión breve). Variante con modelo (opt-in, no calibrada en producción): `nvdcf_reid` — habilita el submódulo de ReID/Re-Assoc propio de NvDCF (recupera `track_id` **intra-cámara** tras oclusión más larga de lo que el shadow tracking cubre; complementa, no reemplaza, a OSNet+`ReIdManager` que hacen ReID **cross-cámara**). Ver `config_loader.py` (`TRACKER_CONFIGS`) y `deploy/models/tracker/config_tracker_NvDCF_reid.yml`.
 - **Siempre activo** en todos los paquetes
 - **`person_count` en analytics snapshot:** se incrementa **solo cuando `match_or_create()` retorna `event_type == "new_person"`**, es decir, cuando `ReIdManager` crea un nuevo `_Entry` con un `global_id` fresco. Las visitas de retorno (`person_return`) y cambios de cámara (`channel_change`) no incrementan el contador — la misma persona física no se cuenta dos veces. Fallback sin ReID (`_reid_manager is None`): se cuenta por track, comportamiento legacy.
 
@@ -608,7 +608,7 @@ Servidor HTTP MJPEG daemon para stream mode (`NX_STREAM_ENABLED=true`). Solo per
 Misma arquitectura de dos threads: `_encode_loop` (drena queues, encoda JPEG) + HTTP server (multipart/x-mixed-replace a 25 fps). Zero overhead cuando `NX_STREAM_ENABLED=false`.
 
 **`config_loader.py`** (~280 líneas)
-Carga y fusiona configuración desde 5 fuentes (prioridad: env vars > `/etc/nx_*` > `config.yaml` > `.env` > defaults). Define 11 paquetes predefinidos (`PACKAGE_DEFINITIONS`), 3 capacidades válidas (`people_counting`, `age_gender`, `face_recognition`), límites de NVDEC, y genera URLs RTSP interpolando el patrón del DVR. Retorna un `ClientConfig` dataclass. Campos configurables desde `config.yaml` (con defaults): `pgie_batch_size=0`, `pgie_interval=-1`, `sgie_interval=-1`, `reid_gallery_size=10`, `osnet_precision="fp32"` (`"fp32"|"fp16"` — ver `ClientConfig.osnet_config_path()` y `OSNET_SGIE_CONFIGS`, agregado 2026-07-14), `tracker="nvdcf"` (`"nvdcf"|"nvdcf_accuracy"|"iou"` — `"nvdcf_accuracy"` agregado 2026-07-16, ventana de búsqueda más ancha + re-identificación propia de NvDCF, sin verificar que el archivo exista con ese nombre en el Jetson real — ver `TRACKER_CONFIGS`). Campos de umbral PGIE sobreescribibles por cliente: `pgie_topk`, `pgie_nms_iou_threshold`, `pgie_pre_cluster_threshold` (todos con default -1 = usar valor del archivo). Si alguno está seteado, `app.py` genera un config temporal en `/tmp/` vía `_apply_pgie_overrides()`. **Importante:** reescribe rutas relativas como absolutas para evitar `Cannot access ONNX file '/tmp/...'` (ver ErrorHistory.md 2026-05-28).
+Carga y fusiona configuración desde 5 fuentes (prioridad: env vars > `/etc/nx_*` > `config.yaml` > `.env` > defaults). Define 11 paquetes predefinidos (`PACKAGE_DEFINITIONS`), 3 capacidades válidas (`people_counting`, `age_gender`, `face_recognition`), límites de NVDEC, y genera URLs RTSP interpolando el patrón del DVR. Retorna un `ClientConfig` dataclass. Campos configurables desde `config.yaml` (con defaults): `pgie_batch_size=0`, `pgie_interval=-1`, `sgie_interval=-1`, `reid_gallery_size=10`, `osnet_precision="fp32"` (`"fp32"|"fp16"` — ver `ClientConfig.osnet_config_path()` y `OSNET_SGIE_CONFIGS`, agregado 2026-07-14), `tracker="nvdcf"` (`"nvdcf"|"nvdcf_accuracy"|"nvdcf_extended_shadow"|"nvdcf_reid"|"iou"` — ver `TRACKER_CONFIGS`. `"nvdcf_accuracy"` ⚠️ NO USAR: perfil stock de NVIDIA, truena porque su modelo TAO nunca se descargó (`ErrorHistory.md` 2026-07-16). `"nvdcf_extended_shadow"` (2026-07-16): mismo perfil que `"nvdcf"`, `maxShadowTrackingAge` 51→100, sin modelo nuevo. `"nvdcf_reid"` (2026-07-22): `"nvdcf_extended_shadow"` + submódulo de ReID/Re-Assoc de NvDCF — a diferencia de `"nvdcf_accuracy"`, el modelo (`resnet50_market1501.etlt`, NVIDIA TAO ReIdentificationNet) sí se descarga vía `download_models.py --tracker-reid`; valores de la sección ReID copiados exactos del stock `config_tracker_NvDCF_accuracy.yml` verificado en el Jetson real, no adivinados. Intra-cámara — no toca OSNet/`ReIdManager`. Sin medir costo de GPU ni validar fragmentación todavía, ver `systemrefactor.md` Capa 1). Campos de umbral PGIE sobreescribibles por cliente: `pgie_topk`, `pgie_nms_iou_threshold`, `pgie_pre_cluster_threshold` (todos con default -1 = usar valor del archivo). Si alguno está seteado, `app.py` genera un config temporal en `/tmp/` vía `_apply_pgie_overrides()`. **Importante:** reescribe rutas relativas como absolutas para evitar `Cannot access ONNX file '/tmp/...'` (ver ErrorHistory.md 2026-05-28).
 
 **`common/bus_call.py`**
 Handler genérico de mensajes del bus GStreamer (EOS, WARNING, ERROR). Estándar de ejemplos NVIDIA DeepStream.
@@ -674,7 +674,7 @@ Correrlas directo en el host (`python3 tools/identify_dvr.py ...`) falla con `Mo
 - Escanea la red con nmap para encontrar DVRs en puerto 554
 - Ejecuta `identify_dvr.py` para detectar marca y patrón RTSP
 - Ejecuta `probe_cameras.py` para encontrar canales con cámaras activas
-- Descarga modelos públicos (OSNet) vía `download_models.py`
+- Descarga modelos públicos (OSNet, y el modelo ReID del tracker si `tracker: nvdcf_reid` ya está en config.yaml) vía `download_models.py`
 - Escribe `/etc/nx_client`, `/etc/nx_sector`, `/etc/nx_pipeline`, `/etc/nx_dvr_ip`
 - Construye la imagen Docker (`docker build`)
 - Lanza el pipeline (`docker compose up -d`)
@@ -687,7 +687,7 @@ Flags principales: `--client`, `--package`, `--authkey`, `--api-key`, `--dvr-use
 Actualización inteligente. Hace `git pull`, detecta si cambiaron el Dockerfile o requirements.txt, y solo reconstruye la imagen si es necesario. Reinicia el pipeline.
 
 **`download_models.py`** (~4.7 KB)
-Descarga modelos públicos que no están en el repo (MoveNet Lightning ONNX desde GitHub, OSNet desde un mirror). Verifica tamaño del archivo descargado.
+Descarga modelos públicos que no están en el repo (MoveNet Lightning ONNX desde GitHub, OSNet desde un mirror, `resnet50_market1501.etlt` de NGC para el submódulo de ReID del tracker vía `--tracker-reid`). Verifica tamaño del archivo descargado.
 
 **`identify_dvr.py`** (~18 KB)
 Auto-detecta la marca del DVR probando patrones RTSP conocidos (Hikvision, Dahua, Reolink, Uniview, Axis, Hanwha, genérico). Soporta `--stream-type sub` para sub-streams en deployments de 16+ cámaras. Retorna la marca, patrón URL y cantidad de canales.

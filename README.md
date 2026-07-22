@@ -356,6 +356,9 @@ When a new model (e.g. EPP) is ready:
 | Value | Algorithm | Max stable streams (Orin Nano) | Best for |
 |-------|-----------|-------------------------------|----------|
 | `nvdcf` | NvDCF correlation filter | ~6 | Clients with few cameras, need precise re-ID through occlusions |
+| `nvdcf_extended_shadow` | Same as `nvdcf`, `maxShadowTrackingAge` 51→100 frames | ~6 | Fragmented `track_id` from brief occlusion/fast movement, no new model needed |
+| `nvdcf_reid` | `nvdcf_extended_shadow` + NvDCF's own ReID/Re-Assoc submodule | ~6 (GPU cost not yet measured) | Fragmented `track_id` surviving longer occlusion than shadow tracking covers — intra-camera only, complements (does not replace) the cross-camera OSNet appearance SGIE. Requires `python3 tools/download_models.py --tracker-reid`. |
+| `nvdcf_accuracy` | ⚠️ Broken — NVIDIA stock accuracy profile, missing model was never downloaded (`"TAO model file does not exist"`). Use `nvdcf_reid` instead. | — | — |
 | `iou` | IoU bounding-box matching | 16 | Clients with many cameras, people-counting use case |
 
 **Sub-stream tip:** For 16-camera deployments the Jetson Orin Nano NVDEC will overload at 1080p.

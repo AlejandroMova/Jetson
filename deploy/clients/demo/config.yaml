@@ -92,6 +92,15 @@ stream_type: main
 #                             Sin modelo nuevo, sin costo de GPU extra. Usar si new_person
 #                             está inflado y ya se descartó que sea el threshold de OSNet
 #                             (ver CLAUDE.md, calibración ronda 3).
+#   nvdcf_reid             — mismo perfil que "nvdcf_extended_shadow" + submódulo de ReID
+#                             propio de NvDCF (recupera track_id INTRA-cámara tras oclusión
+#                             más larga de lo que el shadow tracking cubre solo). Requiere
+#                             descargar el modelo: `python3 tools/download_models.py
+#                             --tracker-reid` (setup.sh lo hace solo si ya ves este valor
+#                             aquí). Intra-cámara, no cruza cámaras — complementa a OSNet +
+#                             ReIdManager (cross-cámara), no los reemplaza. Costo de GPU
+#                             extra sin medir todavía — probar en cliente no crítico primero
+#                             (ver CLAUDE.md, Capa 1).
 #   iou                    — IoU matching. Simpler, no CUDA kernels. Stable with 16 streams.
 #                             Loses track ID on crossing/occlusion but sufficient for people counting.
 tracker: nvdcf

@@ -170,7 +170,7 @@ sgie_interval: 3
 no produce error visible — el pipeline arranca normal y simplemente no mejora nada. Usar
 `identify_dvr.py --stream-type main --update-config` para que los ponga consistentes.
 
-### 5.2 `stream_width` / `stream_height` — PENDIENTE
+### 5.2 `stream_width` / `stream_height` ✅ APLICADO Y VERIFICADO (2026-07-19)
 
 El DVR entrega **1280×720**, pero `stream_type: main` fija el lienzo en **1920×1080** →
 se escala 720p a 1080p, pagando 2.25× el costo de píxeles por información inventada.
@@ -194,11 +194,31 @@ Y ese valor alimenta **ambos** puntos críticos, por lo que no pueden desincroni
 - [app.py:333](deploy/pipelines/app.py#L333) → `streammux.set_property("width", ...)` (lienzo real)
 - [app.py:305](deploy/pipelines/app.py#L305) → `init_stream_resolution(...)` (divisores de normalización)
 
-**Comprobación tras reiniciar:**
+**Comprobación tras reiniciar — CONFIRMADA:**
 ```bash
-docker compose logs deepstream 2>&1 | grep -iE "Resolution|Tracker" | head
-# debe decir:  Resolution : 1280x720 (main)
+docker compose exec deepstream python3 -c "
+import sys; sys.path.insert(0,'/nx_tech/pipelines')
+from config_loader import load_config
+c = load_config(); print('canvas:', c.stream_width, 'x', c.stream_height)"
 ```
+```
+canvas: 1280 x 720     ← antes del cambio decía 1920 x 1080
+```
+
+**Estado final de la configuración tras esta sesión** (`clients/Mova/config.yaml`):
+
+| Campo | Valor | Nota |
+|---|---|---|
+| `rtsp_url_pattern` | `...&subtype=0` | main stream |
+| `stream_type` | `main` | |
+| `stream_width` / `stream_height` | `1280` / `720` | coincide con lo que entrega el DVR |
+| `channels` | `[2, 3]` | |
+| `tracker` | `nvdcf_extended_shadow` | `maxShadowTrackingAge=100` |
+| `pgie_interval` | `1` | detección cada 2 frames |
+| `sgie_interval` | `3` | OSNet cada 4 frames |
+| `osnet_precision` | `fp16` | ⚠️ sin recalibrar, ver §6.2.1 |
+| `pgie_pre_cluster_threshold` | `0.25` | bajado del default 0.3 |
+| `pgie_nms_iou_threshold` | `0.3` | |
 
 ---
 
@@ -222,7 +242,38 @@ variables a la vez). Si persiste fragmentación por oclusión, subir a ~215 para
 
 `SIMILARITY_THRESHOLD=0.85` se calibró con embeddings del **sub-stream**. Crops más grandes y con
 más detalle real **mueven la distribución de similitudes**. Reverificar con los datos nuevos antes
-de asumir que 0.85 sigue siendo correcto (mismo criterio que ya se aplicó para fp16).
+de asumir que 0.85 sigue siendo correcto.
+
+### 6.2.1 `osnet_precision: fp16` activo en producción, sin recalibrar ⚠️
+
+**Detectado 2026-07-19** al revisar `clients/Mova/config.yaml`:
+
+```yaml
+osnet_precision: fp16
+```
+
+El comentario del propio archivo (y CLAUDE.md) marcan fp16 como **no recalibrado**: *"antes de
+dejarlo en producción hay que reverificar que la distribución de similitudes no cambió respecto a
+fp32"*. Pero `SIMILARITY_THRESHOLD=0.85` en `reid_manager.py` **se calibró con fp32**.
+
+**Magnitud estimada:** baja. FP16 típicamente desplaza las similitudes coseno ~0.001–0.005 — no
+explica 465 identidades contra ~20. **No es la causa principal.** Pero el máximo de `new_person`
+observado fue **0.8423** contra un umbral de 0.85: en ese margen, milésimas mueven casos
+individuales.
+
+**Decisión:** no cambiarlo ahora. Si fp16 ya estaba activo durante la captura del 15–18, es una
+**constante** entre la línea base y la medición de verificación, y la comparación sigue siendo
+válida. Cambiarlo introduciría una tercera variable.
+
+**⚠️ Pendiente de confirmar:** si `osnet_precision` cambió *durante* el periodo 15–18 jul, la
+línea base está contaminada y debe interpretarse con cuidado.
+
+### 6.2.2 `entry_exit_channels: [2, 3]` — posiblemente incorrecto
+
+Ambas cámaras están marcadas como entrada/salida, pero **ninguna cubre una puerta** (confirmado por
+el usuario). El comentario del propio `config.yaml` indica: *"Dejar vacío si ninguna cámara cubre
+directamente la puerta de entrada."* Ese flag alimenta cálculo de tiempo en tienda y conteo de
+visitas. **No modificado** — anotado para revisar después de la medición.
 
 ### 6.3 Posible saturación de GPU
 
@@ -288,7 +339,7 @@ fragmentación persiste.**
 ### Capa 0 — Recuperar FPS ✅ EN CURSO
 Ya descrito en §5. Es el cambio más barato y ataca la causa raíz medida.
 
-### Capa 1 — Re-asociación ReID en el tracker
+### Capa 1 — Re-asociación ReID en el tracker ✅ IMPLEMENTADO (2026-07-22), pendiente de validar
 Habilitar el submódulo de ReID de NvDCF (`reidType: 2`), que compara detecciones nuevas contra
 tracks recién perdidos **por apariencia** y **restaura el `track_id` original**. A diferencia del
 shadow tracking, no está limitado por ventana de frames.
@@ -297,8 +348,22 @@ El bloqueo histórico (`nvdcf_accuracy` "roto") era **solo el modelo faltante**,
 ```
 https://api.ngc.nvidia.com/v2/models/nvidia/tao/reidentificationnet/versions/deployable_v1.0/files/resnet50_market1501.etlt
 ```
-- **Evaluar que reemplace al SGIE OSNet** — sería *quitar* un componente, no agregar.
-- **Riesgo:** ResNet50 es más pesado que OSNet-x1.0 en Orin Nano. Medir antes de comprometerse.
+
+**Hecho:** nuevo valor `tracker: nvdcf_reid` (`config_loader.py::TRACKER_CONFIGS`) — mismo perfil
+que `nvdcf_extended_shadow` (asociación frame-a-frame ya calibrada, `maxShadowTrackingAge=100`
+intacto) con el bloque `TrajectoryManagement.enableReAssoc` + `ReID:` agregado encima, valores
+copiados exactos del stock `config_tracker_NvDCF_accuracy.yml` (leído del Jetson real, DS 7.1, no
+adivinados). Descarga: `download_models.py --tracker-reid` (`resnet50_market1501.etlt`, público en
+NGC, ~92 MB), automatizada en `setup.sh` solo si el cliente ya tiene `tracker: nvdcf_reid` en su
+config.yaml. Detalle completo en `Future.md` ("Submódulo de ReID propio de NvDCF").
+
+**Pendiente — validar en Mova (Paso 4 del plan):** arranque sin error / engine cacheado, costo de
+GPU real (red completa por objeto/por frame, `reidExtractionInterval=8`), y las mismas métricas de
+fragmentación de §10-bis (span mediano de track, % tracks de 1 crop, tasa de match) contra la línea
+base main-15fps. Alcance deliberadamente **solo aditivo** — no toca OSNet, `ReIdManager`, ni
+`SIMILARITY_THRESHOLD`. Evaluar reemplazar el SGIE OSNet por este embedding es una decisión
+**separada y diferida**, solo si la medición muestra headroom de sobra y valor claro (ResNet50 es
+más pesado que OSNet-x1.0 en Orin Nano — medir antes de comprometerse).
 
 ### Capa 2 — Métricas sin identidad (red de seguridad)
 Correctas **en vivo**, independientes de la calidad del ReID:
@@ -348,7 +413,96 @@ fragmentación: solo necesita que el track exista los pocos frames del cruce.
 
 ---
 
-## 10. Medición de verificación (siguiente sesión)
+## 10-bis. RESULTADO de la verificación (2026-07-20, main 15 fps) ✅
+
+Dataset `dataset_2026-07-20` (5952 crops, 1850 tracks) + `osnet_reid.csv` (20:00–01:15, 5.25 h).
+
+| Métrica | Base (sub, 7 fps) | Main (15 fps) | Veredicto |
+|---|---|---|---|
+| **FPS medido** | 7.02 | **15.02** | ✅ 2.1×, exacto a lo predicho desde el DVR |
+| **Tasa de match** (cc+return)/(cc+return+new) | 5% | **21%** | ✅ **4× mejor** |
+| **Track mediano (frames)** | 16 | **46** | ✅ ~3× más largo |
+| **Tracks de 1 solo crop** | 39% | **25%** | ✅ menos muerte instantánea |
+| **Tracks que llegan al tope de 5 crops** | 20% | **35%** | ✅ persistencia real |
+| **Compute-bound** | no | **no** (fps plano 1→6+ personas) | ✅ queda headroom |
+| **Max `new_person` sim** | 0.8423 | 0.8497 | umbral sigue sin ser el límite |
+
+### Trampa de medición corregida
+El "track mediano en **segundos**" apenas subió (2.3→3.1 s) y **parece** un fracaso. Es un
+artefacto de censura: el span se corta al 5º crop (`CROP_MAX_PER_PERSON=5`), y ese tope, medido en
+segundos, **encoge al subir el fps**. La comparación justa es en **frames** (censura consistente):
+**16 → 46 frames, casi el triple.** Los tracks sí sobreviven mucho más.
+
+### Confirmación visual
+`cae7c9171101` re-identificado correctamente a lo largo de **138 min** (21:36, 22:30, 23:54) — top
+oscuro, pantalón oscuro, misma zona del sillón rojo, 7 eventos (1 new + 4 return + 2 cc) a sim
+0.85–0.96. Es una persona real (probable empleado) rastreada como regresante. Antes esto casi no
+ocurría.
+
+### Veredicto
+**El arreglo del stream era la causa raíz correcta y funcionó** — pero **redujo la fragmentación,
+no la eliminó.** Persisten 196 `new_person` en 5.25 h y 25% de tracks mueren al primer crop. El
+re-ID ahora reconecta 4× más fragmentos, pero el tracker sigue perdiendo gente.
+
+**Nota sobre `new_person/hora` (17.4→37.3):** NO es regresión. Es una ventana nocturna con más
+tráfico real; las tasas absolutas no son comparables entre periodos con distinto número de
+personas. La tasa de **match** (5%→21%) es la comparación justa.
+
+### Próximas palancas baratas (hay headroom de GPU comprobado)
+1. ~~**`pgie_interval: 1 → 0`**~~ ❌ PROBADO Y REVERTIDO — ver §10-ter.
+2. **DVR a 25 fps** si la web UI lo permite (aún no probado).
+
+Solo si el residual persiste tras eso → Capa 1 (re-asociación NvDCF) o Capa 3 (clustering nocturno).
+
+### `osnet_precision: fp16` — ya no es preocupación
+Día 20 corrió con fp16 (config sin cambios) y la tasa de match **mejoró** 4×. FP16 no está dañando
+nada medible. Punto §6.2.1 efectivamente cerrado.
+
+---
+
+## 10-ter. `pgie_interval: 0` — PROBADO Y REVERTIDO (2026-07-21) ❌
+
+Dataset `dataset_2026-07-21` (470 tracks) + `osnet_reid.csv` (ventana activa 12:35–17:05, 4.5 h,
+tras restart ~02:31 con `pgie_interval=0`).
+
+| Métrica | sub 7fps | main pgie=1 | **main pgie=0** |
+|---|---|---|---|
+| FPS | 7.02 | 15.02 | 15.03 |
+| Tasa de match | 5% | 21% | **7%** ↓ |
+| Tracks de 1 solo crop | 39% | 25% | **31%** ↑ |
+| Span mediano (frames) | 16 | 46 | **30** ↓ |
+
+**Los tres indicadores de persistencia retrocedieron.** Consistente con la nota de NVIDIA
+(Gst-nvinfer): correr inferencia en cada frame (`interval=0`) **aumenta el "ID stealing"** entre
+objetos — más detecciones = más ocasiones de robar/cambiar identidades y crear tracks espurios.
+
+**⚠️ Confound:** la caída de match (21%→7%) está contaminada por hora del día — día 20 fue **noche**
+(mismas ~20 personas reciclándose, muchos return); día 21 fue **mediodía-tarde** (tráfico de gente
+distinta, pocos return). Esa parte no es del `pgie_interval`. Pero span-en-frames (46→30) y 1-crop
+(25%→31%) dependen menos de la población y también empeoraron → sí apunta a `interval=0`.
+
+**Decisión: revertir a `pgie_interval: 1`.**
+
+### Dato valioso del experimento
+`pgie_interval=0` corrió PeopleNet en cada frame **sin bajar los FPS** (15.03, plano bajo carga) →
+**confirma headroom de GPU amplio.** Ese presupuesto se puede reinvertir en la Capa 1 (modelo de
+ReID del tracker), y revertir a `pgie_interval=1` lo libera.
+
+### Confirmación de la queja del usuario ("misma persona, distinto global_id")
+Cluster 13:06 ch02: `track_176` (gid `116011cc4294`) y `track_179` (gid `817cd8f6756d`), a 2 s uno
+del otro, plausiblemente la misma persona → dos global_id. **Max sim de los 279 `new_person` del día
+= 0.8465 < 0.85** → el embedding re-detectado no alcanza el umbral → global_id nuevo. NO es bug: es
+el techo de OSNet (0.64–0.84 misma-persona se solapa con distinta-persona; el umbral no se puede
+bajar sin fusionar gente). El ReID sí funciona cuando puede (`8a3b77e08253` re-id 3× en 40 min).
+
+### Veredicto de la fase de config
+Palancas baratas **agotadas**: stream sub→main fue gran ganancia; pgie_interval=0 fue
+contraproducente. Para cerrar "misma persona = mismo id" en tiempo real ya no hay ajuste de config
+→ toca Capa 1 (re-asociación NvDCF, ahora sin el riesgo de GPU que se creía) o Capa 3 (clustering).
+
+---
+
+## 10. Método de la medición de verificación
 
 Exportar un dataset nuevo desde `/superadmin/dataset` **con actividad real de gente** y correr el
 mismo método de §2.3/§2.4. Comparación directa contra la línea base:

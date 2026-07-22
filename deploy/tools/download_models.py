@@ -6,6 +6,7 @@ Downloads optional model files that are not tracked in git.
 Usage:
   python tools/download_models.py --fall-detection
   python tools/download_models.py --reid --github-token <token>
+  python tools/download_models.py --tracker-reid
   python tools/download_models.py --all --github-token <token>
 
 The GitHub token is extracted automatically by setup.sh from the git remote URL
@@ -104,6 +105,26 @@ def download_osnet(dest_dir: Path, token: str = ""):
     _download(url, dest, "OSNet-x1.0 ONNX (cross-camera re-ID)", token=token)
 
 
+def download_tracker_reid(dest_dir: Path):
+    """
+    ReIdentificationNet (NVIDIA TAO Toolkit, resnet50_market1501), deployable_v1.0.
+    TAO-encoded model (.etlt, key "nvidia_tao") — used by the NvDCF tracker's own
+    ReID/Re-Assoc submodule (intra-camera track_id recovery after occlusion), NOT
+    by our cross-camera OSNet SGIE. See config_tracker_NvDCF_reid.yml for the
+    matching preprocessing values (inferDims, offsets, netScaleFactor) confirmed
+    from NVIDIA's stock config_tracker_NvDCF_accuracy.yml.
+
+    Public NGC download — no API key/token required (verified: plain GET redirects
+    to a signed URL, ~92 MB).
+    """
+    dest = dest_dir / "tracker" / "resnet50_market1501.etlt"
+    url = (
+        "https://api.ngc.nvidia.com/v2/models/nvidia/tao/reidentificationnet/"
+        "versions/deployable_v1.0/files/resnet50_market1501.etlt"
+    )
+    _download(url, dest, "ReIdentificationNet resnet50 (NvDCF tracker ReID)")
+
+
 def download_movenet(dest_dir: Path):
     """
     MoveNet SinglePose Lightning — ONNX, 192×192 input.
@@ -132,6 +153,8 @@ def main():
     parser = argparse.ArgumentParser(description="Download NX optional model files")
     parser.add_argument("--reid", action="store_true",
                         help="Download OSNet-x1.0 ONNX for cross-camera re-ID")
+    parser.add_argument("--tracker-reid", action="store_true",
+                        help="Download ReIdentificationNet .etlt for NvDCF tracker ReID (intra-camera)")
     parser.add_argument("--fall-detection", action="store_true",
                         help="Download MoveNet ONNX for fall detection (Hogar only)")
     parser.add_argument("--all", action="store_true",
@@ -140,12 +163,15 @@ def main():
                         help="GitHub personal access token for private release assets")
     args = parser.parse_args()
 
-    if not any([args.reid, args.fall_detection, args.all]):
+    if not any([args.reid, args.tracker_reid, args.fall_detection, args.all]):
         parser.print_help()
         sys.exit(0)
 
     if args.reid or args.all:
         download_osnet(_MODELS_DIR, token=args.github_token)
+
+    if args.tracker_reid or args.all:
+        download_tracker_reid(_MODELS_DIR)
 
     if args.fall_detection or args.all:
         download_movenet(_MODELS_DIR)

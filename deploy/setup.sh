@@ -551,6 +551,26 @@ _download_models() {
       || warn "Fallo al descargar OSNet. Corre manualmente: python3 tools/download_models.py --reid --github-token <token>"
   fi
 
+  # ── ReIdentificationNet (submódulo ReID del tracker NvDCF) — opt-in ────────
+  # A diferencia de OSNet (siempre activo), este modelo solo hace falta si el
+  # cliente ya tiene `tracker: nvdcf_reid` en su config.yaml. No hay flag de
+  # setup.sh para elegir tracker (se edita config.yaml a mano, mismo patrón que
+  # "nvdcf_extended_shadow") — este chequeo existe para que un rerun de setup.sh
+  # en un cliente que ya lo activó lo descargue solo, en vez de quedar como paso
+  # manual olvidado. URL pública de NGC, sin token.
+  _client_name_dl=$(cat /etc/nx_client 2>/dev/null || echo "")
+  _client_cfg_dl="${WORK_DIR}/clients/${_client_name_dl}/config.yaml"
+  if [[ -f "$_client_cfg_dl" ]] && grep -qE '^tracker:[[:space:]]*nvdcf_reid' "$_client_cfg_dl"; then
+    TRACKER_REID_DEST="${WORK_DIR}/models/tracker/resnet50_market1501.etlt"
+    if [[ -f "$TRACKER_REID_DEST" ]]; then
+      ok "Modelo ReID del tracker ya descargado — skip"
+    else
+      log "tracker: nvdcf_reid detectado en config.yaml — descargando ReIdentificationNet..."
+      python3 "${WORK_DIR}/tools/download_models.py" --tracker-reid \
+        && ok "Modelo ReID del tracker descargado" \
+        || warn "Fallo al descargar el modelo ReID del tracker. Corre manualmente: python3 tools/download_models.py --tracker-reid"
+    fi
+  fi
 }
 
 # ════════════════════════════════════════════════════════════

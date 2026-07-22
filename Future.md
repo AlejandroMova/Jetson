@@ -1040,22 +1040,26 @@ DeepStream tiene un mecanismo nativo para esto: cuando un SGIE corre detrás de 
 
 ---
 
-## Submódulo de ReID propio de NvDCF (`nvdcf_accuracy`) — requiere modelo de NGC
+## Submódulo de ReID propio de NvDCF (`tracker: nvdcf_reid`) — ✅ IMPLEMENTADO (2026-07-22), pendiente de validar en Mova
 
-**Descripción:** DeepStream trae, además del filtro de correlación normal de NvDCF (`_perf`, el que corre hoy en producción), una variante `_accuracy` que habilita un submódulo de re-identificación por apariencia *dentro del propio tracker* — una red neuronal separada que corre por objeto/por frame, por cámara, para recuperar un track_id tras una oclusión o pérdida más larga de lo que un filtro de correlación puro puede seguir. Es un mecanismo distinto y complementario a nuestro propio OSNet + `ReIdManager` (que sí cruza cámaras); el de NvDCF solo ayuda a que el tracker no fragmente a la misma persona en varios `track_id` *dentro de una misma cámara*, reduciendo cuántas veces le toca a OSNet decidir desde cero.
+**Descripción:** DeepStream trae, además del filtro de correlación normal de NvDCF (`_perf`, el que corre hoy en producción), un submódulo de re-identificación por apariencia *dentro del propio tracker* (`TrajectoryManagement.enableReAssoc` + sección `ReID:`) — una red neuronal separada que corre por objeto/por frame, por cámara, para recuperar un track_id tras una oclusión o pérdida más larga de lo que un filtro de correlación puro puede seguir. Es un mecanismo distinto y complementario a nuestro propio OSNet + `ReIdManager` (que sí cruza cámaras); el de NvDCF solo ayuda a que el tracker no fragmente a la misma persona en varios `track_id` *dentro de una misma cámara*, reduciendo cuántas veces le toca a OSNet decidir desde cero.
 
-**Por qué está pendiente, no descartada:** se intentó activar el 2026-07-16 en el cliente Mova (producción) vía `tracker: nvdcf_accuracy` y **truena el pipeline** — el YAML carga bien, pero su submódulo de ReID necesita su propio engine TRT/TAO que nunca se descargó en ningún Jetson de este proyecto (`"TAO model file does not exist"`, ver `ErrorHistory.md` 2026-07-16). Se revirtió a `nvdcf` de inmediato. En su lugar se implementó la Opción B (ventana de búsqueda más ancha dentro de `_perf`, sin modelo nuevo — ver Parte 1 del plan de calibración ronda 3) como mitigación de menor riesgo mientras tanto.
+**Por qué antes estaba bloqueado:** se intentó activar el 2026-07-16 en el cliente Mova vía `tracker: nvdcf_accuracy` (el perfil stock completo de NVIDIA) y **truena el pipeline** — su submódulo de ReID necesita su propio engine TRT/TAO que nunca se descargó en ningún Jetson de este proyecto (`"TAO model file does not exist"`, ver `ErrorHistory.md` 2026-07-16). Se revirtió a `nvdcf` de inmediato. La Opción B (`nvdcf_extended_shadow`, ventana de búsqueda más ancha sin modelo nuevo) quedó como mitigación de menor riesgo mientras tanto.
 
-**Por qué sería mejor que la Opción B:** una red de re-identificación no depende de que el objeto siga siendo visible/rastreable por correlación — puede reconocer a alguien después de una oclusión total más larga (no solo movimiento rápido que se sale de la ventana de búsqueda), que es un caso que la Opción B no cubre.
+**Qué se hizo (2026-07-22):**
+- Se leyó el YAML stock `config_tracker_NvDCF_accuracy.yml` directamente del Jetson real (DeepStream 7.1) para confirmar, sin adivinar, el formato exacto: modelo `.etlt` (TAO-encoded, key `nvidia_tao`), `inferDims: [3, 256, 128]`, `networkMode: 1` (fp16), `offsets`/`netScaleFactor` de preprocesamiento, y todo el bloque `TrajectoryManagement.enableReAssoc` (pesos y umbrales de Re-Assoc). Esa es exactamente la información que faltaba el 07-16.
+- Modelo: `ReIdentificationNet` (NVIDIA TAO, `resnet50_market1501.etlt`, deployable_v1.0) — confirmado público en NGC, sin API key (`https://api.ngc.nvidia.com/v2/models/nvidia/tao/reidentificationnet/versions/deployable_v1.0/files/resnet50_market1501.etlt`, ~92 MB).
+- `download_models.py::download_tracker_reid()` + flag `--tracker-reid` — mismo patrón que `download_osnet()`.
+- `setup.sh::_download_models()` descarga el modelo automáticamente solo si el cliente ya tiene `tracker: nvdcf_reid` en su `config.yaml` (opt-in, sin flag de CLI — mismo patrón manual que `nvdcf_extended_shadow`).
+- `deploy/models/tracker/config_tracker_NvDCF_reid.yml` — parte de `config_tracker_NvDCF_extended_shadow.yml` (BaseConfig/DataAssociator/StateEstimator/VisualTracker ya calibrados, `maxShadowTrackingAge=100` intacto) y le agrega **solo** el bloque ReID/Re-Assoc, con los valores exactos del stock (sin recalibrar — son específicos del modelo, no ajustables a ojo). Deliberadamente NO se partió de `_accuracy.yml` completo para no cambiar el perfil de asociación frame-a-frame ya calibrado en producción al mismo tiempo que se agrega ReID.
+- `TRACKER_CONFIGS["nvdcf_reid"]` en `config_loader.py`.
 
-**Qué haría falta para retomarla:**
-- Ubicar el modelo exacto que espera `config_tracker_NvDCF_accuracy.yml` en su sección de ReID — candidato sin confirmar: `ReIdentificationNet` de NVIDIA TAO Toolkit, publicado en NGC (mismo tipo de fuente que ya se usa para PeopleNet en este proyecto). Verificar licencia, tamaño, y si requiere cuenta/API key de NGC para descargar.
-- Agregar la descarga al flujo existente de `download_models.py`/`setup.sh` (mismo patrón que PeopleNet/OSNet).
-- Apuntar el path del modelo dentro del YAML de `_accuracy` (posiblemente haga falta copiar el YAML a este repo y editarlo, como ya se hizo con `config_infer_sgie_osnet_fp16.txt`, en vez de depender del archivo stock de NVIDIA).
-- Medir el costo de GPU real en un cliente no crítico antes de desplegarlo — es una red completa corriendo por objeto/por frame, encima de PeopleNet + OSNet + AgeGender ya corriendo; podría volver a comerse el margen que se ganó con `sgie_interval`/`osnet_precision`.
-- Probar primero en un cliente de prueba, nunca directo en producción (lección del incidente del 07-16).
+**Pendiente (no hecho todavía, ver `systemrefactor.md` Capa 1 / plan de validación):**
+- Correr en Mova (cliente de prueba) con `tracker: nvdcf_reid`, confirmar arranque sin error y que el engine se cachea (nombre `model-engine-file` ya coincide con la convención `<archivo>_b100_gpu0_fp16.engine`, misma trampa que OSNet en `ErrorHistory.md` 2026-07-04, ya evitada).
+- Medir costo de GPU real — es una red completa corriendo por objeto/por frame (`reidExtractionInterval: 8` en frames), encima de PeopleNet + OSNet + AgeGender ya corriendo. Ya se confirmó headroom de GPU amplio con `pgie_interval=0` (`systemrefactor.md` §10-ter), pero eso no mide el costo específico de esta red.
+- Medir fragmentación (span mediano de track, % tracks de 1 crop, tasa de match) contra la línea base main-15fps de `systemrefactor.md` §10-bis.
 
-**Consideraciones:** más piezas nuevas = más que puede romperse — ya lo demostró el intento del 07-16. Solo vale la pena si, después de medir el efecto de la Opción B + el buffer multi-frame + el umbral acotado (ya implementados), el sobreconteo por oclusión larga (no solo movimiento rápido) sigue siendo significativo.
+**Consideraciones:** sigue siendo intra-cámara, no reemplaza a OSNet/`ReIdManager` ni cambia `SIMILARITY_THRESHOLD` — alcance deliberadamente aditivo. Si la medición no muestra mejora clara o la GPU se satura sin ganancia, revertir a `nvdcf_extended_shadow` y escalar directo a la Capa 3 (clustering nocturno).
 
 ---
 
