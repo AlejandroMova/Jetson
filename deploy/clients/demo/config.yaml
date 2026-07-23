@@ -1,204 +1,106 @@
-# NOTA: client_name aquí es solo referencia visual — el código lo lee de /etc/nx_client
-# (escrito por setup.sh). Cambiar este valor no tiene efecto en el pipeline.
+# ═══════════════════════════════════════════════════════════════════════════
+#  Config del cliente. Editable a mano; setup.sh completa lo básico solo.
+#  Los campos comentados (# campo: valor) son opcionales — descoméntalos para usarlos.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Nombre del cliente. Solo referencia visual — el sistema lo lee de /etc/nx_client.
 client_name: demo
 
-# DVR connection
+# Puerto RTSP del DVR (554 en casi todos).
 dvr_port: 554
 
-# RTSP URL template — placeholders replaced at runtime by config_loader:
-#   {user}      → DVR_USER from .env
-#   {password}  → DVR_PASS from .env
-#   {dvr_ip}    → DVR IP discovered by setup.sh (written to /etc/nx_dvr_ip)
-#   {port}      → dvr_port above
-#   {ch:02d}    → zero-padded channel number (01, 03, 05, ...)
+# Plantilla de la URL RTSP. setup.sh la llena solo con identify_dvr.py.
+# Placeholders: {user} {password} {dvr_ip} {port} y {ch:02d} (canal, ej. 01, 03).
 #
-# identify_dvr.py sets this automatically. Common variants by brand:
-#
-#   Brand                   Main stream                                      Sub-stream (stream_type: sub)
-#   ─────────────────────── ──────────────────────────────────────────────── ──────────────────────────────────────────────────
-#   Generic/QSee/Swann/Annke  .../ch{ch:02d}/main/av_stream                   .../ch{ch:02d}/sub/av_stream
-#   Hikvision               .../Streaming/Channels/{ch:02d}01               .../Streaming/Channels/{ch:02d}02
-#   Dahua/Amcrest/Lorex     .../cam/realmonitor?channel={ch}&subtype=0      .../cam/realmonitor?channel={ch}&subtype=1
-#   Reolink                 .../h264Preview_{ch:02d}_main                   .../h264Preview_{ch:02d}_sub
-#   Uniview/Unv             .../media/video{ch}                             .../unicast/c{ch}/s1/live  (firmware-dependent)
-#   Generic h264            .../h264/ch{ch:02d}/main/av_stream              .../h264/ch{ch:02d}/sub/av_stream
-#   Generic live            .../live/ch{ch:02d}                             .../live/ch{ch:02d}_1
-#   Axis / Hanwha-Samsung   Sub-stream path is device-specific — set manually after checking DVR web UI.
+# La ruta cambia según la marca del DVR. Las más comunes:
+#   Genérico/QSee/Swann   /ch{ch:02d}/main/av_stream
+#   Hikvision             /Streaming/Channels/{ch:02d}01
+#   Dahua/Amcrest/Lorex   /cam/realmonitor?channel={ch}&subtype=0
+#   Reolink               /h264Preview_{ch:02d}_main
+# (Axis y Hanwha/Samsung: revisar la web del DVR y poner la ruta a mano.)
 rtsp_url_pattern: "rtsp://{user}:{password}@{dvr_ip}:{port}/ch{ch:02d}/main/av_stream"
 
-# Active camera channels (DVR channel numbers, 1-indexed)
+# Canales de cámara activos (números del DVR, empiezan en 1).
 channels: [1]
 
-# Contracted package — defines the AI pipeline and sector automatically.
-# Set by setup.sh --package <name>, or edit manually here.
-#
-#   Package                  Pipeline capabilities                            Sector
-#   ──────────────────────── ──────────────────────────────────────────────── ──────────────
-#   comercio_basico          people_counting                                  comercio
-#   comercio_avanzado        people_counting                                  comercio
-#   comercio_total           people_counting, age_gender, face_recognition    comercio
-#   comercio_enterprise      people_counting, age_gender, face_recognition    comercio
-#   industrial_basico        people_counting                                  industrial
-#   industrial_avanzado      people_counting, epp_detection                   industrial
-#   industrial_total         people_counting, epp_detection, license_plate,   industrial
-#                              fire_smoke, face_recognition
-#   industrial_enterprise    people_counting, epp_detection, license_plate,   industrial
-#                              fire_smoke, face_recognition
-#   hogar_basico             people_counting                                  hogar
-#   hogar_avanzado           people_counting, fall_detection                  hogar
-#   hogar_total              people_counting, fall_detection, fire_smoke,     hogar
-#                              face_recognition
-#   manual                   uses pipeline + sector fields below (testing)    —
-#
-# Priority: NX_PIPELINE env var > /etc/nx_pipeline > this field.
+# Paquete contratado. Define qué analiza el sistema. setup.sh --package lo pone.
+#   comercio_basico / avanzado   → conteo de personas (avanzado suma edad/género)
+#   comercio_total / enterprise  → + reconocimiento facial de empleados
+#   industrial_basico / avanzado → conteo de personas
+#   industrial_total / enterprise→ + reconocimiento facial
+#   hogar_basico                 → conteo de personas
+#   hogar_avanzado / total       → + reconocimiento facial
+#   manual                       → usa los campos pipeline/sector de abajo (pruebas)
 package: comercio_basico
 
-# ── Only used when package: manual ───────────────────────────────────────────
+# Solo si package: manual
 # pipeline:
 #   - people_counting
 #   - age_gender
 # sector: comercio
 
-# Stream type — which RTSP stream the Jetson pulls from the DVR.
-#
-#   main — Full-resolution main stream (1920×1080). Default.
-#          Use for ≤6 cameras on a single Jetson Orin Nano.
-#
-#   sub  — DVR sub-stream (960×544). Required for 16-camera deployments.
-#          Run: setup.sh --stream-type sub  OR  identify_dvr.py --stream-type sub --update-config
-#          This sets rtsp_url_pattern to the correct sub-stream path automatically.
-#          For Axis and Hanwha/Samsung the path is device-specific — set manually.
-#
-#          Accuracy impact: PeopleNet natively targets 960×544 — zero detection loss.
-#          SGIEs (age/gender, face) see smaller crops; people far from camera may be
-#          skipped by minimum-size filters (same as they would be at long range anyway).
-#
-# stream_width / stream_height sobreescriben la resolución de stream_type si se especifican.
-# Ejemplo para forzar resolución no estándar de un DVR:
-# stream_width: 1280
-# stream_height: 720
+# Calidad del stream que se pide al DVR:
+#   main → alta resolución (1920×1080). Para hasta 6 cámaras por Jetson.
+#   sub  → baja resolución (960×544). Necesario para 16 cámaras.
+#          Poner con: setup.sh --stream-type sub  (ajusta la URL solo).
+# stream_type: main
 stream_type: main
 
-# Tracker algorithm:
-#   nvdcf                  — NvDCF correlation filter. Stable up to ~6 streams en Orin
-#                             Nano. Default — el más barato, pero pierde el track fácil
-#                             en oclusión o movimiento rápido (fragmenta una persona en
-#                             varios new_person).
-#   nvdcf_accuracy         — ⚠️ NO USAR, confirmado roto en producción (ver CLAUDE.md,
-#                             ErrorHistory.md 2026-07-16) — requiere un modelo de ReID
-#                             (TAO/NGC) que no está descargado en ningún Jetson todavía.
-#   nvdcf_extended_shadow  — mismo tracker que "nvdcf", con más tolerancia a oclusión
-#                             breve/movimiento rápido (maxShadowTrackingAge 51→100 frames).
-#                             Sin modelo nuevo, sin costo de GPU extra. Usar si new_person
-#                             está inflado y ya se descartó que sea el threshold de OSNet
-#                             (ver CLAUDE.md, calibración ronda 3).
-#   nvdcf_reid             — mismo perfil que "nvdcf_extended_shadow" + submódulo de ReID
-#                             propio de NvDCF (recupera track_id INTRA-cámara tras oclusión
-#                             más larga de lo que el shadow tracking cubre solo). Requiere
-#                             descargar el modelo: `python3 tools/download_models.py
-#                             --tracker-reid` (setup.sh lo hace solo si ya ves este valor
-#                             aquí). Intra-cámara, no cruza cámaras — complementa a OSNet +
-#                             ReIdManager (cross-cámara), no los reemplaza. Costo de GPU
-#                             extra sin medir todavía — probar en cliente no crítico primero
-#                             (ver CLAUDE.md, Capa 1).
-#   iou                    — IoU matching. Simpler, no CUDA kernels. Stable with 16 streams.
-#                             Loses track ID on crossing/occlusion but sufficient for people counting.
+# Forzar resolución exacta (opcional, solo si el DVR usa una rara).
+# stream_width: 1280
+# stream_height: 720
+
+# Algoritmo de seguimiento de personas:
+#   nvdcf   → preciso. Recomendado hasta 6 cámaras. (Default)
+#   iou     → ligero. Estable hasta 16 cámaras, pero pierde más el rastro.
+# Avanzados (dejar nvdcf salvo que sepas por qué cambiarlo):
+#   nvdcf_extended_shadow → nvdcf con más tolerancia a que alguien quede tapado un momento.
+#   nvdcf_reid            → nvdcf + recupera mejor el rastro; requiere descargar un modelo extra.
+#   nvdcf_accuracy        → perfil de máxima precisión de NVIDIA; necesita un modelo que aún
+#                           no se descarga, así que hoy no arranca. No usar todavía.
 tracker: nvdcf
 
-# Cámaras de entrada/salida (subconjunto de channels).
-# Usado para calcular tiempo en tienda y conteo de visitas.
-# Dejar vacío si ninguna cámara cubre directamente la puerta de entrada.
+# Cámaras que apuntan a la entrada/salida (subconjunto de channels).
+# Sirven para medir tiempo en tienda y visitas. Vacío si ninguna da a la puerta.
 entry_exit_channels: []
 
-# Tipo de cámara — las no listadas son internas por defecto.
-# Solo agregar canales que son externos (ej. fachada, estacionamiento).
+# Cámaras externas (fachada, estacionamiento). Las no listadas se tratan como internas.
 external_channels: []
 
-# Control de conteo por tipo de cámara.
-# false → esas cámaras no ejecutan analytics ni envían eventos al API.
+# Activar/desactivar el conteo por tipo de cámara.
+# false → esas cámaras no analizan ni envían datos.
 count_internal: true
 count_external: true
 
-# ── Ajuste de inferencia PeopleNet (opcional) ─────────────────────────────
-#
-# pgie_batch_size — frames procesados por llamada TRT.
-#   Menor = menos memoria GPU, más llamadas al engine.
-#   0 (default) = usa el valor de nvinfer_config.txt (actualmente 4).
-#   IMPORTANTE: si se sube por encima del batch compilado en el engine,
-#               TRT recompila (~5-8 min en el primer boot).
-#
-#   Guía por número de cámaras (Orin Nano, sub-stream 960×544):
-#     1–16 cámaras → pgie_batch_size: 4   (no subir a 16 — agota NVMM)
-#
-# pgie_interval — corre inferencia cada (interval+1) frames; el tracker cubre los intermedios.
-#   Mayor = menos carga GPU/memoria.
-#   -1 (default) = usa el valor de nvinfer_config.txt (actualmente 4).
-#
-#   Guía por número de cámaras:
-#     1–6  cámaras → pgie_interval: 2  (más fresco, más carga GPU)
-#     7–16 cámaras → pgie_interval: 4  (conservador, estable)
-#
-# pgie_batch_size: 0
-# pgie_interval guide:
-#   1-6  cameras → 2  (detects every 3rd frame — faster first bbox, more GPU load)
-#   7-16 cameras → 4  (detects every 5th frame — conservative, stable)
+# ── Ajustes finos de detección (opcionales) ──────────────────────────────────
+# Todo lo de abajo es opcional. El sistema funciona sin tocarlo.
+
+# Cada cuántos frames detecta personas (los intermedios los cubre el tracker).
+# Menor = más preciso, más carga. Guía: 2 para pocas cámaras, 4 para muchas.
 pgie_interval: 2
 
-# ── Umbrales de detección PeopleNet (opcional) ────────────────────────────
-#
-# pgie_nms_iou_threshold — dos bboxes con IoU > este valor se colapsan en uno.
-#   Bajar si personas paradas juntas aparecen como una sola detección.
-#   -1 (default) = usa el valor del nvinfer_config.txt (actualmente 0.35).
-#   Rango útil: 0.25 (multitudes muy densas) → 0.4 (escenas normales)
-#
-# pgie_pre_cluster_threshold — confianza mínima que debe tener un bbox antes del NMS.
-#   Bajar mejora recall en personas ocluidas, de espaldas o lejanas.
-#   -1 (default) = usa el valor del nvinfer_config.txt (actualmente 0.3).
-#   Rango útil: 0.2 (máximo recall, más falsos positivos) → 0.35 (más limpio)
-#
-# pgie_topk — máximo de detecciones que sobreviven el NMS por frame de inferencia.
-#   Subir si en escenas con muchas personas el sistema deja de detectar a partir de N.
-#   -1 (default) = usa el valor del nvinfer_config.txt (actualmente 20).
-#
+# Frames por lote de inferencia. 0 = valor por defecto del sistema. Dejar en 0.
+# pgie_batch_size: 0
+
+# Umbrales de detección de personas. Dejarlos comentados usa los valores por defecto.
+#   nms_iou: 0.25 (multitudes) a 0.4 (normal) — baja si dos personas juntas se ven como una.
+#   pre_cluster: 0.2 (más detecciones) a 0.35 (más limpio) — baja para captar gente lejana.
+#   topk: máximo de personas por frame. Sube si en escenas llenas deja de detectar.
 # pgie_nms_iou_threshold: 0.3
 # pgie_pre_cluster_threshold: 0.25
 # pgie_topk: 20
 
-# ── Ajuste de SGIEs (clasificadores secundarios: age_gender, epp, etc.) ──
-#
-# sgie_interval — aplica el mismo interval a todos los SGIEs activos.
-#   Mayor = menos carga GPU; el tracker mantiene la clasificación entre frames.
-#   -1 (default) = usa el valor de cada config_infer.txt individual.
-#   Guía: 4 (conservador) / 2 (más fresco) / 0 (cada frame)
-#
+# Cada cuántos frames corren los clasificadores (edad/género, etc.).
+# Mayor = menos carga. -1 = por defecto.
 # sgie_interval: -1
 
-# ── Re-ID entre cámaras ───────────────────────────────────────────────────
-#
-# reid_gallery_size — máximo de embeddings almacenados por persona conocida.
-#   Más embeddings = mejor reconocimiento desde distintos ángulos, más memoria RAM.
-#   Default: 10. Bajar a 5 en deployments con muchas personas; subir a 15 si hay
-#   problemas de reconocimiento en entornos con iluminación cambiante.
-#
+# Reconocimiento de la misma persona entre cámaras:
+#   reid_gallery_size → cuántas fotos guarda por persona. Default 10.
+#                       Baja a 5 si hay mucha gente; sube a 15 si falla con luz cambiante.
+#   osnet_precision   → fp32 (default, preciso) o fp16 (más rápido, dejar fp32).
 # reid_gallery_size: 10
-
-# osnet_precision — precisión del SGIE de apariencia OSNet (re-ID entre cámaras).
-#   fp32 (default) — el modo con el que está calibrado SIMILARITY_THRESHOLD=0.85
-#     en reid_manager.py. Más lento en Orin Nano (sin tensor cores para FP32).
-#   fp16 — más rápido, pero NO recalibrado: antes de dejarlo en producción hay que
-#     reverificar que la distribución de similitudes no cambió respecto a fp32
-#     (ver CLAUDE.md, sección "Re-ID entre Cámaras").
-#   Requiere reiniciar el pipeline para tomar efecto; la primera vez en fp16 tarda
-#   ~2 min extra compilando el engine TRT nuevo (se cachea después, igual que fp32).
-#
 # osnet_precision: fp32
 
-# ── Grabación automática de clips ─────────────────────────────────────────
-#
-# recording_enabled — graba clips MP4 cuando se detectan personas.
-#   En QA mode (./qa.sh) siempre graba, independientemente de este valor.
-#   En producción solo graba si está en true. Los clips se guardan en
-#   /nx_tech/recordings/ y se auto-eliminan cuando superan 10 GB.
-#   false (default) = sin grabación en producción.
-#
+# Grabar clips MP4 cuando se detectan personas. Se guardan en /nx_tech/recordings/
+# y se borran solos al superar 10 GB. Default: apagado.
 # recording_enabled: false
