@@ -239,6 +239,7 @@ video-testing pipeline) across increasing camera counts and reports the max that
 
 ```bash
 cd deploy
+python3 tools/benchmark_cameras.py --list-variants       # qué config aplica cada modalidad
 python3 tools/benchmark_cameras.py                      # default: fp32 / fp16 / fp16_sgie2, N=1,2,4,6,8
 python3 tools/benchmark_cameras.py --counts 1,4,8,12,16
 python3 tools/benchmark_cameras.py --variants fp16 --max 16 --step 2

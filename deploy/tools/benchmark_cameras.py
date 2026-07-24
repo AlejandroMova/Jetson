@@ -29,6 +29,7 @@ el config.yaml de __bench__/ es descartable (se borra al terminar), así que no 
 preservar comentarios al escribirlo, y .env se puede leer con un parser de dos líneas.
 
 Usage (desde deploy/):
+    python3 tools/benchmark_cameras.py --list-variants               # qué config aplica cada modalidad
     python3 tools/benchmark_cameras.py                              # 3 modalidades, counts 1,2,4,6,8
     python3 tools/benchmark_cameras.py --counts 1,4,8,12,16
     python3 tools/benchmark_cameras.py --variants fp16 --max 16 --step 2
@@ -54,10 +55,30 @@ BENCH_CONTAINER = "nx_bench"                            # nombre fijo del contai
 # Cada modalidad = overrides sobre config.yaml. tracker/pgie son iguales en todas (los "ideales");
 # solo cambian osnet_precision y sgie_interval. sgie_interval=None → usar el default del archivo.
 VARIANTS = {
-    "fp32":       {"osnet_precision": "fp32", "sgie_interval": None},
-    "fp16":       {"osnet_precision": "fp16", "sgie_interval": None},
-    "fp16_sgie2": {"osnet_precision": "fp16", "sgie_interval": 2},
+    "fp32": {
+        "osnet_precision": "fp32", "sgie_interval": None,
+        "desc": "Ideal completo: máxima precisión de ReID (OSNet en FP32).",
+    },
+    "fp16": {
+        "osnet_precision": "fp16", "sgie_interval": None,
+        "desc": "OSNet en FP16 — más rápido, mínima pérdida de precisión reportada.",
+    },
+    "fp16_sgie2": {
+        "osnet_precision": "fp16", "sgie_interval": 2,
+        "desc": "fp16 + OSNet cada 2 frames en vez de cada frame (el cuello de botella real).",
+    },
 }
+
+
+def _print_variants():
+    """Imprime qué config aplica cada modalidad — para --list-variants."""
+    print("Modalidades disponibles (todas con tracker=nvdcf_reid, pgie_batch_size=0, pgie_interval=2):\n")
+    for name, v in VARIANTS.items():
+        sgie = v["sgie_interval"] if v["sgie_interval"] is not None else "(default del archivo)"
+        print(f"  {name}")
+        print(f"    osnet_precision : {v['osnet_precision']}")
+        print(f"    sgie_interval   : {sgie}")
+        print(f"    {v['desc']}\n")
 
 # Estado para el cleanup: si detuvimos el deepstream de producción, hay que restaurarlo.
 _prod_was_up = False
@@ -371,6 +392,8 @@ def main():
                     help="Cliente base a copiar (default: lee /etc/nx_client)")
     ap.add_argument("--variants", default=",".join(VARIANTS),
                     help=f"Modalidades a medir, coma-separadas. Opciones: {list(VARIANTS)}")
+    ap.add_argument("--list-variants", action="store_true",
+                    help="Imprime qué config aplica cada modalidad (osnet_precision/sgie_interval) y termina")
     ap.add_argument("--counts", default=None,
                     help="Cuentas de cámaras a probar, coma-separadas (ej. 1,2,4,6,8)")
     ap.add_argument("--max", type=int, default=None, help="Alternativa a --counts: probar hasta este N")
@@ -385,6 +408,10 @@ def main():
                     help="Máx segundos esperando el 1er FPS (cubre build de engine fp16) (default 300)")
     ap.add_argument("--measure", type=int, default=45, help="Segundos de medición por corrida (default 45)")
     args = ap.parse_args()
+
+    if args.list_variants:
+        _print_variants()
+        return
 
     # Preflight: esto corre en el host del Jetson.
     for tool in ("docker", "tegrastats"):
