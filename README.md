@@ -231,6 +231,34 @@ View output at `rtsp://<jetson-ip>:8554/ds-test` (VLC).
 
 ---
 
+## Benchmarking: how many cameras does this Jetson handle?
+
+`deploy/tools/benchmark_cameras.py` — a manual tool, **not part of `setup.sh`**, run when you
+need to know the real ceiling for a given Jetson. It runs the real `app.py` (RTSP, not the
+video-testing pipeline) across increasing camera counts and reports the max that stays real-time.
+
+```bash
+cd deploy
+python3 tools/benchmark_cameras.py                      # default: fp32 / fp16 / fp16_sgie2, N=1,2,4,6,8
+python3 tools/benchmark_cameras.py --counts 1,4,8,12,16
+python3 tools/benchmark_cameras.py --variants fp16 --max 16 --step 2
+```
+
+It measures three modalities (all with the "ideal" settings `tracker: nvdcf_reid`,
+`pgie_batch_size: 0`, `pgie_interval: 2`):
+- `fp32` — `osnet_precision: fp32` (the accurate default)
+- `fp16` — `osnet_precision: fp16` (cheaper, least accuracy impact of the levers tried)
+- `fp16_sgie2` — `fp16` + `sgie_interval: 2` (OSNet is the diagnosed FPS bottleneck since it runs
+  every frame regardless of `pgie_interval` — running it every 2 frames instead is the next-cheapest lever)
+
+It simulates N cameras by cycling the client's configured `channels` (no RTSP server needed), stops
+production `deepstream` while it measures (restored automatically on exit, including Ctrl+C), and
+judges "handles it" as: FPS per stream stays ≥ 90% of what the DVR actually delivers (sondeado once
+via `gst-discoverer-1.0`, so it isn't compute-bound) **and** GPU/RAM stay under headroom (`tegrastats`).
+Requires the host tool `tegrastats` (comes with JetPack). See the module docstring for full details.
+
+---
+
 ## Pipeline packages
 
 The active models are controlled by the `pipeline` setting. Each capability maps to either a

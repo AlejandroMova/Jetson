@@ -35,7 +35,7 @@ from gi.repository import GLib, Gst
 import pyds
 from config_loader import load_config
 from probes import (
-    osd_sink_pad_buffer_probe, tiled_overlay_probe, api_client,
+    osd_sink_pad_buffer_probe, tiled_overlay_probe, bench_fps_probe, api_client,
     init_channel_map, init_stream_resolution, init_sector, init_entry_exit_pads, init_camera_types,
     init_handlers, init_workers, start_workers, stop_workers,
     init_stream_grid, tiled_frame_queue,
@@ -472,6 +472,13 @@ def main():
     if _IS_STREAM_ENABLED and tiler is not None:
         tiler.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, tiled_overlay_probe)
         logger.info("Probe B en tiler src-pad (frame tileado 640×360)")
+
+    # ── Probe FPS — solo para benchmark (NX_BENCH_FPS) ────────────────────────
+    # Inerte en producción. tools/benchmark_cameras.py lo activa para medir cuántas
+    # cámaras sostienen tiempo real por modalidad de config.
+    if os.environ.get("NX_BENCH_FPS"):
+        caps_rgba.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, bench_fps_probe)
+        logger.info("Probe FPS activo (NX_BENCH_FPS) — imprime BENCH_FPS stream=<i> fps=<v>")
 
     # ── Run ───────────────────────────────────────────────────────────────────
     api_client.start()

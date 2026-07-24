@@ -36,6 +36,7 @@ NX_tech/
 │   │   ├── identify_dvr.py     # Auto-detección de marca/patrón DVR
 │   │   ├── probe_cameras.py    # Detección de canales activos
 │   │   ├── register_face.py    # Enrolamiento de rostros
+│   │   ├── benchmark_cameras.py # Techo de cámaras por modalidad (manual, no en setup.sh)
 │   │   └── update.sh           # Actualización inteligente (git pull + rebuild)
 │   ├── clients/                # Config por cliente (config.yaml + .env)
 │   ├── setup.sh                # Script de primera instalación en campo
@@ -578,7 +579,7 @@ Cada vez que se agrega, elimina o cambia un campo configurable en `config_loader
 ### `deploy/pipelines/` — Núcleo del pipeline
 
 **`app.py`** (~300 líneas)
-Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **Sin tiler** — el path siempre es `caps_rgba → probe → fakesink`; el probe recibe frames RGBA full-res por cámara. Sin `nvdsosd`. Maneja el ciclo de vida de workers async (start/stop). Si `NX_STREAM_ENABLED=true`: inicializa `camera_frame_queues` y arranca `StreamServer` en :8080 antes de iniciar el pipeline. El OSNet SGIE (`sgie-appearance`, gie-id=3) se agrega condicionalmente si `models/osnet/osnet_x1_0_market1501.onnx` existe en disco — independiente de `cfg.pipeline`.
+Pipeline de producción. Construye el grafo GStreamer dinámicamente según las cámaras y capacidades activas. Conecta fuentes RTSP del DVR (H.264 o H.265, detección automática), configura PeopleNet como PGIE, añade SGIEs opcionales según el paquete. **Sin tiler** — el path siempre es `caps_rgba → probe → fakesink`; el probe recibe frames RGBA full-res por cámara. Sin `nvdsosd`. Maneja el ciclo de vida de workers async (start/stop). Si `NX_STREAM_ENABLED=true`: inicializa `camera_frame_queues` y arranca `StreamServer` en :8080 antes de iniciar el pipeline. El OSNet SGIE (`sgie-appearance`, gie-id=3) se agrega condicionalmente si `models/osnet/osnet_x1_0_market1501.onnx` existe en disco — independiente de `cfg.pipeline`. Si `NX_BENCH_FPS` está seteado, ata `probes.py::bench_fps_probe` al mismo pad de `caps_rgba` (ver detalle en `probes.py` abajo) — usado por `tools/benchmark_cameras.py`, inerte en producción normal.
 
 **`app_video_testing.py`** (~230 líneas)
 Igual que `app.py` pero para archivos MP4 locales. Usa `filesrc + decodebin` en lugar de `rtspsrc`. `decodebin` detecta el codec automáticamente. Las dimensiones del streammux se detectan con `cv2.VideoCapture` antes de construir el pipeline. Acepta `--capabilities`, `--client`, `--input` y `--no-loop` por CLI. Sink: siempre `fakesink` (mismo que producción). Si `NX_STREAM_ENABLED=true`: arranca `StreamServer` en :8080 para ver la inferencia sobre el video.
@@ -599,6 +600,7 @@ El motor central de analytics. Probe único (`osd_sink_pad_buffer_probe`) en `ca
 - **Bboxes de cara en stream (debug)** — agregado para diagnosticar el pipeline de detección/reconocimiento facial: `osd_sink_pad_buffer_probe` registra en `_track_labels[face_track_id]` un label `Cara NN%` (confianza cruda de PeopleNet class 2) para **cada** detección en `face_metas`, sin el filtro `OSD_CONFIDENCE_THRESHOLD` ni el gate de `global_id` que usa `_face_handler.process_face` — el objetivo es ver exactamente qué está detectando el PGIE, no lo que ya pasó el pipeline de reconocimiento. `tiled_overlay_probe` dibuja también `PGIE_CLASS_FACE` (antes solo `PGIE_CLASS_PERSON`), en naranja (`(0, 200, 255)` BGR) para distinguirlo del verde de persona / rojo de caída. Las caras no tienen equivalente a `_active_tracks`/`_expire_lost_tracks`, así que `tiled_overlay_probe` poda cada frame las entradas `face: True` de `_track_labels` cuyo `track_id` ya no aparezca en el batch actual — evita crecimiento sin límite en sesiones largas.
 - **Stream verbose output** (`_slog`, `_C`): cuando `NX_STREAM_ENABLED=true`, imprime líneas coloreadas a stdout (visibles en `docker logs -f`) por cada evento relevante: `DETECCIÓN` (tras ReID), `DEMOGRAFÍA` (clasificación edad/género), `EMPLEADO` (reconocimiento facial exitoso), `ROSTRO Desconocido` (cara vista sin match, una vez por track), y `[API]` (cada POST exitoso al backend). Desactivar colores ANSI con `NO_COLOR=1`. Sin overhead en producción.
 - **Log CSV persistente de face recognition** (`_face_csv_logger`): a diferencia de `_slog`, corre siempre (no gateado por `NX_STREAM_ENABLED`). Escribe en `clients/<cliente>/logs/face_recognition.csv` una fila por cada muestra procesada en `_FaceRecognitionHandler.process_face` (no dedupeada por track): `timestamp,camera_id,track_id,global_id,identity,similarity,status`. Se inicializa en `init_workers()` junto con `FaceRecognizer`, vía `RotatingFileHandler` (stdlib, 20 MB × 5 archivos). Pensado para análisis posterior de threshold/precisión, no para debugging en vivo.
+- **`bench_fps_probe` (agregado 2026-07-23)** — probe opt-in, atado en `app.py` solo si `NX_BENCH_FPS` está seteado (inerte en producción). Es la única medición **live** de FPS del sistema: `systemrefactor.md §2.4` documenta que el FPS históricamente se derivaba offline desde `manifest.csv` (`Δframe_num/Δtimestamp`), no en vivo. Cuenta frames por `pad_index` en `_bench_fps_state` (dict módulo-nivel, estado por stream — a diferencia de `common/FPS.py::GETFPS`) e imprime `BENCH_FPS stream=<i> fps=<v>` cada `_BENCH_FPS_WINDOW_S=5s`. Consumido por `tools/benchmark_cameras.py` vía `docker logs`.
 
 **`stream_server.py`** (~130 líneas)
 Servidor HTTP MJPEG daemon para stream mode (`NX_STREAM_ENABLED=true`). Solo per-cámara, sin tiler. Expone:
@@ -614,7 +616,10 @@ Carga y fusiona configuración desde 5 fuentes (prioridad: env vars > `/etc/nx_*
 Handler genérico de mensajes del bus GStreamer (EOS, WARNING, ERROR). Estándar de ejemplos NVIDIA DeepStream.
 
 **`common/FPS.py`**
-Medidor de FPS con ventana de 5 segundos. Clase `GETFPS` con `get_fps()` y `print_data()`.
+Medidor de FPS con ventana de 5 segundos (`GETFPS`, muestra de ejemplos NVIDIA). **No se usa** —
+su estado global (`start_time`/`frame_count` a nivel módulo) reporta mal con N streams simultáneos.
+La medición live de FPS real del sistema es `probes.py::bench_fps_probe` (ver abajo), que sí
+mantiene estado por stream. Se conserva por si sirve de referencia rápida para un solo stream.
 
 **`face_recognizer.py`** (~330 líneas)
 Worker thread para reconocimiento facial. Carga `known_faces.json` (dos formatos: legacy nombre-clave, nuevo UUID-clave `{"uuid": {"name": "...", "embeddings": [...]}}`) en `_load_db()`. Para cada crop de rostro: extrae embedding 512-dim con InsightFace buffalo_l, calcula similitud coseno contra la DB. Threshold: ≥ 0.50. `_locked`/`_votes` están indexados por `global_id` (no `track_id`) — `_votes` es un `deque(maxlen=FACE_VOTES_REQUIRED=3)` por `global_id` que se sigue alimentando aunque ya haya un candado, para poder corregirlo si la mayoría cambia (protección contra que ReID/OSNet confunda a dos empleados con uniformes parecidos).
@@ -697,6 +702,24 @@ Dado un patrón RTSP y una lista de canales, usa `gst-discoverer` para verificar
 
 **`register_face.py`** (~7.6 KB)
 CLI para enrolamiento de rostros en la DB local. Acepta imágenes individuales, frames de video, o carpeta completa. Genera embeddings con InsightFace y los guarda en `known_faces.json`.
+
+**`benchmark_cameras.py`** (agregado 2026-07-23) — **manual, no invocada desde `setup.sh`**
+Mide cuántas cámaras aguanta el Jetson en tiempo real, por modalidad de config, corriendo `app.py`
+(RTSP real, no `app_video_testing.py` — ese hardcodea el tracker e ignora `osnet_precision`) con
+N fuentes RTSP obtenidas ciclando los `channels` del cliente base. Modalidades por defecto
+(`VARIANTS`): `fp32`/`fp16`/`fp16_sgie2`, todas con `tracker=nvdcf_reid`, `pgie_batch_size=0`,
+`pgie_interval=2` — solo varía `osnet_precision` y `sgie_interval` (el SGIE de OSNet corre cada
+frame sin importar `pgie_interval`, ver "Costo de cómputo" en Re-ID entre Cámaras arriba; probarlo
+cada 2 frames es la siguiente palanca más barata en precisión tras bajar a fp16). Por cada (modalidad, N):
+escribe `clients/__bench__/config.yaml` (copia temporal del cliente base, vía `ruamel.yaml` —
+mismo patrón que `probe_cameras.py::_update_config`), detiene el `deepstream` de producción,
+lanza el container con `NX_BENCH_FPS=1` (activa `bench_fps_probe`), espera el primer `BENCH_FPS`
+(tolera el build del engine TRT en la 1ª corrida fp16), mide `--measure` segundos con `tegrastats`
+(host, GPU%/RAM%/EMC%) + los `BENCH_FPS` de esa ventana, y decide "aguanta" comparando el FPS
+mínimo entre streams contra el FPS real de la fuente (sondeado una vez con `gst-discoverer-1.0`,
+mismo método usado en `systemrefactor.md §12` para medir el salto sub→main). Restaura producción
+y borra `clients/__bench__/` siempre (`atexit`), incluso si se interrumpe con Ctrl+C. Self-check
+en `test_benchmark_cameras.py` (funciones de parsing/veredicto, sin Docker).
 
 **`test_rtsp.py`** (~2 KB)
 Test rápido de conectividad RTSP. Útil para verificar credenciales DVR antes de despliegue completo.

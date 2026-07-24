@@ -771,6 +771,46 @@ def _iter_pyds_list(pyds_list, cast_fn):
             return
 
 
+# ── Benchmark FPS probe (opt-in vía NX_BENCH_FPS) ────────────────────────────
+# pad_index → [frames_en_ventana, monotonic_inicio_ventana]. Estado por stream para
+# no compartir globals entre cámaras (el defecto que hace inservible a common/FPS.py::GETFPS
+# con N streams). Lo consume tools/benchmark_cameras.py grepeando las líneas BENCH_FPS.
+_bench_fps_state: Dict[int, list] = {}
+_BENCH_FPS_WINDOW_S = 5.0  # ventana de promediado; igual que la de GETFPS
+
+
+def bench_fps_probe(_pad, info):
+    """Probe de medición de FPS por stream — la única medición live de FPS del sistema.
+
+    Solo se ata al pipeline si NX_BENCH_FPS está seteado (ver app.py), así que es
+    inerte en producción. Cuenta frames por pad_index (= stream) y cada ~5 s imprime
+    una línea greppable `BENCH_FPS stream=<i> fps=<v>` a stdout (docker logs).
+    Reemplaza a common/FPS.py::GETFPS, cuyo estado global compartido reporta mal con N streams.
+    """
+    gst_buffer = info.get_buffer()
+    if gst_buffer is None:
+        return Gst.PadProbeReturn.OK
+
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    if batch_meta is None:
+        return Gst.PadProbeReturn.OK
+
+    now = time.monotonic()
+    for fm in _iter_pyds_list(batch_meta.frame_meta_list, pyds.NvDsFrameMeta.cast):
+        sid = fm.pad_index
+        state = _bench_fps_state.get(sid)
+        if state is None:
+            state = _bench_fps_state[sid] = [0, now]
+        state[0] += 1
+        elapsed = now - state[1]
+        if elapsed >= _BENCH_FPS_WINDOW_S:
+            # flush=True: sin buffering para que benchmark_cameras.py lo lea en vivo.
+            print(f"BENCH_FPS stream={sid} fps={state[0] / elapsed:.2f}", flush=True)
+            state[0], state[1] = 0, now
+
+    return Gst.PadProbeReturn.OK
+
+
 # Pedestrian Attr model outputs 6 classes — maps raw label → (display gender, display age group).
 _AGE_GENDER_LABEL_MAP: Dict[str, Tuple[str, str]] = {
     "female_adult":  ("Mujer",  "Adulta"),

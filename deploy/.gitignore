@@ -1,6 +1,10 @@
 # DVR credentials — never commit
 clients/*/.env
 
+# Temp client used by tools/benchmark_cameras.py (copies base client's .env) —
+# deleted on exit, but ignored as a safety net in case cleanup doesn't run.
+clients/__bench__/
+
 # Face recognition database — per-deployment, not tracked
 clients/*/known_faces.json
 
