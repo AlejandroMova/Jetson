@@ -323,7 +323,11 @@ def _measure(measure_s: int):
     Retorna (gpu_pct, ram_pct, emc_pct, min_fps, n_streams). tegrastats corre en paralelo;
     docker logs --since <measure_s> recorta justo la ventana (descarta el warmup).
     """
-    teg = subprocess.Popen(["tegrastats", "--interval", "1000"],
+    # stdbuf -oL: sin esto, tegrastats bufferea stdout en bloques de 4KB al escribir a un pipe
+    # (en vez de línea-por-línea como cuando corre en una terminal interactiva) — al matarlo con
+    # terminate(), el último bloque sin flushear se pierde, dejando EMC_FREQ/GR3D_FREQ vacíos o
+    # con solo la primera línea que alcanzó a salir. stdbuf (coreutils) fuerza flush por línea.
+    teg = subprocess.Popen(["stdbuf", "-oL", "tegrastats", "--interval", "1000"],
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     time.sleep(measure_s)
     teg.terminate()
