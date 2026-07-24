@@ -23,6 +23,11 @@ Y RAM con headroom. Es el test compute-bound-vs-source de systemrefactor.md §2.
 Requiere: correr en el host del Jetson (usa tegrastats + docker compose + gst-discoverer,
 todos nativos de JetPack). El probe de FPS lo aporta app.py cuando NX_BENCH_FPS=1.
 
+Este script corre en el HOST, no dentro de Docker (a diferencia de la mayoría de tools/*.py) —
+por eso solo usa pyyaml (ya presente en el host) + stdlib, nunca ruamel.yaml ni python-dotenv:
+el config.yaml de __bench__/ es descartable (se borra al terminar), así que no hace falta
+preservar comentarios al escribirlo, y .env se puede leer con un parser de dos líneas.
+
 Usage (desde deploy/):
     python3 tools/benchmark_cameras.py                              # 3 modalidades, counts 1,2,4,6,8
     python3 tools/benchmark_cameras.py --counts 1,4,8,12,16
@@ -41,8 +46,6 @@ import time
 from pathlib import Path
 
 import yaml
-from ruamel.yaml import YAML as _YAML
-from dotenv import dotenv_values
 
 REPO_ROOT   = Path(__file__).resolve().parent.parent   # .../deploy
 BENCH_CLIENT = "__bench__"                              # cliente temporal que escribimos/borramos
@@ -91,16 +94,16 @@ def _cycle_channels(base: list, n: int) -> list:
 
 
 def _write_bench_config(base_channels: list, n: int, variant: dict):
-    """Escribe clients/__bench__/config.yaml con la modalidad + N canales, preservando comentarios.
+    """Escribe clients/__bench__/config.yaml con la modalidad + N canales.
 
-    Parte de la copia del cliente base (hecha en setup_bench_client) y sobrescribe solo los
+    Parte de la copia del cliente base (hecha en _setup_bench_client) y sobrescribe solo los
     knobs de la prueba. sgie_interval se borra si la variante no lo fija (usa el default del archivo).
+    Usa yaml.safe_dump en vez de ruamel: __bench__/config.yaml es descartable (se borra al
+    terminar), así que perder los comentarios del template no importa — nadie lo edita a mano.
     """
     cfg_path = REPO_ROOT / "clients" / BENCH_CLIENT / "config.yaml"
-    ryaml = _YAML()
-    ryaml.preserve_quotes = True
     with open(cfg_path) as f:
-        cfg = ryaml.load(f) or {}
+        cfg = yaml.safe_load(f) or {}
 
     # Knobs "ideales" fijos en todas las modalidades.
     cfg["tracker"]         = "nvdcf_reid"
@@ -116,7 +119,7 @@ def _write_bench_config(base_channels: list, n: int, variant: dict):
     cfg["channels"] = _cycle_channels(base_channels, n)
 
     with open(cfg_path, "w") as f:
-        ryaml.dump(cfg, f)
+        yaml.safe_dump(cfg, f, sort_keys=False)
 
 
 def _setup_bench_client(base_client: str) -> list:
@@ -152,6 +155,28 @@ def _cleanup():
 
 # ── FPS de la fuente (target de tiempo real) ──────────────────────────────────
 
+def _read_env_file(path: Path) -> dict:
+    """Parser mínimo de .env (KEY=value por línea, comillas opcionales, # = comentario).
+
+    Reemplaza python-dotenv (no garantizado en el host, a diferencia del contenedor) —
+    el formato de .env acá es siempre simple, no amerita una dependencia extra.
+    """
+    env = {}
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
+
+
 def _source_fps(base_client: str) -> float:
     """Sondea la fuente RTSP con gst-discoverer-1.0 y retorna el framerate real del DVR.
 
@@ -162,7 +187,7 @@ def _source_fps(base_client: str) -> float:
     base_dir = REPO_ROOT / "clients" / base_client
     with open(base_dir / "config.yaml") as f:
         cfg = yaml.safe_load(f) or {}
-    env = dotenv_values(base_dir / ".env") if (base_dir / ".env").exists() else {}
+    env = _read_env_file(base_dir / ".env")
 
     dvr_ip = (Path("/etc/nx_dvr_ip").read_text().strip()
               if Path("/etc/nx_dvr_ip").exists() else "")

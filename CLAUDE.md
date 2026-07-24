@@ -711,8 +711,12 @@ N fuentes RTSP obtenidas ciclando los `channels` del cliente base. Modalidades p
 `pgie_interval=2` — solo varía `osnet_precision` y `sgie_interval` (el SGIE de OSNet corre cada
 frame sin importar `pgie_interval`, ver "Costo de cómputo" en Re-ID entre Cámaras arriba; probarlo
 cada 2 frames es la siguiente palanca más barata en precisión tras bajar a fp16). Por cada (modalidad, N):
-escribe `clients/__bench__/config.yaml` (copia temporal del cliente base, vía `ruamel.yaml` —
-mismo patrón que `probe_cameras.py::_update_config`), detiene el `deepstream` de producción,
+escribe `clients/__bench__/config.yaml` (copia temporal del cliente base, vía `yaml.safe_dump` —
+**no** `ruamel.yaml`: a diferencia de `probe_cameras.py`, este script corre en el HOST, no dentro
+de Docker, y el host solo tiene `ruamel.yaml` instalado para los dos parches inline de `setup.sh`
+—no como dependencia general—; como `__bench__/config.yaml` es descartable, perder comentarios
+no importa. Lee `.env` con `_read_env_file()` propio en vez de `python-dotenv`, mismo motivo:
+sin esa dependencia garantizada en el host), detiene el `deepstream` de producción,
 lanza el container con `NX_BENCH_FPS=1` (activa `bench_fps_probe`), espera el primer `BENCH_FPS`
 (tolera el build del engine TRT en la 1ª corrida fp16), mide `--measure` segundos con `tegrastats`
 (host, GPU%/RAM%/EMC%) + los `BENCH_FPS` de esa ventana, y decide "aguanta" comparando el FPS

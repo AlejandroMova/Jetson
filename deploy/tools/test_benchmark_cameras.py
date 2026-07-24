@@ -7,9 +7,20 @@ cambia un regex o un umbral). No arranca Docker ni el pipeline. Correr en el hos
     python3 tools/test_benchmark_cameras.py
 """
 
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import benchmark_cameras as b
+
+
+def test_read_env_file():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / ".env"
+        p.write_text('# comentario\nDVR_USER=admin\nDVR_PASS="a b c"\nexport OTRO=x\n\n')
+        env = b._read_env_file(p)
+        assert env == {"DVR_USER": "admin", "DVR_PASS": "a b c", "OTRO": "x"}
+    assert b._read_env_file(Path("/no/existe/.env")) == {}
 
 
 def test_cycle_channels():
